@@ -210,6 +210,32 @@ app.post("/experiments/:id/optimize", async (req: Request, res: Response) => {
   }
 });
 
+// Normalize object keys to lowercase and get headline + body from common key names
+function extractCopyFromItem(item: Record<string, unknown>): string {
+  const lower: Record<string, string> = {};
+  for (const [k, v] of Object.entries(item)) {
+    if (typeof v === "string") lower[k.toLowerCase()] = v;
+  }
+  const headline =
+    lower.headline ?? lower.headlinetext ?? lower.title ?? lower.head ?? "";
+  const body =
+    lower.primarytext ??
+    lower["primary text"] ??
+    lower.primary_text ??
+    lower.body ??
+    lower.copy ??
+    lower.text ??
+    lower.description ??
+    "";
+  const parts = [headline, body].filter(Boolean);
+  let combined = parts.join("\n\n").trim();
+  if (!combined) {
+    const allStrings = Object.values(lower).filter((v) => v && v.length > 2);
+    combined = allStrings.join("\n\n").trim();
+  }
+  return combined;
+}
+
 // Generate N ad copy variants from one user prompt (experiment flow)
 async function generateVariantsFromPrompt(
   prompt: string,
@@ -219,7 +245,7 @@ async function generateVariantsFromPrompt(
   const systemPrompt =
     "You are an expert ad copywriter. You write NEW, original ad copy. " +
     "Never repeat or echo the user's idea text as the headline or body. " +
-    "Output only valid JSON: a single array of objects with headline and primaryText.";
+    "Output only valid JSON: a single object with key \"variants\" whose value is an array of objects. Each object must have \"headline\" and \"primaryText\" as strings.";
 
   const userPrompt = buildVariantsFromOnePrompt(prompt, platform as AdPlatform, count);
 
@@ -233,35 +259,42 @@ async function generateVariantsFromPrompt(
   });
 
   let content = (completion.choices[0]?.message?.content || "").trim();
-  // Strip markdown code fence if present (e.g. ```json ... ```)
   const codeFence = content.match(/^```(?:json)?\s*([\s\S]*?)```$/);
   if (codeFence) content = codeFence[1].trim();
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
-  } catch {
+  } catch (e) {
+    console.error("[AI] JSON parse failed. Content preview:", content.slice(0, 300));
     const match = content.match(/\[[\s\S]*\]/);
-    parsed = match ? JSON.parse(match[0]) : [];
+    parsed = match ? JSON.parse(match[0]) : { variants: [] };
   }
 
-  const arr = Array.isArray(parsed) ? parsed : (parsed as any)?.variants ?? (parsed as any)?.ads ?? [];
+  const raw = parsed as Record<string, unknown>;
+  const arr = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(raw?.variants)
+      ? raw.variants
+      : Array.isArray(raw?.ads)
+        ? raw.ads
+        : [];
+
+  console.log("[AI] Parsed variants count:", arr.length, "First item keys:", arr[0] && typeof arr[0] === "object" ? Object.keys(arr[0] as object) : "n/a");
+
   const copies: string[] = [];
   for (let i = 0; i < count; i++) {
     const item = arr[i];
-    if (item && typeof item === "object") {
-      const headline = item.headline ?? item.headlineText ?? item.title ?? "";
-      const body = item.primaryText ?? item.body ?? item.copy ?? item.text ?? item.description ?? "";
-      const parts = [headline, body].filter(Boolean);
-      const combined = parts.join("\n\n").trim();
-      copies.push(combined || `Variant ${i + 1}`);
-    } else if (typeof item === "string" && item.trim() && !item.trim().startsWith("---")) {
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      const combined = extractCopyFromItem(item as Record<string, unknown>);
+      copies.push(combined || `Variant ${i + 1} — AI returned no text (see Render logs)`);
+    } else if (typeof item === "string" && item.trim()) {
       copies.push(item.trim());
     } else {
-      copies.push(`Variant ${i + 1}`);
+      copies.push(`Variant ${i + 1} — no content`);
     }
   }
-  return copies.length >= count ? copies : [...copies, ...Array(count - copies.length).fill("")].slice(0, count);
+  return copies.length >= count ? copies : [...copies, ...Array(Math.max(0, count - copies.length)).fill("Variant (missing)")].slice(0, count);
 }
 
 // Create a new experiment with variants (Phase 2: creativesSource, prompt, variantCount)
