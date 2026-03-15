@@ -12,27 +12,8 @@ const openai = new OpenAI({
 });
 
 const app = express();
-// Allow GHL embed origin and your frontend so fetch works inside iframe
-const allowedOrigins = [
-  "https://app.gohighlevel.com",
-  "https://whitelabel.gohighlevel.com",
-  "https://www.k-6marketing.com",
-  "https://k-6marketing.com",
-  /\.vercel\.app$/,
-  /\.onrender\.com$/,
-];
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      const ok = allowedOrigins.some(
-        (o) => o === origin || (typeof o === "object" && o.test && o.test(origin))
-      );
-      return cb(null, ok ? origin : false);
-    },
-    credentials: true,
-  })
-);
+// Allow all origins so fetch works when app is embedded in GHL iframe
+app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
