@@ -333,6 +333,36 @@ app.patch("/experiments/:experimentId/variants/:variantId", (req: Request, res: 
   res.json(variant);
 });
 
+// Regenerate one variant's copy with AI (same prompt, new angle)
+app.post("/experiments/:experimentId/variants/:variantId/regenerate", async (req: Request, res: Response) => {
+  const { experimentId, variantId } = req.params;
+
+  const exp = experiments.find((e) => e.id === experimentId);
+  if (!exp) {
+    return res.status(404).json({ error: "Experiment not found" });
+  }
+
+  const variants = variantsByExperimentId[experimentId];
+  if (!variants) {
+    return res.status(404).json({ error: "Experiment not found" });
+  }
+  const variant = variants.find((v) => v.id === variantId);
+  if (!variant) {
+    return res.status(404).json({ error: "Variant not found" });
+  }
+
+  const promptText = exp.prompt || "Generate a new, distinct ad copy variant.";
+  try {
+    const copies = await generateVariantsFromPrompt(promptText, exp.platform, 1);
+    const newCopy = copies[0] || "";
+    variant.copy = newCopy;
+    res.json({ copy: newCopy, variant });
+  } catch (err: any) {
+    console.error("Regenerate variant failed", err?.message || err);
+    res.status(500).json({ error: "Failed to regenerate ad copy" });
+  }
+});
+
 // Launch experiment (Phase 2)
 app.post("/experiments/:id/launch", (req: Request, res: Response) => {
   const exp = experiments.find((e) => e.id === req.params.id);
