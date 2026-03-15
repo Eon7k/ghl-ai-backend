@@ -12,8 +12,16 @@ const openai = new OpenAI({
 });
 
 const app = express();
-// Allow all origins so fetch works when app is embedded in GHL iframe
-app.use(cors());
+// CORS: allow any origin (e.g. GHL iframe) so fetch is not blocked
+app.use(
+  cors({
+    origin: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+    credentials: false,
+    optionsSuccessStatus: 200,
+  })
+);
 app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
