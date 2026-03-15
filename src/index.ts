@@ -217,10 +217,9 @@ async function generateVariantsFromPrompt(
   count: number
 ): Promise<string[]> {
   const systemPrompt =
-    "You are an expert performance ad copywriter. " +
-    "When given one ad idea, you generate multiple completely different ad copies based on that idea. " +
-    "Each variant must have different headlines, angles, and body copy. " +
-    "Do not repeat the same phrases across variants. Output only valid JSON.";
+    "You are an expert ad copywriter. You write NEW, original ad copy. " +
+    "Never repeat or echo the user's idea text as the headline or body. " +
+    "Output only valid JSON: a single array of objects with headline and primaryText.";
 
   const userPrompt = buildVariantsFromOnePrompt(prompt, platform as AdPlatform, count);
 
@@ -229,27 +228,37 @@ async function generateVariantsFromPrompt(
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt }
-    ]
+    ],
+    response_format: { type: "json_object" }
   });
 
-  const content = completion.choices[0]?.message?.content || "";
+  let content = (completion.choices[0]?.message?.content || "").trim();
+  // Strip markdown code fence if present (e.g. ```json ... ```)
+  const codeFence = content.match(/^```(?:json)?\s*([\s\S]*?)```$/);
+  if (codeFence) content = codeFence[1].trim();
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
   } catch {
-    const match = content.match(/\[([\s\S]*?)\]/);
+    const match = content.match(/\[[\s\S]*\]/);
     parsed = match ? JSON.parse(match[0]) : [];
   }
 
-  const arr = Array.isArray(parsed) ? parsed : (parsed as any)?.variants ?? [];
+  const arr = Array.isArray(parsed) ? parsed : (parsed as any)?.variants ?? (parsed as any)?.ads ?? [];
   const copies: string[] = [];
   for (let i = 0; i < count; i++) {
     const item = arr[i];
     if (item && typeof item === "object") {
-      const parts = [item.headline, item.primaryText, item.description].filter(Boolean);
-      copies.push(parts.join("\n\n") || `Variant ${i + 1}`);
+      const headline = item.headline ?? item.headlineText ?? item.title ?? "";
+      const body = item.primaryText ?? item.body ?? item.copy ?? item.text ?? item.description ?? "";
+      const parts = [headline, body].filter(Boolean);
+      const combined = parts.join("\n\n").trim();
+      copies.push(combined || `Variant ${i + 1}`);
+    } else if (typeof item === "string" && item.trim() && !item.trim().startsWith("---")) {
+      copies.push(item.trim());
     } else {
-      copies.push(typeof item === "string" ? item : `Variant ${i + 1}`);
+      copies.push(`Variant ${i + 1}`);
     }
   }
   return copies.length >= count ? copies : [...copies, ...Array(count - copies.length).fill("")].slice(0, count);

@@ -57,7 +57,7 @@ export function buildUserPrompt(input: AdCopyPromptInput): string {
 
 /**
  * For experiment flow: one user prompt → N fully different ad copies.
- * Strong instructions so the AI uses the exact idea and produces varied copy.
+ * Strong instructions so the AI writes NEW copy (never just repeat the idea).
  */
 export function buildVariantsFromOnePrompt(adIdea: string, platform: AdPlatform, count: number): string {
   const platformBrief =
@@ -67,18 +67,15 @@ export function buildVariantsFromOnePrompt(adIdea: string, platform: AdPlatform,
         ? "Google Ads: headlines and short descriptions."
         : "TikTok/short-form: punchy, scroll-stopping copy.";
   return [
-    "The user provided ONE ad idea below. Your job: generate " + count + " completely different ad copies that all use this idea.",
-    "Each ad must: (1) be clearly based on the idea, (2) have different headlines and body copy, (3) use different angles or hooks (e.g. pain point, benefit, urgency, social proof).",
-    "Do not repeat the same phrasing. Every variant must feel like a distinct ad.",
+    "Below is an ad IDEA (topic/angle). Your job: write " + count + " completely NEW ad copies inspired by this idea.",
+    "CRITICAL: Do NOT copy or repeat the idea text. Write fresh headlines and body text that SELL the idea (e.g. different hooks, benefits, CTAs). Each variant must be original ad copy, not the idea pasted again.",
+    "Each object must have: headline (short, catchy), primaryText (2-4 sentences of ad body). Optional: description.",
     "",
-    "Ad idea from user:",
-    "---",
+    "Ad idea (use this as inspiration only; do not repeat it):",
     adIdea,
-    "---",
     "",
     "Platform: " + platformBrief,
     "",
-    "Return ONLY a valid JSON array of exactly " + count + " objects. Each object must have: headline (string), primaryText (string). Optional: description (string).",
-    "Example shape: [{\"headline\": \"...\", \"primaryText\": \"...\"}, ...]"
+    "Return a JSON object with one key \"variants\" whose value is an array of exactly " + count + " objects. Each object: headline, primaryText. Example: {\"variants\": [{\"headline\": \"...\", \"primaryText\": \"...\"}, ...]}"
   ].join("\n");
 }
