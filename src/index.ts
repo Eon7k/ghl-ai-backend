@@ -5,7 +5,10 @@ import axios from "axios";
 import OpenAI from "openai";
 import { buildSystemPrompt, buildUserPrompt, buildVariantsFromOnePrompt, AdPlatform } from "./aiPromptTemplates";
 
-dotenv.config();
+// Only load .env file when NOT in production (so Render always uses its own env vars)
+if (process.env.NODE_ENV !== "production") {
+  dotenv.config();
+}
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 if (!OPENAI_API_KEY || OPENAI_API_KEY.length < 10) {
@@ -13,6 +16,9 @@ if (!OPENAI_API_KEY || OPENAI_API_KEY.length < 10) {
     "[WARN] OPENAI_API_KEY is not set or invalid. AI ad generation and regenerate will fail. " +
     "Set OPENAI_API_KEY in .env (local) or in Render Environment (production)."
   );
+} else {
+  const keyPreview = OPENAI_API_KEY.slice(0, 7) + "..." + OPENAI_API_KEY.slice(-4);
+  console.log("[OPENAI] Using API key:", keyPreview);
 }
 
 const openai = new OpenAI({
