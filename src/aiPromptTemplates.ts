@@ -54,3 +54,31 @@ export function buildUserPrompt(input: AdCopyPromptInput): string {
     "Respond as a JSON array of objects, each with: headline, primaryText, description (optional)."
   ].join("\n");
 }
+
+/**
+ * For experiment flow: one user prompt → N fully different ad copies.
+ * Strong instructions so the AI uses the exact idea and produces varied copy.
+ */
+export function buildVariantsFromOnePrompt(adIdea: string, platform: AdPlatform, count: number): string {
+  const platformBrief =
+    platform === "meta"
+      ? "Meta (Facebook/Instagram) feed ads: hook, benefit, CTA."
+      : platform === "google"
+        ? "Google Ads: headlines and short descriptions."
+        : "TikTok/short-form: punchy, scroll-stopping copy.";
+  return [
+    "The user provided ONE ad idea below. Your job: generate " + count + " completely different ad copies that all use this idea.",
+    "Each ad must: (1) be clearly based on the idea, (2) have different headlines and body copy, (3) use different angles or hooks (e.g. pain point, benefit, urgency, social proof).",
+    "Do not repeat the same phrasing. Every variant must feel like a distinct ad.",
+    "",
+    "Ad idea from user:",
+    "---",
+    adIdea,
+    "---",
+    "",
+    "Platform: " + platformBrief,
+    "",
+    "Return ONLY a valid JSON array of exactly " + count + " objects. Each object must have: headline (string), primaryText (string). Optional: description (string).",
+    "Example shape: [{\"headline\": \"...\", \"primaryText\": \"...\"}, ...]"
+  ].join("\n");
+}

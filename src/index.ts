@@ -3,12 +3,20 @@ import cors from "cors";
 import dotenv from "dotenv";
 import axios from "axios";
 import OpenAI from "openai";
-import { buildSystemPrompt, buildUserPrompt, AdPlatform } from "./aiPromptTemplates";
+import { buildSystemPrompt, buildUserPrompt, buildVariantsFromOnePrompt, AdPlatform } from "./aiPromptTemplates";
 
 dotenv.config();
 
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+if (!OPENAI_API_KEY || OPENAI_API_KEY.length < 10) {
+  console.warn(
+    "[WARN] OPENAI_API_KEY is not set or invalid. AI ad generation and regenerate will fail. " +
+    "Set OPENAI_API_KEY in .env (local) or in Render Environment (production)."
+  );
+}
+
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+  apiKey: OPENAI_API_KEY || "not-set"
 });
 
 const app = express();
@@ -202,25 +210,24 @@ app.post("/experiments/:id/optimize", async (req: Request, res: Response) => {
   }
 });
 
-// Generate N ad copy variants from prompt using OpenAI (for Phase 2)
+// Generate N ad copy variants from one user prompt (experiment flow)
 async function generateVariantsFromPrompt(
   prompt: string,
   platform: string,
   count: number
 ): Promise<string[]> {
-  const sysPrompt = buildSystemPrompt(platform as AdPlatform);
-  const userPrompt = buildUserPrompt({
-    offerDescription: prompt,
-    audienceDescription: "General audience",
-    brandVoice: undefined,
-    platform: platform as AdPlatform,
-    numVariants: count
-  });
+  const systemPrompt =
+    "You are an expert performance ad copywriter. " +
+    "When given one ad idea, you generate multiple completely different ad copies based on that idea. " +
+    "Each variant must have different headlines, angles, and body copy. " +
+    "Do not repeat the same phrases across variants. Output only valid JSON.";
+
+  const userPrompt = buildVariantsFromOnePrompt(prompt, platform as AdPlatform, count);
 
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [
-      { role: "system", content: sysPrompt },
+      { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt }
     ]
   });
