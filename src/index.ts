@@ -100,8 +100,10 @@ interface ExperimentRecord {
   variantCount?: number;
   creativesSource?: "ai" | "own";
   aiCreativeCount?: number; // set at launch: how many variants get AI-created creatives (0 = none)
-  /** When we create a campaign on Meta, store its ID here so we can fetch insights */
+  /** When we create a campaign on Meta, store its ID here so we can fetch insights and update status */
   metaCampaignId?: string;
+  /** When we create an ad set on Meta, store its ID here so we can update budget */
+  metaAdSetId?: string;
 }
 
 interface VariantRecord {
@@ -767,15 +769,21 @@ app.post("/experiments/:id/launch", requireAuth, (req: AuthRequest, res: Respons
   res.json(exp);
 });
 
-// Campaign metrics: for launched campaigns, return spend/impressions/clicks etc. From Meta when we have metaCampaignId.
+// Campaign metrics: full Meta-style metrics for dashboard. From Meta when we have metaCampaignId.
 interface CampaignMetricsResponse {
   spend: number;
   impressions: number;
+  reach: number;
+  frequency: number;
+  cpm: number;
   clicks: number;
   ctr: number;
   cpc: number;
+  linkClicks: number;
   conversions: number;
+  costPerConversion: number;
   source: "placeholder" | "meta";
+  datePreset?: string;
 }
 
 function parseNum(value: unknown): number {
@@ -785,6 +793,21 @@ function parseNum(value: unknown): number {
     return Number.isNaN(n) ? 0 : n;
   }
   return 0;
+}
+
+/** Parse Meta actions array for conversion count (e.g. offsite_conversion.fb_pixel_purchase) */
+function parseConversionsFromActions(actions: unknown): number {
+  if (!Array.isArray(actions)) return 0;
+  let total = 0;
+  for (const a of actions) {
+    if (a && typeof a === "object" && "action_type" in a) {
+      const type = (a as { action_type?: string }).action_type;
+      if (type && (type.includes("conversion") || type.includes("purchase") || type.includes("lead"))) {
+        total += parseNum((a as { value?: unknown }).value);
+      }
+    }
+  }
+  return total;
 }
 
 app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: Response) => {
@@ -799,10 +822,15 @@ app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: R
   const placeholder: CampaignMetricsResponse = {
     spend: 0,
     impressions: 0,
+    reach: 0,
+    frequency: 0,
+    cpm: 0,
     clicks: 0,
     ctr: 0,
     cpc: 0,
+    linkClicks: 0,
     conversions: 0,
+    costPerConversion: 0,
     source: "placeholder",
   };
 
@@ -814,7 +842,7 @@ app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: R
       return res.json(placeholder);
     }
     try {
-      const fields = "spend,impressions,clicks,ctr,cpc";
+      const fields = "spend,impressions,reach,frequency,cpm,clicks,ctr,cpc,inline_link_clicks,actions";
       const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(exp.metaCampaignId)}/insights?fields=${fields}&date_preset=last_7d&access_token=${encodeURIComponent(metaConn.accessToken)}`;
       const apiRes = await axios.get<{ data?: Array<Record<string, unknown>> }>(url);
       const insights = apiRes.data?.data;
@@ -822,17 +850,29 @@ app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: R
       if (row) {
         const spend = parseNum(row.spend);
         const impressions = parseNum(row.impressions);
+        const reach = parseNum(row.reach);
+        const frequency = parseNum(row.frequency);
+        const cpm = parseNum(row.cpm);
         const clicks = parseNum(row.clicks);
         const ctr = parseNum(row.ctr);
         const cpc = parseNum(row.cpc);
+        const linkClicks = parseNum(row.inline_link_clicks);
+        const conversions = parseConversionsFromActions(row.actions);
+        const costPerConversion = conversions > 0 ? spend / conversions : 0;
         return res.json({
           spend,
           impressions,
+          reach,
+          frequency,
+          cpm,
           clicks,
           ctr,
           cpc,
-          conversions: 0, // Meta returns conversions in actions array; we can add later
+          linkClicks,
+          conversions,
+          costPerConversion,
           source: "meta" as const,
+          datePreset: "last_7d",
         });
       }
     } catch (err: unknown) {
@@ -845,6 +885,66 @@ app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: R
   }
 
   res.json(placeholder);
+});
+
+// Campaign adjustments: update status (pause/activate) or daily budget on Meta. Require metaCampaignId (and metaAdSetId for budget).
+app.patch("/experiments/:id/campaign-status", requireAuth, async (req: AuthRequest, res: Response) => {
+  const exp = experiments.find((e) => e.id === req.params.id);
+  if (!exp || exp.userId !== req.user!.id) {
+    return res.status(404).json({ error: "Campaign not found" });
+  }
+  const status = req.body?.status === "PAUSED" || req.body?.status === "ACTIVE" ? req.body.status : null;
+  if (!status) {
+    return res.status(400).json({ error: "Body must include status: 'ACTIVE' or 'PAUSED'" });
+  }
+  if (!exp.metaCampaignId) {
+    return res.status(400).json({ error: "Campaign is not linked to Meta. Launch to Meta first." });
+  }
+  const metaConn = connectedAccounts.find((c) => c.userId === req.user!.id && c.platform === "meta");
+  if (!metaConn) {
+    return res.status(400).json({ error: "Meta not connected. Connect Meta in Integrations." });
+  }
+  try {
+    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(exp.metaCampaignId)}?status=${status}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+    await axios.post(url);
+    return res.json({ ok: true, status });
+  } catch (err: unknown) {
+    const msg = err && typeof err === "object" && "response" in err
+      ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
+      : err instanceof Error ? err.message : "Meta API error";
+    console.error("[Meta campaign-status]", msg);
+    return res.status(502).json({ error: typeof msg === "string" ? msg : "Meta API error" });
+  }
+});
+
+app.patch("/experiments/:id/campaign-budget", requireAuth, async (req: AuthRequest, res: Response) => {
+  const exp = experiments.find((e) => e.id === req.params.id);
+  if (!exp || exp.userId !== req.user!.id) {
+    return res.status(404).json({ error: "Campaign not found" });
+  }
+  const dailyBudget = typeof req.body?.dailyBudget === "number" ? req.body.dailyBudget : null;
+  if (dailyBudget == null || dailyBudget < 1) {
+    return res.status(400).json({ error: "Body must include dailyBudget (number, min 1)" });
+  }
+  if (!exp.metaAdSetId) {
+    return res.status(400).json({ error: "Campaign has no linked Meta ad set. Launch to Meta first." });
+  }
+  const metaConn = connectedAccounts.find((c) => c.userId === req.user!.id && c.platform === "meta");
+  if (!metaConn) {
+    return res.status(400).json({ error: "Meta not connected. Connect Meta in Integrations." });
+  }
+  try {
+    const budgetCents = Math.round(dailyBudget * 100);
+    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(exp.metaAdSetId)}?daily_budget=${budgetCents}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+    await axios.post(url);
+    return res.json({ ok: true, dailyBudget });
+  } catch (err: unknown) {
+    const msg = err && typeof err === "object" && "response" in err
+      ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
+      : err instanceof Error ? err.message : "Meta API error";
+    console.error("[Meta campaign-budget]", msg);
+    return res.status(502).json({ error: typeof msg === "string" ? msg : "Meta API error" });
+  }
 });
 
 app.listen(PORT, () => {
