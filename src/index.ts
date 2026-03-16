@@ -108,11 +108,17 @@ interface VariantRecord {
   index: number;
   copy: string;
   status: string;
+  imageData?: string; // base64 PNG from DALL-E
 }
 
 // Temporary in-memory storage (no database yet)
 const experiments: ExperimentRecord[] = [];
 const variantsByExperimentId: Record<string, VariantRecord[]> = {};
+
+function variantToJson(v: VariantRecord): Omit<VariantRecord, "imageData"> & { hasCreative?: boolean } {
+  const { imageData, ...rest } = v;
+  return { ...rest, hasCreative: !!imageData };
+}
 
 // ----- Integrations: connected ad accounts (Meta, TikTok, Google) -----
 const META_APP_ID = (process.env.META_APP_ID || "").trim();
@@ -385,22 +391,22 @@ app.get("/experiments", requireAuth, (req: AuthRequest, res: Response) => {
   const list = experiments
     .filter((e) => e.userId === req.user!.id)
     .map((e) => {
-    const variants = variantsByExperimentId[e.id] || [];
-    return {
-      ...e,
-      variants,
-      variantCount: e.variantCount ?? variants.length
-    };
-  });
+      const variants = (variantsByExperimentId[e.id] || []).map(variantToJson);
+      return {
+        ...e,
+        variants,
+        variantCount: e.variantCount ?? variants.length
+      };
+    });
   res.json(list);
 });
 
-// Get one experiment with its variants (must belong to user)
+// Get one experiment with its variants (must belong to user). Variants omit imageData; use GET .../creative for image.
 app.get("/experiments/:id", requireAuth, (req: AuthRequest, res: Response) => {
   const exp = experiments.find((e) => e.id === req.params.id);
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
   if (exp.userId !== req.user!.id) return res.status(404).json({ error: "Experiment not found" });
-  const variants = variantsByExperimentId[exp.id] || [];
+  const variants = (variantsByExperimentId[exp.id] || []).map(variantToJson);
   res.json({ ...exp, variants });
 });
 
@@ -653,7 +659,65 @@ app.patch("/experiments/:experimentId/variants/:variantId", requireAuth, (req: A
   const variant = variants.find((v) => v.id === variantId);
   if (!variant) return res.status(404).json({ error: "Variant not found" });
   variant.copy = copy;
-  res.json(variant);
+  res.json(variantToJson(variant));
+});
+
+// Generate AI creative (image) for a variant using DALL-E. Stores base64 PNG on variant.
+app.post("/experiments/:experimentId/variants/:variantId/generate-creative", requireAuth, async (req: AuthRequest, res: Response) => {
+  const { experimentId, variantId } = req.params;
+  const exp = experiments.find((e) => e.id === experimentId);
+  if (!exp || exp.userId !== req.user!.id) {
+    return res.status(404).json({ error: "Experiment not found" });
+  }
+  const variants = variantsByExperimentId[experimentId];
+  if (!variants) return res.status(404).json({ error: "Experiment not found" });
+  const variant = variants.find((v) => v.id === variantId);
+  if (!variant) return res.status(404).json({ error: "Variant not found" });
+
+  const copy = (variant.copy || "").trim().slice(0, 500);
+  const imagePrompt =
+    `Professional advertising image for a social media ad. Visual only, no text or words in the image. ` +
+    `Style: clean, modern, high quality, suitable for Facebook or Instagram feed. ` +
+    `Theme or mood inspired by: ${copy || "modern marketing"}.`;
+
+  try {
+    const response = await openai.images.generate({
+      model: "dall-e-3",
+      prompt: imagePrompt,
+      n: 1,
+      size: "1024x1024",
+      response_format: "b64_json",
+      quality: "standard",
+    });
+    const b64 = response.data?.[0]?.b64_json;
+    if (!b64) {
+      return res.status(500).json({ error: "No image data from AI" });
+    }
+    variant.imageData = b64;
+    res.json({ hasCreative: true });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Image generation failed";
+    console.error("[generate-creative]", msg);
+    res.status(500).json({ error: String(msg) });
+  }
+});
+
+// Serve variant creative image (PNG). No auth on URL so img src works; variant is scoped by experiment ownership.
+app.get("/experiments/:experimentId/variants/:variantId/creative", requireAuth, (req: AuthRequest, res: Response) => {
+  const { experimentId, variantId } = req.params;
+  const exp = experiments.find((e) => e.id === experimentId);
+  if (!exp || exp.userId !== req.user!.id) {
+    return res.status(404).send();
+  }
+  const variants = variantsByExperimentId[experimentId];
+  const variant = variants?.find((v) => v.id === variantId);
+  if (!variant?.imageData) {
+    return res.status(404).send();
+  }
+  const buf = Buffer.from(variant.imageData, "base64");
+  res.setHeader("Content-Type", "image/png");
+  res.setHeader("Cache-Control", "private, max-age=3600");
+  res.send(buf);
 });
 
 // Regenerate one variant's copy with AI (same prompt, new angle)
@@ -679,7 +743,7 @@ app.post("/experiments/:experimentId/variants/:variantId/regenerate", requireAut
     const copies = await generateVariantsFromPrompt(promptText, exp.platform, 1);
     const newCopy = copies[0] || "";
     variant.copy = newCopy;
-    res.json({ copy: newCopy, variant });
+    res.json({ copy: newCopy, variant: variantToJson(variant) });
   } catch (err: any) {
     console.error("Regenerate variant failed", err?.message || err);
     res.status(500).json({ error: "Failed to regenerate ad copy" });
