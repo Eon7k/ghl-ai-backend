@@ -356,6 +356,28 @@ app.delete("/integrations/:id", requireAuth, (req: AuthRequest, res: Response) =
   res.json({ ok: true });
 });
 
+// Get Meta ad accounts for the connected Meta integration (so we can show/use them for launching).
+app.get("/integrations/meta/ad-accounts", requireAuth, async (req: AuthRequest, res: Response) => {
+  const metaConn = connectedAccounts.find(
+    (c) => c.userId === req.user!.id && c.platform === "meta"
+  );
+  if (!metaConn) {
+    return res.status(404).json({ error: "Meta not connected. Connect Meta in Integrations first." });
+  }
+  try {
+    const url = `https://graph.facebook.com/v21.0/me/adaccounts?fields=id,name,account_id,account_status&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+    const apiRes = await axios.get<{ data?: Array<{ id: string; name: string; account_id: string; account_status?: number }> }>(url);
+    const list = apiRes.data?.data || [];
+    res.json({ adAccounts: list.map((a) => ({ id: a.id, name: a.name, accountId: a.account_id, accountStatus: a.account_status })) });
+  } catch (err: unknown) {
+    const msg = err && typeof err === "object" && "response" in err
+      ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
+      : err instanceof Error ? err.message : "Failed to fetch ad accounts";
+    console.error("[Meta ad-accounts]", msg);
+    res.status(502).json({ error: typeof msg === "string" ? msg : "Meta API error" });
+  }
+});
+
 // ----- Experiments (auth required) -----
 // List all experiments for the logged-in user (with variants and variantCount)
 app.get("/experiments", requireAuth, (req: AuthRequest, res: Response) => {
