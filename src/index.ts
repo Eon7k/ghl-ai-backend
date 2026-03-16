@@ -99,6 +99,7 @@ interface ExperimentRecord {
   prompt?: string;
   variantCount?: number;
   creativesSource?: "ai" | "own";
+  aiCreativeCount?: number; // set at launch: how many variants get AI-created creatives (0 = none)
 }
 
 interface VariantRecord {
@@ -690,6 +691,10 @@ app.post("/experiments/:id/launch", requireAuth, (req: AuthRequest, res: Respons
   const exp = experiments.find((e) => e.id === req.params.id);
   if (!exp || exp.userId !== req.user!.id) {
     return res.status(404).json({ error: "Experiment not found" });
+  }
+  const aiCreativeCount = req.body?.aiCreativeCount;
+  if (typeof aiCreativeCount === "number" && aiCreativeCount >= 0) {
+    exp.aiCreativeCount = Math.min(aiCreativeCount, exp.variantCount ?? 20);
   }
   exp.status = "launched";
   exp.phase = "running";
