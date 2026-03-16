@@ -1,7 +1,9 @@
-import express, { Request, Response } from "express";
+import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import axios from "axios";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 import OpenAI from "openai";
 import { buildSystemPrompt, buildUserPrompt, buildVariantsFromOnePrompt, AdPlatform } from "./aiPromptTemplates";
 
@@ -10,15 +12,18 @@ if (process.env.NODE_ENV !== "production") {
   dotenv.config();
 }
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY || OPENAI_API_KEY.length < 10) {
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
+const isProduction = process.env.NODE_ENV === "production";
+console.log("[OPENAI] NODE_ENV:", process.env.NODE_ENV || "(not set)", "| Key present:", !!OPENAI_API_KEY, "| Key starts with sk-:", OPENAI_API_KEY.startsWith("sk-"));
+
+if (!OPENAI_API_KEY || OPENAI_API_KEY.length < 20) {
   console.warn(
-    "[WARN] OPENAI_API_KEY is not set or invalid. AI ad generation and regenerate will fail. " +
-    "Set OPENAI_API_KEY in .env (local) or in Render Environment (production)."
+    "[WARN] OPENAI_API_KEY is missing or too short. Set OPENAI_API_KEY in Render → Environment (exact name)."
   );
+} else if (!OPENAI_API_KEY.startsWith("sk-")) {
+  console.warn("[WARN] OPENAI_API_KEY should start with sk-. Check for typos or extra characters in Render.");
 } else {
-  const keyPreview = OPENAI_API_KEY.slice(0, 7) + "..." + OPENAI_API_KEY.slice(-4);
-  console.log("[OPENAI] Using API key:", keyPreview);
+  console.log("[OPENAI] Using key:", OPENAI_API_KEY.slice(0, 7) + "..." + OPENAI_API_KEY.slice(-4));
 }
 
 const openai = new OpenAI({
@@ -41,9 +46,51 @@ app.use(express.json());
 const PORT = process.env.PORT || 4000;
 const OPTIMIZER_URL = process.env.OPTIMIZER_URL || "http://localhost:5001";
 
+// Auth: user and JWT
+const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
+interface UserRecord {
+  id: string;
+  email: string;
+  passwordHash: string;
+  createdAt: string;
+}
+const usersByEmail = new Map<string, UserRecord>();
+const usersById = new Map<string, UserRecord>();
+
+function generateUserId(): string {
+  return `user-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+// Extend Express Request so we can attach user
+interface AuthRequest extends Request {
+  user?: { id: string; email: string };
+}
+
+function requireAuth(req: AuthRequest, res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) {
+    res.status(401).json({ error: "Authentication required" });
+    return;
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as { userId: string; email: string };
+    const user = usersById.get(payload.userId);
+    if (!user) {
+      res.status(401).json({ error: "User not found" });
+      return;
+    }
+    req.user = { id: user.id, email: user.email };
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
 // Experiment and variant types for Phase 2 (frontend API spec)
 interface ExperimentRecord {
   id: string;
+  userId: string;
   name: string;
   platform: string;
   status: string;
@@ -114,9 +161,71 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok" });
 });
 
-// List all experiments (with variants and variantCount for Phase 2)
-app.get("/experiments", (_req: Request, res: Response) => {
-  const list = experiments.map((e) => {
+// ----- Auth (no auth required for these) -----
+app.post("/auth/register", async (req: Request, res: Response) => {
+  const { email, password } = req.body;
+  if (!email || typeof email !== "string" || !password || typeof password !== "string") {
+    return res.status(400).json({ error: "email and password are required" });
+  }
+  const emailNorm = email.trim().toLowerCase();
+  if (emailNorm.length < 3) {
+    return res.status(400).json({ error: "Invalid email" });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters" });
+  }
+  if (usersByEmail.has(emailNorm)) {
+    return res.status(400).json({ error: "An account with this email already exists" });
+  }
+  const id = generateUserId();
+  const passwordHash = await bcrypt.hash(password, 10);
+  const user: UserRecord = { id, email: emailNorm, passwordHash, createdAt: new Date().toISOString() };
+  usersByEmail.set(emailNorm, user);
+  usersById.set(id, user);
+  const token = jwt.sign({ userId: id, email: emailNorm }, JWT_SECRET, { expiresIn: "7d" });
+  res.status(201).json({ token, user: { id, email: emailNorm } });
+});
+
+app.post("/auth/login", async (req: Request, res: Response) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: "email and password are required" });
+  }
+  const emailNorm = (email as string).trim().toLowerCase();
+  const user = usersByEmail.get(emailNorm);
+  if (!user) {
+    return res.status(401).json({ error: "Invalid email or password" });
+  }
+  const match = await bcrypt.compare(password as string, user.passwordHash);
+  if (!match) {
+    return res.status(401).json({ error: "Invalid email or password" });
+  }
+  const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
+  res.json({ token, user: { id: user.id, email: user.email } });
+});
+
+app.get("/auth/me", (req: AuthRequest, res: Response) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ error: "Not logged in" });
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as { userId: string; email: string };
+    const user = usersById.get(payload.userId);
+    if (!user) return res.status(401).json({ error: "User not found" });
+    res.json({ user: { id: user.id, email: user.email } });
+  } catch {
+    res.status(401).json({ error: "Invalid or expired token" });
+  }
+});
+
+// ----- Experiments (auth required) -----
+// List all experiments for the logged-in user (with variants and variantCount)
+app.get("/experiments", requireAuth, (req: AuthRequest, res: Response) => {
+  const list = experiments
+    .filter((e) => e.userId === req.user!.id)
+    .map((e) => {
     const variants = variantsByExperimentId[e.id] || [];
     return {
       ...e,
@@ -127,12 +236,11 @@ app.get("/experiments", (_req: Request, res: Response) => {
   res.json(list);
 });
 
-// Get one experiment with its variants
-app.get("/experiments/:id", (req: Request, res: Response) => {
+// Get one experiment with its variants (must belong to user)
+app.get("/experiments/:id", requireAuth, (req: AuthRequest, res: Response) => {
   const exp = experiments.find((e) => e.id === req.params.id);
-  if (!exp) {
-    return res.status(404).json({ error: "Experiment not found" });
-  }
+  if (!exp) return res.status(404).json({ error: "Experiment not found" });
+  if (exp.userId !== req.user!.id) return res.status(404).json({ error: "Experiment not found" });
   const variants = variantsByExperimentId[exp.id] || [];
   res.json({ ...exp, variants });
 });
@@ -304,7 +412,7 @@ async function generateVariantsFromPrompt(
 }
 
 // Create a new experiment with variants (Phase 2: creativesSource, prompt, variantCount)
-app.post("/experiments", async (req: Request, res: Response) => {
+app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) => {
   const {
     name,
     platform,
@@ -330,6 +438,7 @@ app.post("/experiments", async (req: Request, res: Response) => {
   const id = generateId();
   const newExperiment: ExperimentRecord = {
     id,
+    userId: req.user!.id,
     name,
     platform,
     status: "draft",
@@ -368,7 +477,7 @@ app.post("/experiments", async (req: Request, res: Response) => {
 });
 
 // Update one variant's copy (Phase 2)
-app.patch("/experiments/:experimentId/variants/:variantId", (req: Request, res: Response) => {
+app.patch("/experiments/:experimentId/variants/:variantId", requireAuth, (req: AuthRequest, res: Response) => {
   const { experimentId, variantId } = req.params;
   const { copy } = req.body;
 
@@ -376,24 +485,24 @@ app.patch("/experiments/:experimentId/variants/:variantId", (req: Request, res: 
     return res.status(400).json({ error: "Body must include copy (string)" });
   }
 
-  const variants = variantsByExperimentId[experimentId];
-  if (!variants) {
+  const exp = experiments.find((e) => e.id === experimentId);
+  if (!exp || exp.userId !== req.user!.id) {
     return res.status(404).json({ error: "Experiment not found" });
   }
+  const variants = variantsByExperimentId[experimentId];
+  if (!variants) return res.status(404).json({ error: "Experiment not found" });
   const variant = variants.find((v) => v.id === variantId);
-  if (!variant) {
-    return res.status(404).json({ error: "Variant not found" });
-  }
+  if (!variant) return res.status(404).json({ error: "Variant not found" });
   variant.copy = copy;
   res.json(variant);
 });
 
 // Regenerate one variant's copy with AI (same prompt, new angle)
-app.post("/experiments/:experimentId/variants/:variantId/regenerate", async (req: Request, res: Response) => {
+app.post("/experiments/:experimentId/variants/:variantId/regenerate", requireAuth, async (req: AuthRequest, res: Response) => {
   const { experimentId, variantId } = req.params;
 
   const exp = experiments.find((e) => e.id === experimentId);
-  if (!exp) {
+  if (!exp || exp.userId !== req.user!.id) {
     return res.status(404).json({ error: "Experiment not found" });
   }
 
@@ -419,9 +528,9 @@ app.post("/experiments/:experimentId/variants/:variantId/regenerate", async (req
 });
 
 // Launch experiment (Phase 2)
-app.post("/experiments/:id/launch", (req: Request, res: Response) => {
+app.post("/experiments/:id/launch", requireAuth, (req: AuthRequest, res: Response) => {
   const exp = experiments.find((e) => e.id === req.params.id);
-  if (!exp) {
+  if (!exp || exp.userId !== req.user!.id) {
     return res.status(404).json({ error: "Experiment not found" });
   }
   exp.status = "launched";
