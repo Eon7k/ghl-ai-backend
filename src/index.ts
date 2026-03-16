@@ -116,7 +116,14 @@ const variantsByExperimentId: Record<string, VariantRecord[]> = {};
 // ----- Integrations: connected ad accounts (Meta, TikTok, Google) -----
 const META_APP_ID = (process.env.META_APP_ID || "").trim();
 const META_APP_SECRET = (process.env.META_APP_SECRET || "").trim();
-const FRONTEND_URL = (process.env.FRONTEND_URL || "http://localhost:3000").replace(/\/$/, "");
+// Must be a full URL (https://...) so redirect after OAuth goes to the frontend, not a path on the backend
+function normalizeFrontendUrl(url: string): string {
+  const trimmed = url.replace(/\/$/, "");
+  if (!trimmed) return "http://localhost:3000";
+  if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) return trimmed;
+  return `https://${trimmed}`;
+}
+const FRONTEND_URL = normalizeFrontendUrl(process.env.FRONTEND_URL || "http://localhost:3000");
 
 interface ConnectedAccountRecord {
   id: string;
@@ -190,17 +197,18 @@ app.post("/auth/register", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "email and password are required" });
   }
   const emailNorm = email.trim().toLowerCase();
+  const passwordTrimmed = (password as string).trim();
   if (emailNorm.length < 3) {
     return res.status(400).json({ error: "Invalid email" });
   }
-  if (password.length < 8) {
+  if (passwordTrimmed.length < 8) {
     return res.status(400).json({ error: "Password must be at least 8 characters" });
   }
   if (usersByEmail.has(emailNorm)) {
     return res.status(400).json({ error: "An account with this email already exists" });
   }
   const id = generateUserId();
-  const passwordHash = await bcrypt.hash(password, 10);
+  const passwordHash = await bcrypt.hash(passwordTrimmed, 10);
   const user: UserRecord = { id, email: emailNorm, passwordHash, createdAt: new Date().toISOString() };
   usersByEmail.set(emailNorm, user);
   usersById.set(id, user);
@@ -214,11 +222,12 @@ app.post("/auth/login", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "email and password are required" });
   }
   const emailNorm = (email as string).trim().toLowerCase();
+  const passwordTrimmed = (password as string).trim();
   const user = usersByEmail.get(emailNorm);
   if (!user) {
     return res.status(401).json({ error: "Invalid email or password" });
   }
-  const match = await bcrypt.compare(password as string, user.passwordHash);
+  const match = await bcrypt.compare(passwordTrimmed, user.passwordHash);
   if (!match) {
     return res.status(401).json({ error: "Invalid email or password" });
   }
