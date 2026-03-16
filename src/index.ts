@@ -113,6 +113,28 @@ interface VariantRecord {
 const experiments: ExperimentRecord[] = [];
 const variantsByExperimentId: Record<string, VariantRecord[]> = {};
 
+// ----- Integrations: connected ad accounts (Meta, TikTok, Google) -----
+const META_APP_ID = (process.env.META_APP_ID || "").trim();
+const META_APP_SECRET = (process.env.META_APP_SECRET || "").trim();
+const FRONTEND_URL = (process.env.FRONTEND_URL || "http://localhost:3000").replace(/\/$/, "");
+
+interface ConnectedAccountRecord {
+  id: string;
+  userId: string;
+  platform: "meta" | "tiktok" | "google";
+  accessToken: string;
+  refreshToken?: string;
+  platformAccountId?: string;
+  platformAccountName?: string;
+  createdAt: string;
+}
+const connectedAccounts: ConnectedAccountRecord[] = [];
+const connectedAccountsById = new Map<string, ConnectedAccountRecord>();
+
+function generateIntegrationId(): string {
+  return `conn-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
 function generateId(): string {
   return `exp-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
@@ -218,6 +240,111 @@ app.get("/auth/me", (req: AuthRequest, res: Response) => {
   } catch {
     res.status(401).json({ error: "Invalid or expired token" });
   }
+});
+
+// ----- Integrations: connect ad accounts (Meta, etc.) -----
+app.get("/integrations", requireAuth, (req: AuthRequest, res: Response) => {
+  const list = connectedAccounts
+    .filter((c) => c.userId === req.user!.id)
+    .map(({ id, platform, platformAccountId, platformAccountName, createdAt }) => ({
+      id,
+      platform,
+      platformAccountId,
+      platformAccountName,
+      createdAt,
+    }));
+  res.json({ integrations: list });
+});
+
+// Start Meta OAuth: redirect user to Meta login. Call with ?token=JWT so we know the user (browser can't send Authorization on redirect).
+app.get("/integrations/meta/connect", (req: Request, res: Response) => {
+  const tokenParam = (req.query.token as string) || "";
+  const token = tokenParam.trim() || (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null);
+  if (!token) {
+    return res.status(401).send("Missing token. Log in and use the Connect Meta button from the Integrations page.");
+  }
+  let userId: string;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as { userId: string };
+    const user = usersById.get(payload.userId);
+    if (!user) return res.status(401).send("User not found");
+    userId = user.id;
+  } catch {
+    return res.status(401).send("Invalid or expired token. Please log in again.");
+  }
+  if (!META_APP_ID || !META_APP_SECRET) {
+    return res.status(503).send("Meta integration is not configured. Set META_APP_ID and META_APP_SECRET on the server.");
+  }
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
+  const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/meta/callback`;
+  const scope = "ads_management,ads_read,business_management";
+  const state = userId;
+  const metaAuthUrl = `https://www.facebook.com/v21.0/dialog/oauth?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${encodeURIComponent(state)}`;
+  res.redirect(302, metaAuthUrl);
+});
+
+// Meta OAuth callback: exchange code for access token, store for user, redirect to frontend.
+app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
+  const { code, state: userId, error: metaError } = req.query as { code?: string; state?: string; error?: string };
+  const frontendBase = FRONTEND_URL;
+  const integrationsPath = "/integrations";
+  if (metaError || !code) {
+    const err = metaError || "No authorization code received";
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(err)}`);
+    return;
+  }
+  if (!userId || !usersById.has(userId)) {
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("Invalid state")}`);
+    return;
+  }
+  if (!META_APP_ID || !META_APP_SECRET) {
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("Meta not configured")}`);
+    return;
+  }
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
+  const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/meta/callback`;
+  const tokenUrl = `https://graph.facebook.com/v21.0/oauth/access_token?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${encodeURIComponent(META_APP_SECRET)}&code=${encodeURIComponent(code)}`;
+  try {
+    const tokenRes = await axios.get<{ access_token: string; token_type?: string }>(tokenUrl);
+    const accessToken = tokenRes.data?.access_token;
+    if (!accessToken) {
+      res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("No token from Meta")}`);
+      return;
+    }
+    // Remove any existing Meta connection for this user (one Meta account per user for now)
+    const existing = connectedAccounts.filter((c) => c.userId === userId && c.platform === "meta");
+    existing.forEach((c) => {
+      connectedAccountsById.delete(c.id);
+    });
+    const newList = connectedAccounts.filter((c) => !(c.userId === userId && c.platform === "meta"));
+    connectedAccounts.length = 0;
+    connectedAccounts.push(...newList);
+
+    const id = generateIntegrationId();
+    const record: ConnectedAccountRecord = {
+      id,
+      userId,
+      platform: "meta",
+      accessToken,
+      createdAt: new Date().toISOString(),
+    };
+    connectedAccounts.push(record);
+    connectedAccountsById.set(id, record);
+    res.redirect(302, `${frontendBase}${integrationsPath}?connected=meta`);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Token exchange failed";
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(message))}`);
+  }
+});
+
+app.delete("/integrations/:id", requireAuth, (req: AuthRequest, res: Response) => {
+  const conn = connectedAccountsById.get(req.params.id);
+  if (!conn) return res.status(404).json({ error: "Connection not found" });
+  if (conn.userId !== req.user!.id) return res.status(404).json({ error: "Connection not found" });
+  connectedAccountsById.delete(conn.id);
+  const idx = connectedAccounts.findIndex((c) => c.id === conn.id);
+  if (idx !== -1) connectedAccounts.splice(idx, 1);
+  res.json({ ok: true });
 });
 
 // ----- Experiments (auth required) -----
