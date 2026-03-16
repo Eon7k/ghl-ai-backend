@@ -100,6 +100,8 @@ interface ExperimentRecord {
   variantCount?: number;
   creativesSource?: "ai" | "own";
   aiCreativeCount?: number; // set at launch: how many variants get AI-created creatives (0 = none)
+  /** When we create a campaign on Meta, store its ID here so we can fetch insights */
+  metaCampaignId?: string;
 }
 
 interface VariantRecord {
@@ -763,6 +765,86 @@ app.post("/experiments/:id/launch", requireAuth, (req: AuthRequest, res: Respons
   exp.status = "launched";
   exp.phase = "running";
   res.json(exp);
+});
+
+// Campaign metrics: for launched campaigns, return spend/impressions/clicks etc. From Meta when we have metaCampaignId.
+interface CampaignMetricsResponse {
+  spend: number;
+  impressions: number;
+  clicks: number;
+  ctr: number;
+  cpc: number;
+  conversions: number;
+  source: "placeholder" | "meta";
+}
+
+function parseNum(value: unknown): number {
+  if (typeof value === "number" && !Number.isNaN(value)) return value;
+  if (typeof value === "string") {
+    const n = parseFloat(value);
+    return Number.isNaN(n) ? 0 : n;
+  }
+  return 0;
+}
+
+app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: Response) => {
+  const exp = experiments.find((e) => e.id === req.params.id);
+  if (!exp || exp.userId !== req.user!.id) {
+    return res.status(404).json({ error: "Campaign not found" });
+  }
+  if (exp.status !== "launched") {
+    return res.status(400).json({ error: "Campaign is not launched" });
+  }
+
+  const placeholder: CampaignMetricsResponse = {
+    spend: 0,
+    impressions: 0,
+    clicks: 0,
+    ctr: 0,
+    cpc: 0,
+    conversions: 0,
+    source: "placeholder",
+  };
+
+  if (exp.platform === "meta" && exp.metaCampaignId) {
+    const metaConn = connectedAccounts.find(
+      (c) => c.userId === req.user!.id && c.platform === "meta"
+    );
+    if (!metaConn) {
+      return res.json(placeholder);
+    }
+    try {
+      const fields = "spend,impressions,clicks,ctr,cpc";
+      const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(exp.metaCampaignId)}/insights?fields=${fields}&date_preset=last_7d&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+      const apiRes = await axios.get<{ data?: Array<Record<string, unknown>> }>(url);
+      const insights = apiRes.data?.data;
+      const row = Array.isArray(insights) && insights.length > 0 ? insights[0] : null;
+      if (row) {
+        const spend = parseNum(row.spend);
+        const impressions = parseNum(row.impressions);
+        const clicks = parseNum(row.clicks);
+        const ctr = parseNum(row.ctr);
+        const cpc = parseNum(row.cpc);
+        return res.json({
+          spend,
+          impressions,
+          clicks,
+          ctr,
+          cpc,
+          conversions: 0, // Meta returns conversions in actions array; we can add later
+          source: "meta" as const,
+        });
+      }
+    } catch (err: unknown) {
+      const msg = err && typeof err === "object" && "response" in err
+        ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
+        : err instanceof Error ? err.message : "Meta API error";
+      console.error("[Meta metrics]", msg);
+      return res.json(placeholder);
+    }
+  }
+
+  res.json(placeholder);
 });
 
 app.listen(PORT, () => {
