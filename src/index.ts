@@ -134,6 +134,8 @@ interface VariantRecord {
   copy: string;
   status: string;
   imageData?: string; // base64 PNG from DALL-E
+  /** Which AI generated this variant (openai | anthropic). Set when experiment uses AI copy. */
+  aiSource?: "openai" | "anthropic";
 }
 
 // Temporary in-memory storage (no database yet)
@@ -684,8 +686,11 @@ type AiProviderOption = "openai" | "anthropic" | "split";
 
 function parseVariantsFromContent(content: string, count: number): string[] {
   let trimmed = content.trim();
-  const codeFence = trimmed.match(/^```(?:json)?\s*([\s\S]*?)```$/);
+  // Strip markdown code blocks (Anthropic often wraps JSON in ```json ... ```)
+  const codeFence = trimmed.match(/^```(?:json)?\s*([\s\S]*?)```$/m);
   if (codeFence) trimmed = codeFence[1].trim();
+  const innerBlock = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (innerBlock) trimmed = innerBlock[1].trim();
 
   let parsed: unknown;
   try {
@@ -743,11 +748,11 @@ async function generateWithAnthropic(prompt: string, platform: string, count: nu
   const systemPrompt =
     "You are an expert ad copywriter. You write NEW, original ad copy. " +
     "Never repeat or echo the user's idea text as the headline or body. " +
-    "Output only valid JSON: a single object with key \"variants\" whose value is an array of objects. Each object must have \"headline\" and \"primaryText\" as strings.";
+    "Output only valid JSON: a single object with key \"variants\" whose value is an array of objects. Each object must have \"headline\" and \"primaryText\" as strings. Do not wrap the JSON in markdown code blocks.";
   const userPrompt = buildVariantsFromOnePrompt(prompt, platform as AdPlatform, count);
 
   const message = await anthropic!.messages.create({
-    model: "claude-3-5-haiku-20241022",
+    model: "claude-3-5-haiku-latest",
     max_tokens: 4096,
     system: systemPrompt,
     messages: [{ role: "user", content: userPrompt }]
@@ -765,21 +770,33 @@ async function generateVariantsFromPrompt(
   count: number,
   provider: AiProviderOption = "openai"
 ): Promise<string[]> {
-  const useAnthropic = anthropic && (provider === "anthropic" || provider === "split");
-  const useOpenAI = provider === "openai" || provider === "split" || !useAnthropic;
-
   if (provider === "split" && anthropic) {
     const half = Math.ceil(count / 2);
     const rest = count - half;
-    const [openaiCopies, anthropicCopies] = await Promise.all([
-      generateWithOpenAI(prompt, platform, half),
-      generateWithAnthropic(prompt, platform, rest)
-    ]);
+    let openaiCopies: string[];
+    let anthropicCopies: string[];
+    try {
+      openaiCopies = await generateWithOpenAI(prompt, platform, half);
+    } catch (err: any) {
+      console.error("[AI] OpenAI half failed in split, retrying:", err?.message || err);
+      openaiCopies = await generateWithOpenAI(prompt, platform, half);
+    }
+    try {
+      anthropicCopies = await generateWithAnthropic(prompt, platform, rest);
+    } catch (err: any) {
+      console.error("[AI] Anthropic half failed in split, using OpenAI for rest:", err?.message || err);
+      anthropicCopies = await generateWithOpenAI(prompt, platform, rest);
+    }
     return [...openaiCopies, ...anthropicCopies];
   }
 
   if (provider === "anthropic" && anthropic) {
-    return generateWithAnthropic(prompt, platform, count);
+    try {
+      return await generateWithAnthropic(prompt, platform, count);
+    } catch (err: any) {
+      console.error("[AI] Anthropic failed, falling back to OpenAI:", err?.message || err);
+      return generateWithOpenAI(prompt, platform, count);
+    }
   }
 
   return generateWithOpenAI(prompt, platform, count);
@@ -842,15 +859,23 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     }
   }
 
+  const half = source === "ai" && (aiProvider === "split") ? Math.ceil(count / 2) : 0;
   const variants: VariantRecord[] = copies.map((copy, i) => {
     const text = (typeof copy === "string" && copy.trim()) ? copy.trim() : "";
     const fallback = source === "own" ? "Paste your ad copy here..." : `Variant ${i + 1} — Ad copy`;
+    let aiSource: "openai" | "anthropic" | undefined;
+    if (source === "ai" && aiProvider) {
+      if (aiProvider === "openai") aiSource = "openai";
+      else if (aiProvider === "anthropic") aiSource = "anthropic";
+      else if (aiProvider === "split") aiSource = i < half ? "openai" : "anthropic";
+    }
     return {
       id: generateVariantId(),
       experimentId: id,
       index: i + 1,
       copy: text || fallback,
-      status: "draft"
+      status: "draft",
+      ...(aiSource && { aiSource }),
     };
   });
 
@@ -961,6 +986,7 @@ app.post("/experiments/:experimentId/variants/:variantId/regenerate", requireAut
     const copies = await generateVariantsFromPrompt(promptText, exp.platform, 1);
     const newCopy = copies[0] || "";
     variant.copy = newCopy;
+    variant.aiSource = "openai"; // regenerate always uses OpenAI
     res.json({ copy: newCopy, variant: variantToJson(variant) });
   } catch (err: any) {
     console.error("Regenerate variant failed", err?.message || err);
