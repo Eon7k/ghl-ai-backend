@@ -942,11 +942,12 @@ async function generateVariantsFromPrompt(
   return generateWithOpenAI(prompt, platform, count);
 }
 
-// Create a new experiment with variants (Phase 2: creativesSource, prompt, variantCount)
+// Create one or more experiments (same campaign, one per platform when platforms[] has multiple)
 app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) => {
   const {
     name,
-    platform,
+    platform: platformBody,
+    platforms: platformsBody,
     totalDailyBudget,
     prompt,
     variantCount,
@@ -958,10 +959,17 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
   const aiProvider: AiProviderOption =
     aiProviderBody === "anthropic" || aiProviderBody === "split" ? aiProviderBody : "openai";
 
-  if (!name || !platform || typeof totalDailyBudget !== "number") {
+  const platformsList: string[] =
+    Array.isArray(platformsBody) && platformsBody.length > 0
+      ? platformsBody.filter((p: string) => p === "meta" || p === "google" || p === "tiktok")
+      : platformBody
+        ? [platformBody]
+        : [];
+
+  if (!name || platformsList.length === 0 || typeof totalDailyBudget !== "number") {
     return res
       .status(400)
-      .json({ error: "name, platform, totalDailyBudget are required" });
+      .json({ error: "name, platform or platforms (array), and totalDailyBudget are required" });
   }
 
   const count = Math.min(20, Math.max(1, Number(variantCount) || 3));
@@ -970,33 +978,17 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     typeof prompt === "string" && prompt.trim()
       ? prompt.trim()
       : "Generate varied ad copy for this campaign.";
-
-  const id = generateId();
   const creativePrompt =
     typeof creativePromptBody === "string" && creativePromptBody.trim() ? creativePromptBody.trim() : undefined;
-  const newExperiment: ExperimentRecord = {
-    id,
-    userId: req.user!.id,
-    name,
-    platform,
-    status: "draft",
-    phase: "setup",
-    totalDailyBudget: Number(totalDailyBudget),
-    prompt: promptText,
-    variantCount: count,
-    creativesSource: source,
-    ...(source === "ai" && { aiProvider }),
-    ...(creativePrompt && { creativePrompt }),
-  };
 
-  experiments.push(newExperiment);
+  const platformForAi = platformsList[0];
 
   let copies: string[];
   if (source === "own") {
     copies = Array.from({ length: count }, () => "");
   } else {
     try {
-      copies = await generateVariantsFromPrompt(promptText, platform, count, aiProvider);
+      copies = await generateVariantsFromPrompt(promptText, platformForAi, count, aiProvider);
     } catch (err: any) {
       console.error("AI variant generation failed", err?.message || err);
       copies = Array.from({ length: count }, (_, i) => `Variant ${i + 1} — Ad copy (generation failed; use Regenerate to try again)`);
@@ -1004,28 +996,57 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
   }
 
   const half = source === "ai" && (aiProvider === "split") ? Math.ceil(count / 2) : 0;
-  const variants: VariantRecord[] = copies.map((copy, i) => {
-    const text = (typeof copy === "string" && copy.trim()) ? copy.trim() : "";
-    const fallback = source === "own" ? "Paste your ad copy here..." : `Variant ${i + 1} — Ad copy`;
-    let aiSource: "openai" | "anthropic" | undefined;
-    if (source === "ai" && aiProvider) {
-      if (aiProvider === "openai") aiSource = "openai";
-      else if (aiProvider === "anthropic") aiSource = "anthropic";
-      else if (aiProvider === "split") aiSource = i < half ? "openai" : "anthropic";
-    }
-    return {
-      id: generateVariantId(),
-      experimentId: id,
-      index: i + 1,
-      copy: text || fallback,
+  const createdExperimentIds: string[] = [];
+
+  for (const platform of platformsList) {
+    const id = generateId();
+    const newExperiment: ExperimentRecord = {
+      id,
+      userId: req.user!.id,
+      name,
+      platform,
       status: "draft",
-      ...(aiSource && { aiSource }),
+      phase: "setup",
+      totalDailyBudget: Number(totalDailyBudget),
+      prompt: promptText,
+      variantCount: count,
+      creativesSource: source,
+      ...(source === "ai" && { aiProvider }),
+      ...(creativePrompt && { creativePrompt }),
     };
+    experiments.push(newExperiment);
+    createdExperimentIds.push(id);
+
+    const variants: VariantRecord[] = copies.map((copy, i) => {
+      const text = (typeof copy === "string" && copy.trim()) ? copy.trim() : "";
+      const fallback = source === "own" ? "Paste your ad copy here..." : `Variant ${i + 1} — Ad copy`;
+      let aiSource: "openai" | "anthropic" | undefined;
+      if (source === "ai" && aiProvider) {
+        if (aiProvider === "openai") aiSource = "openai";
+        else if (aiProvider === "anthropic") aiSource = "anthropic";
+        else if (aiProvider === "split") aiSource = i < half ? "openai" : "anthropic";
+      }
+      return {
+        id: generateVariantId(),
+        experimentId: id,
+        index: i + 1,
+        copy: text || fallback,
+        status: "draft",
+        ...(aiSource && { aiSource }),
+      };
+    });
+    variantsByExperimentId[id] = variants;
+  }
+
+  const firstId = createdExperimentIds[0];
+  const firstExp = experiments.find((e) => e.id === firstId)!;
+  const firstVariants = variantsByExperimentId[firstId] || [];
+
+  res.status(201).json({
+    ...firstExp,
+    variants: firstVariants.map(variantToJson),
+    createdExperimentIds,
   });
-
-  variantsByExperimentId[id] = variants;
-
-  res.status(201).json({ ...newExperiment, variants });
 });
 
 // Update one variant's copy (Phase 2)
