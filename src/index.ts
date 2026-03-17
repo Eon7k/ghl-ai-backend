@@ -94,6 +94,18 @@ function requireAuth(req: AuthRequest, res: Response, next: NextFunction): void 
   }
 }
 
+// Admin: only these emails can access /admin and see extra metrics
+const ADMIN_EMAILS = new Set(
+  (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+function isAdmin(email: string): boolean {
+  return ADMIN_EMAILS.has(email.toLowerCase().trim());
+}
+
 // Experiment and variant types for Phase 2 (frontend API spec)
 interface ExperimentRecord {
   id: string;
@@ -106,6 +118,8 @@ interface ExperimentRecord {
   prompt?: string;
   variantCount?: number;
   creativesSource?: "ai" | "own";
+  /** Which AI generated ad copy: openai, anthropic, or split (half each). Only set when creativesSource === "ai". */
+  aiProvider?: "openai" | "anthropic" | "split";
   aiCreativeCount?: number; // set at launch: how many variants get AI-created creatives (0 = none)
   /** When we create a campaign on Meta, store its ID here so we can fetch insights and update status */
   metaCampaignId?: string;
@@ -265,11 +279,19 @@ app.get("/auth/me", (req: AuthRequest, res: Response) => {
     const payload = jwt.verify(token, JWT_SECRET) as { userId: string; email: string };
     const user = usersById.get(payload.userId);
     if (!user) return res.status(401).json({ error: "User not found" });
-    res.json({ user: { id: user.id, email: user.email } });
+    res.json({ user: { id: user.id, email: user.email }, isAdmin: isAdmin(user.email) });
   } catch {
     res.status(401).json({ error: "Invalid or expired token" });
   }
 });
+
+function requireAdmin(req: AuthRequest, res: Response, next: NextFunction): void {
+  if (!req.user || !isAdmin(req.user.email)) {
+    res.status(403).json({ error: "Admin access required" });
+    return;
+  }
+  next();
+}
 
 // ----- Integrations: connect ad accounts (Meta, etc.) -----
 app.get("/integrations", requireAuth, (req: AuthRequest, res: Response) => {
@@ -802,7 +824,8 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     totalDailyBudget: Number(totalDailyBudget),
     prompt: promptText,
     variantCount: count,
-    creativesSource: source
+    creativesSource: source,
+    ...(source === "ai" && { aiProvider }),
   };
 
   experiments.push(newExperiment);
@@ -997,6 +1020,66 @@ function parseConversionsFromActions(actions: unknown): number {
   return total;
 }
 
+const placeholderMetrics: CampaignMetricsResponse = {
+  spend: 0,
+  impressions: 0,
+  reach: 0,
+  frequency: 0,
+  cpm: 0,
+  clicks: 0,
+  ctr: 0,
+  cpc: 0,
+  linkClicks: 0,
+  conversions: 0,
+  costPerConversion: 0,
+  source: "placeholder",
+};
+
+/** Fetch Meta insights for a campaign; used by metrics route and admin aggregation. */
+async function fetchMetaMetrics(
+  metaCampaignId: string,
+  accessToken: string
+): Promise<Omit<CampaignMetricsResponse, "source" | "datePreset"> | null> {
+  try {
+    const fields = "spend,impressions,reach,frequency,cpm,clicks,ctr,cpc,inline_link_clicks,actions";
+    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(metaCampaignId)}/insights?fields=${fields}&date_preset=last_7d&access_token=${encodeURIComponent(accessToken)}`;
+    const apiRes = await axios.get<{ data?: Array<Record<string, unknown>> }>(url);
+    const insights = apiRes.data?.data;
+    const row = Array.isArray(insights) && insights.length > 0 ? insights[0] : null;
+    if (!row) return null;
+    const spend = parseNum(row.spend);
+    const impressions = parseNum(row.impressions);
+    const reach = parseNum(row.reach);
+    const frequency = parseNum(row.frequency);
+    const cpm = parseNum(row.cpm);
+    const clicks = parseNum(row.clicks);
+    const ctr = parseNum(row.ctr);
+    const cpc = parseNum(row.cpc);
+    const linkClicks = parseNum(row.inline_link_clicks);
+    const conversions = parseConversionsFromActions(row.actions);
+    const costPerConversion = conversions > 0 ? spend / conversions : 0;
+    return {
+      spend,
+      impressions,
+      reach,
+      frequency,
+      cpm,
+      clicks,
+      ctr,
+      cpc,
+      linkClicks,
+      conversions,
+      costPerConversion,
+    };
+  } catch (err: unknown) {
+    const msg = err && typeof err === "object" && "response" in err
+      ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
+      : err instanceof Error ? err.message : "Meta API error";
+    console.error("[Meta metrics]", msg);
+    return null;
+  }
+}
+
 app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: Response) => {
   const exp = experiments.find((e) => e.id === req.params.id);
   if (!exp || exp.userId !== req.user!.id) {
@@ -1006,72 +1089,17 @@ app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: R
     return res.status(400).json({ error: "Campaign is not launched" });
   }
 
-  const placeholder: CampaignMetricsResponse = {
-    spend: 0,
-    impressions: 0,
-    reach: 0,
-    frequency: 0,
-    cpm: 0,
-    clicks: 0,
-    ctr: 0,
-    cpc: 0,
-    linkClicks: 0,
-    conversions: 0,
-    costPerConversion: 0,
-    source: "placeholder",
-  };
-
   if (exp.platform === "meta" && exp.metaCampaignId) {
     const metaConn = connectedAccounts.find(
       (c) => c.userId === req.user!.id && c.platform === "meta"
     );
-    if (!metaConn) {
-      return res.json(placeholder);
-    }
-    try {
-      const fields = "spend,impressions,reach,frequency,cpm,clicks,ctr,cpc,inline_link_clicks,actions";
-      const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(exp.metaCampaignId)}/insights?fields=${fields}&date_preset=last_7d&access_token=${encodeURIComponent(metaConn.accessToken)}`;
-      const apiRes = await axios.get<{ data?: Array<Record<string, unknown>> }>(url);
-      const insights = apiRes.data?.data;
-      const row = Array.isArray(insights) && insights.length > 0 ? insights[0] : null;
-      if (row) {
-        const spend = parseNum(row.spend);
-        const impressions = parseNum(row.impressions);
-        const reach = parseNum(row.reach);
-        const frequency = parseNum(row.frequency);
-        const cpm = parseNum(row.cpm);
-        const clicks = parseNum(row.clicks);
-        const ctr = parseNum(row.ctr);
-        const cpc = parseNum(row.cpc);
-        const linkClicks = parseNum(row.inline_link_clicks);
-        const conversions = parseConversionsFromActions(row.actions);
-        const costPerConversion = conversions > 0 ? spend / conversions : 0;
-        return res.json({
-          spend,
-          impressions,
-          reach,
-          frequency,
-          cpm,
-          clicks,
-          ctr,
-          cpc,
-          linkClicks,
-          conversions,
-          costPerConversion,
-          source: "meta" as const,
-          datePreset: "last_7d",
-        });
-      }
-    } catch (err: unknown) {
-      const msg = err && typeof err === "object" && "response" in err
-        ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
-        : err instanceof Error ? err.message : "Meta API error";
-      console.error("[Meta metrics]", msg);
-      return res.json(placeholder);
+    if (metaConn) {
+      const m = await fetchMetaMetrics(exp.metaCampaignId, metaConn.accessToken);
+      if (m) return res.json({ ...m, source: "meta" as const, datePreset: "last_7d" });
     }
   }
 
-  res.json(placeholder);
+  return res.json(placeholderMetrics);
 });
 
 // Campaign adjustments: update status (pause/activate) or daily budget on Meta. Require metaCampaignId (and metaAdSetId for budget).
@@ -1132,6 +1160,83 @@ app.patch("/experiments/:id/campaign-budget", requireAuth, async (req: AuthReque
     console.error("[Meta campaign-budget]", msg);
     return res.status(502).json({ error: typeof msg === "string" ? msg : "Meta API error" });
   }
+});
+
+// ----- Admin: extra metrics and AI performance (only for ADMIN_EMAILS) -----
+app.get("/admin/overview", requireAuth, requireAdmin, (_req: AuthRequest, res: Response) => {
+  const totalUsers = usersById.size;
+  const totalCampaigns = experiments.length;
+  const launched = experiments.filter((e) => e.status === "launched");
+  const byPlatform: Record<string, number> = {};
+  const byStatus: Record<string, number> = {};
+  for (const e of experiments) {
+    byPlatform[e.platform] = (byPlatform[e.platform] || 0) + 1;
+    byStatus[e.status] = (byStatus[e.status] || 0) + 1;
+  }
+  res.json({
+    totalUsers,
+    totalCampaigns,
+    launchedCampaigns: launched.length,
+    byPlatform,
+    byStatus,
+    funnel: { created: totalCampaigns, launched: launched.length },
+  });
+});
+
+app.get("/admin/ai-performance", requireAuth, requireAdmin, async (_req: AuthRequest, res: Response) => {
+  type ProviderKey = "openai" | "anthropic" | "split";
+  const agg: Record<
+    ProviderKey,
+    { campaigns: number; spend: number; impressions: number; clicks: number; conversions: number; ctrSum: number; cpcSum: number }
+  > = {
+    openai: { campaigns: 0, spend: 0, impressions: 0, clicks: 0, conversions: 0, ctrSum: 0, cpcSum: 0 },
+    anthropic: { campaigns: 0, spend: 0, impressions: 0, clicks: 0, conversions: 0, ctrSum: 0, cpcSum: 0 },
+    split: { campaigns: 0, spend: 0, impressions: 0, clicks: 0, conversions: 0, ctrSum: 0, cpcSum: 0 },
+  };
+
+  const launchedWithAi = experiments.filter(
+    (e) => e.status === "launched" && e.aiProvider && e.platform === "meta" && e.metaCampaignId
+  );
+
+  for (const exp of launchedWithAi) {
+    const metaConn = connectedAccounts.find((c) => c.userId === exp.userId && c.platform === "meta");
+    if (!metaConn || !exp.metaCampaignId) continue;
+    const m = await fetchMetaMetrics(exp.metaCampaignId, metaConn.accessToken);
+    const provider = (exp.aiProvider || "openai") as ProviderKey;
+    if (!agg[provider]) agg[provider] = { campaigns: 0, spend: 0, impressions: 0, clicks: 0, conversions: 0, ctrSum: 0, cpcSum: 0 };
+    agg[provider].campaigns += 1;
+    if (m) {
+      agg[provider].spend += m.spend;
+      agg[provider].impressions += m.impressions;
+      agg[provider].clicks += m.clicks;
+      agg[provider].conversions += m.conversions;
+      agg[provider].ctrSum += m.ctr;
+      agg[provider].cpcSum += m.cpc;
+    }
+  }
+
+  const byProvider = Object.fromEntries(
+    (["openai", "anthropic", "split"] as const).map((key) => {
+      const a = agg[key];
+      const campaigns = a.campaigns;
+      const avgCtr = campaigns > 0 ? a.ctrSum / campaigns : 0;
+      const avgCpc = campaigns > 0 ? a.cpcSum / campaigns : 0;
+      return [
+        key,
+        {
+          campaigns,
+          spend: Math.round(a.spend * 100) / 100,
+          impressions: a.impressions,
+          clicks: a.clicks,
+          conversions: a.conversions,
+          avgCtr: Math.round(avgCtr * 10000) / 100,
+          avgCpc: Math.round(avgCpc * 100) / 100,
+        },
+      ];
+    })
+  );
+
+  res.json({ byProvider });
 });
 
 app.listen(PORT, () => {
