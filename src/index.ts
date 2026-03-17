@@ -838,17 +838,21 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       copies = await generateVariantsFromPrompt(promptText, platform, count, aiProvider);
     } catch (err: any) {
       console.error("AI variant generation failed", err?.message || err);
-      copies = Array.from({ length: count }, (_, i) => `[Variant ${i + 1}] ${promptText.slice(0, 80)}...`);
+      copies = Array.from({ length: count }, (_, i) => `Variant ${i + 1} — Ad copy (generation failed; use Regenerate to try again)`);
     }
   }
 
-  const variants: VariantRecord[] = copies.map((copy, i) => ({
-    id: generateVariantId(),
-    experimentId: id,
-    index: i + 1,
-    copy: copy || (source === "own" ? "Paste your ad copy here..." : copy),
-    status: "draft"
-  }));
+  const variants: VariantRecord[] = copies.map((copy, i) => {
+    const text = (typeof copy === "string" && copy.trim()) ? copy.trim() : "";
+    const fallback = source === "own" ? "Paste your ad copy here..." : `Variant ${i + 1} — Ad copy`;
+    return {
+      id: generateVariantId(),
+      experimentId: id,
+      index: i + 1,
+      copy: text || fallback,
+      status: "draft"
+    };
+  });
 
   variantsByExperimentId[id] = variants;
 
