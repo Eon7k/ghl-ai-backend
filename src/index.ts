@@ -125,6 +125,8 @@ interface ExperimentRecord {
   creativePrompt?: string;
   /** IDs of user creatives from the library attached to this campaign (when using own or mixed creatives). */
   attachedCreativeIds?: string[];
+  /** When same campaign is launched on multiple platforms, all experiments share this id for grouping in Campaign Manager. */
+  campaignGroupId?: string;
   metaCampaignId?: string;
   metaAdSetId?: string;
 }
@@ -1066,6 +1068,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
 
   const half = (source === "ai" || source === "mix") && (aiProvider === "split") ? Math.ceil(count / 2) : 0;
   const createdExperimentIds: string[] = [];
+  const campaignGroupId = platformsList.length > 1 ? `cg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}` : undefined;
 
   for (const platform of platformsList) {
     const id = generateId();
@@ -1083,6 +1086,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       ...((source === "ai" || source === "mix") && { aiProvider }),
       ...(creativePrompt && { creativePrompt }),
       ...(attachedCreativeIds.length > 0 && { attachedCreativeIds }),
+      campaignGroupId: campaignGroupId ?? id,
     };
     experiments.push(newExperiment);
     createdExperimentIds.push(id);
