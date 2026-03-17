@@ -123,6 +123,8 @@ interface ExperimentRecord {
   aiCreativeCount?: number; // set at launch: how many variants get AI-created creatives (0 = none)
   /** Optional: how the user wants the ad image/creative to look (used when generating AI creatives). */
   creativePrompt?: string;
+  /** IDs of user creatives from the library attached to this campaign (when using own or mixed creatives). */
+  attachedCreativeIds?: string[];
   metaCampaignId?: string;
   metaAdSetId?: string;
 }
@@ -136,6 +138,22 @@ interface VariantRecord {
   imageData?: string; // base64 PNG from DALL-E
   /** Which AI generated this variant (openai | anthropic). Set when experiment uses AI copy. */
   aiSource?: "openai" | "anthropic";
+}
+
+// User creatives library (stored images; can be attached to campaigns)
+interface CreativeRecord {
+  id: string;
+  userId: string;
+  name: string;
+  /** base64 image data (e.g. data:image/png;base64,... or raw base64) */
+  imageData: string;
+  createdAt: string;
+}
+const creatives: CreativeRecord[] = [];
+const creativesById = new Map<string, CreativeRecord>();
+
+function generateCreativeId(): string {
+  return `creative-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
 // Temporary in-memory storage (no database yet)
@@ -343,18 +361,18 @@ app.get("/integrations/meta/connect", (req: Request, res: Response) => {
 app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
   const { code, state: userId, error: metaError } = req.query as { code?: string; state?: string; error?: string };
   const frontendBase = FRONTEND_URL;
-  const integrationsPath = "/integrations";
+  const redirectPath = "/";
   if (metaError || !code) {
     const err = metaError || "No authorization code received";
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(err)}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(err)}`);
     return;
   }
   if (!userId || !usersById.has(userId)) {
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("Invalid state")}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("Invalid state")}`);
     return;
   }
   if (!META_APP_ID || !META_APP_SECRET) {
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("Meta not configured")}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("Meta not configured")}`);
     return;
   }
   const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
@@ -364,7 +382,7 @@ app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
     const tokenRes = await axios.get<{ access_token: string; token_type?: string }>(tokenUrl);
     const accessToken = tokenRes.data?.access_token;
     if (!accessToken) {
-      res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("No token from Meta")}`);
+      res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("No token from Meta")}`);
       return;
     }
     // Remove any existing Meta connection for this user (one Meta account per user for now)
@@ -386,10 +404,10 @@ app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
     };
     connectedAccounts.push(record);
     connectedAccountsById.set(id, record);
-    res.redirect(302, `${frontendBase}${integrationsPath}?connected=meta`);
+    res.redirect(302, `${frontendBase}${redirectPath}?connected=meta`);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Token exchange failed";
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(message))}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(message))}`);
   }
 });
 
@@ -425,19 +443,19 @@ app.get("/integrations/tiktok/connect", (req: Request, res: Response) => {
 app.get("/integrations/tiktok/callback", async (req: Request, res: Response) => {
   const { auth_code: authCode, code, state: userId, error: tiktokError } = req.query as { auth_code?: string; code?: string; state?: string; error?: string };
   const frontendBase = FRONTEND_URL;
-  const integrationsPath = "/integrations";
+  const redirectPath = "/";
   const codeToUse = authCode || code;
   if (tiktokError || !codeToUse) {
     const err = tiktokError || "No authorization code received";
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(err))}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(err))}`);
     return;
   }
   if (!userId || !usersById.has(userId)) {
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("Invalid state")}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("Invalid state")}`);
     return;
   }
   if (!TIKTOK_APP_ID || !TIKTOK_APP_SECRET) {
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("TikTok not configured")}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("TikTok not configured")}`);
     return;
   }
   const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
@@ -457,7 +475,7 @@ app.get("/integrations/tiktok/callback", async (req: Request, res: Response) => 
     const data = tokenRes.data?.data;
     const accessToken = data?.access_token;
     if (!accessToken) {
-      res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("No token from TikTok")}`);
+      res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("No token from TikTok")}`);
       return;
     }
     const refreshToken = data?.refresh_token;
@@ -481,12 +499,12 @@ app.get("/integrations/tiktok/callback", async (req: Request, res: Response) => 
     };
     connectedAccounts.push(record);
     connectedAccountsById.set(id, record);
-    res.redirect(302, `${frontendBase}${integrationsPath}?connected=tiktok`);
+    res.redirect(302, `${frontendBase}${redirectPath}?connected=tiktok`);
   } catch (err: unknown) {
     const msg = err && typeof err === "object" && "response" in err
       ? (err as { response?: { data?: { message?: string } } }).response?.data?.message
       : err instanceof Error ? err.message : "Token exchange failed";
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(msg))}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(msg))}`);
   }
 });
 
@@ -529,18 +547,18 @@ app.get("/integrations/google/connect", (req: Request, res: Response) => {
 app.get("/integrations/google/callback", async (req: Request, res: Response) => {
   const { code, state: userId, error: googleError } = req.query as { code?: string; state?: string; error?: string };
   const frontendBase = FRONTEND_URL;
-  const integrationsPath = "/integrations";
+  const redirectPath = "/";
   if (googleError || !code) {
     const err = googleError || "No authorization code received";
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(err))}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(err))}`);
     return;
   }
   if (!userId || !usersById.has(userId)) {
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("Invalid state")}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("Invalid state")}`);
     return;
   }
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("Google not configured")}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("Google not configured")}`);
     return;
   }
   const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
@@ -559,7 +577,7 @@ app.get("/integrations/google/callback", async (req: Request, res: Response) => 
     );
     const accessToken = tokenRes.data?.access_token;
     if (!accessToken) {
-      res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("No token from Google")}`);
+      res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("No token from Google")}`);
       return;
     }
     const refreshToken = tokenRes.data?.refresh_token;
@@ -580,12 +598,12 @@ app.get("/integrations/google/callback", async (req: Request, res: Response) => 
     };
     connectedAccounts.push(record);
     connectedAccountsById.set(id, record);
-    res.redirect(302, `${frontendBase}${integrationsPath}?connected=google`);
+    res.redirect(302, `${frontendBase}${redirectPath}?connected=google`);
   } catch (err: unknown) {
     const msg = err && typeof err === "object" && "response" in err
       ? (err as { response?: { data?: { error_description?: string } } }).response?.data?.error_description
       : err instanceof Error ? err.message : "Token exchange failed";
-    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(msg || "Google token exchange failed"))}`);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(msg || "Google token exchange failed"))}`);
   }
 });
 
@@ -668,6 +686,53 @@ app.delete("/integrations/:id", requireAuth, (req: AuthRequest, res: Response) =
   const idx = connectedAccounts.findIndex((c) => c.id === conn.id);
   if (idx !== -1) connectedAccounts.splice(idx, 1);
   res.json({ ok: true });
+});
+
+// ----- Creatives library (user uploads; can attach to campaigns) -----
+app.get("/creatives", requireAuth, (req: AuthRequest, res: Response) => {
+  const list = creatives
+    .filter((c) => c.userId === req.user!.id)
+    .map((c) => ({ id: c.id, name: c.name, createdAt: c.createdAt }));
+  res.json({ creatives: list });
+});
+
+app.post("/creatives", requireAuth, (req: AuthRequest, res: Response) => {
+  const { name, imageData } = req.body;
+  if (!name || typeof name !== "string" || !imageData || typeof imageData !== "string") {
+    return res.status(400).json({ error: "name and imageData (base64 string) are required" });
+  }
+  const base64 = imageData.replace(/^data:image\/[a-z]+;base64,/, "").trim();
+  if (!base64.length) return res.status(400).json({ error: "imageData must be a valid base64 image" });
+  const id = generateCreativeId();
+  const creative: CreativeRecord = {
+    id,
+    userId: req.user!.id,
+    name: String(name).trim().slice(0, 200) || "Creative",
+    imageData: base64,
+    createdAt: new Date().toISOString(),
+  };
+  creatives.push(creative);
+  creativesById.set(id, creative);
+  res.status(201).json({ id: creative.id, name: creative.name, createdAt: creative.createdAt });
+});
+
+app.delete("/creatives/:id", requireAuth, (req: AuthRequest, res: Response) => {
+  const c = creativesById.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Creative not found" });
+  if (c.userId !== req.user!.id) return res.status(404).json({ error: "Creative not found" });
+  creativesById.delete(c.id);
+  const idx = creatives.findIndex((x) => x.id === c.id);
+  if (idx !== -1) creatives.splice(idx, 1);
+  res.json({ ok: true });
+});
+
+app.get("/creatives/:id/asset", requireAuth, (req: AuthRequest, res: Response) => {
+  const c = creativesById.get(req.params.id);
+  if (!c) return res.status(404).json({ error: "Creative not found" });
+  if (c.userId !== req.user!.id) return res.status(404).json({ error: "Creative not found" });
+  const buf = Buffer.from(c.imageData, "base64");
+  res.setHeader("Content-Type", "image/png");
+  res.send(buf);
 });
 
 // Get Meta ad accounts for the connected Meta integration (so we can show/use them for launching).
@@ -954,6 +1019,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     creativesSource,
     aiProvider: aiProviderBody,
     creativePrompt: creativePromptBody,
+    attachedCreativeIds: attachedCreativeIdsBody,
   } = req.body;
 
   const aiProvider: AiProviderOption =
@@ -980,6 +1046,9 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       : "Generate varied ad copy for this campaign.";
   const creativePrompt =
     typeof creativePromptBody === "string" && creativePromptBody.trim() ? creativePromptBody.trim() : undefined;
+  const attachedCreativeIds: string[] = Array.isArray(attachedCreativeIdsBody)
+    ? attachedCreativeIdsBody.filter((id: unknown) => typeof id === "string" && id.startsWith("creative-"))
+    : [];
 
   const platformForAi = platformsList[0];
 
@@ -1013,6 +1082,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       creativesSource: source,
       ...(source === "ai" && { aiProvider }),
       ...(creativePrompt && { creativePrompt }),
+      ...(attachedCreativeIds.length > 0 && { attachedCreativeIds }),
     };
     experiments.push(newExperiment);
     createdExperimentIds.push(id);
