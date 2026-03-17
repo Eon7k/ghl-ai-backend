@@ -5,6 +5,7 @@ import axios from "axios";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 import { buildSystemPrompt, buildUserPrompt, buildVariantsFromOnePrompt, AdPlatform } from "./aiPromptTemplates";
 
 // Only load .env file when NOT in production (so Render always uses its own env vars)
@@ -29,6 +30,12 @@ if (!OPENAI_API_KEY || OPENAI_API_KEY.length < 20) {
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY || "not-set"
 });
+
+const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
+const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
+if (process.env.NODE_ENV !== "production" && !ANTHROPIC_API_KEY) {
+  console.log("[ANTHROPIC] No ANTHROPIC_API_KEY set; split/anthropic provider will fall back to OpenAI.");
+}
 
 const app = express();
 // CORS: allow any origin (e.g. GHL iframe) so fetch is not blocked
@@ -127,6 +134,8 @@ function variantToJson(v: VariantRecord): Omit<VariantRecord, "imageData"> & { h
 // ----- Integrations: connected ad accounts (Meta, TikTok, Google) -----
 const META_APP_ID = (process.env.META_APP_ID || "").trim();
 const META_APP_SECRET = (process.env.META_APP_SECRET || "").trim();
+const TIKTOK_APP_ID = (process.env.TIKTOK_APP_ID || process.env.TIKTOK_CLIENT_KEY || "").trim();
+const TIKTOK_APP_SECRET = (process.env.TIKTOK_APP_SECRET || process.env.TIKTOK_CLIENT_SECRET || "").trim();
 // Must be a full URL (https://...) so redirect after OAuth goes to the frontend, not a path on the backend
 function normalizeFrontendUrl(url: string): string {
   const trimmed = url.replace(/\/$/, "");
@@ -357,6 +366,136 @@ app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
   }
 });
 
+// ----- TikTok OAuth (Business / Marketing API) -----
+// Start TikTok OAuth: redirect user to TikTok. Call with ?token=JWT.
+app.get("/integrations/tiktok/connect", (req: Request, res: Response) => {
+  const tokenParam = (req.query.token as string) || "";
+  const token = tokenParam.trim() || (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null);
+  if (!token) {
+    return res.status(401).send("Missing token. Log in and use the Connect TikTok button from the Integrations page.");
+  }
+  let userId: string;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as { userId: string };
+    const user = usersById.get(payload.userId);
+    if (!user) return res.status(401).send("User not found");
+    userId = user.id;
+  } catch {
+    return res.status(401).send("Invalid or expired token. Please log in again.");
+  }
+  if (!TIKTOK_APP_ID || !TIKTOK_APP_SECRET) {
+    return res.status(503).send("TikTok integration is not configured. Set TIKTOK_APP_ID and TIKTOK_APP_SECRET on the server.");
+  }
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
+  const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/tiktok/callback`;
+  const state = userId;
+  // TikTok Business API auth URL (portal)
+  const tiktokAuthUrl = `https://business-api.tiktok.com/portal/auth?app_id=${encodeURIComponent(TIKTOK_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}`;
+  res.redirect(302, tiktokAuthUrl);
+});
+
+// TikTok OAuth callback: exchange auth_code for access token, store for user, redirect to frontend.
+app.get("/integrations/tiktok/callback", async (req: Request, res: Response) => {
+  const { auth_code: authCode, code, state: userId, error: tiktokError } = req.query as { auth_code?: string; code?: string; state?: string; error?: string };
+  const frontendBase = FRONTEND_URL;
+  const integrationsPath = "/integrations";
+  const codeToUse = authCode || code;
+  if (tiktokError || !codeToUse) {
+    const err = tiktokError || "No authorization code received";
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(err))}`);
+    return;
+  }
+  if (!userId || !usersById.has(userId)) {
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("Invalid state")}`);
+    return;
+  }
+  if (!TIKTOK_APP_ID || !TIKTOK_APP_SECRET) {
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("TikTok not configured")}`);
+    return;
+  }
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
+  const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/tiktok/callback`;
+  try {
+    const tokenRes = await axios.post<{ data?: { access_token?: string; refresh_token?: string; open_id?: string } }>(
+      "https://business-api.tiktok.com/open_api/v1.3/oauth2/access_token/",
+      {
+        app_id: TIKTOK_APP_ID,
+        secret: TIKTOK_APP_SECRET,
+        auth_code: codeToUse,
+        grant_type: "authorization_code",
+        redirect_uri: redirectUri,
+      },
+      { headers: { "Content-Type": "application/json" } }
+    );
+    const data = tokenRes.data?.data;
+    const accessToken = data?.access_token;
+    if (!accessToken) {
+      res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("No token from TikTok")}`);
+      return;
+    }
+    const refreshToken = data?.refresh_token;
+    const openId = data?.open_id;
+    // Remove any existing TikTok connection for this user
+    const existing = connectedAccounts.filter((c) => c.userId === userId && c.platform === "tiktok");
+    existing.forEach((c) => connectedAccountsById.delete(c.id));
+    const newList = connectedAccounts.filter((c) => !(c.userId === userId && c.platform === "tiktok"));
+    connectedAccounts.length = 0;
+    connectedAccounts.push(...newList);
+
+    const id = generateIntegrationId();
+    const record: ConnectedAccountRecord = {
+      id,
+      userId,
+      platform: "tiktok",
+      accessToken,
+      refreshToken,
+      platformAccountId: openId,
+      createdAt: new Date().toISOString(),
+    };
+    connectedAccounts.push(record);
+    connectedAccountsById.set(id, record);
+    res.redirect(302, `${frontendBase}${integrationsPath}?connected=tiktok`);
+  } catch (err: unknown) {
+    const msg = err && typeof err === "object" && "response" in err
+      ? (err as { response?: { data?: { message?: string } } }).response?.data?.message
+      : err instanceof Error ? err.message : "Token exchange failed";
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(msg))}`);
+  }
+});
+
+// Get TikTok ad accounts (advertisers) for the connected TikTok integration.
+app.get("/integrations/tiktok/ad-accounts", requireAuth, async (req: AuthRequest, res: Response) => {
+  const tiktokConn = connectedAccounts.find(
+    (c) => c.userId === req.user!.id && c.platform === "tiktok"
+  );
+  if (!tiktokConn) {
+    return res.status(404).json({ error: "TikTok not connected. Connect TikTok in Integrations first." });
+  }
+  if (!TIKTOK_APP_ID || !TIKTOK_APP_SECRET) {
+    return res.status(503).json({ error: "TikTok integration is not configured on the server." });
+  }
+  try {
+    const url = "https://business-api.tiktok.com/open_api/v1.3/oauth2/advertiser/get/";
+    const resAd = await axios.get<{ data?: { list?: Array<{ advertiser_id: string; advertiser_name: string }> } }>(url, {
+      params: {
+        app_id: TIKTOK_APP_ID,
+        secret: TIKTOK_APP_SECRET,
+        access_token: tiktokConn.accessToken,
+      },
+    });
+    const list = resAd.data?.data?.list || [];
+    res.json({
+      adAccounts: list.map((a) => ({ id: a.advertiser_id, name: a.advertiser_name, accountId: a.advertiser_id })),
+    });
+  } catch (err: unknown) {
+    const msg = err && typeof err === "object" && "response" in err
+      ? (err as { response?: { data?: { message?: string } } }).response?.data?.message
+      : err instanceof Error ? err.message : "Failed to fetch ad accounts";
+    console.error("[TikTok ad-accounts]", msg);
+    res.status(502).json({ error: typeof msg === "string" ? msg : "TikTok API error" });
+  }
+});
+
 app.delete("/integrations/:id", requireAuth, (req: AuthRequest, res: Response) => {
   const conn = connectedAccountsById.get(req.params.id);
   if (!conn) return res.status(404).json({ error: "Connection not found" });
@@ -519,38 +658,18 @@ function extractCopyFromItem(item: Record<string, unknown>): string {
   return combined;
 }
 
-// Generate N ad copy variants from one user prompt (experiment flow)
-async function generateVariantsFromPrompt(
-  prompt: string,
-  platform: string,
-  count: number
-): Promise<string[]> {
-  const systemPrompt =
-    "You are an expert ad copywriter. You write NEW, original ad copy. " +
-    "Never repeat or echo the user's idea text as the headline or body. " +
-    "Output only valid JSON: a single object with key \"variants\" whose value is an array of objects. Each object must have \"headline\" and \"primaryText\" as strings.";
+type AiProviderOption = "openai" | "anthropic" | "split";
 
-  const userPrompt = buildVariantsFromOnePrompt(prompt, platform as AdPlatform, count);
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt }
-    ],
-    response_format: { type: "json_object" }
-  });
-
-  let content = (completion.choices[0]?.message?.content || "").trim();
-  const codeFence = content.match(/^```(?:json)?\s*([\s\S]*?)```$/);
-  if (codeFence) content = codeFence[1].trim();
+function parseVariantsFromContent(content: string, count: number): string[] {
+  let trimmed = content.trim();
+  const codeFence = trimmed.match(/^```(?:json)?\s*([\s\S]*?)```$/);
+  if (codeFence) trimmed = codeFence[1].trim();
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(content);
+    parsed = JSON.parse(trimmed);
   } catch (e) {
-    console.error("[AI] JSON parse failed. Content preview:", content.slice(0, 300));
-    const match = content.match(/\[[\s\S]*\]/);
+    const match = trimmed.match(/\[[\s\S]*\]/);
     parsed = match ? JSON.parse(match[0]) : { variants: [] };
   }
 
@@ -563,14 +682,12 @@ async function generateVariantsFromPrompt(
         ? raw.ads
         : [];
 
-  console.log("[AI] Parsed variants count:", arr.length, "First item keys:", arr[0] && typeof arr[0] === "object" ? Object.keys(arr[0] as object) : "n/a");
-
   const copies: string[] = [];
   for (let i = 0; i < count; i++) {
     const item = arr[i];
     if (item && typeof item === "object" && !Array.isArray(item)) {
       const combined = extractCopyFromItem(item as Record<string, unknown>);
-      copies.push(combined || `Variant ${i + 1} — AI returned no text (see Render logs)`);
+      copies.push(combined || `Variant ${i + 1} — AI returned no text`);
     } else if (typeof item === "string" && item.trim()) {
       copies.push(item.trim());
     } else {
@@ -578,6 +695,72 @@ async function generateVariantsFromPrompt(
     }
   }
   return copies.length >= count ? copies : [...copies, ...Array(Math.max(0, count - copies.length)).fill("Variant (missing)")].slice(0, count);
+}
+
+async function generateWithOpenAI(prompt: string, platform: string, count: number): Promise<string[]> {
+  const systemPrompt =
+    "You are an expert ad copywriter. You write NEW, original ad copy. " +
+    "Never repeat or echo the user's idea text as the headline or body. " +
+    "Output only valid JSON: a single object with key \"variants\" whose value is an array of objects. Each object must have \"headline\" and \"primaryText\" as strings.";
+  const userPrompt = buildVariantsFromOnePrompt(prompt, platform as AdPlatform, count);
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ],
+    response_format: { type: "json_object" }
+  });
+
+  const content = (completion.choices[0]?.message?.content || "").trim();
+  return parseVariantsFromContent(content, count);
+}
+
+async function generateWithAnthropic(prompt: string, platform: string, count: number): Promise<string[]> {
+  const systemPrompt =
+    "You are an expert ad copywriter. You write NEW, original ad copy. " +
+    "Never repeat or echo the user's idea text as the headline or body. " +
+    "Output only valid JSON: a single object with key \"variants\" whose value is an array of objects. Each object must have \"headline\" and \"primaryText\" as strings.";
+  const userPrompt = buildVariantsFromOnePrompt(prompt, platform as AdPlatform, count);
+
+  const message = await anthropic!.messages.create({
+    model: "claude-3-5-haiku-20241022",
+    max_tokens: 4096,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userPrompt }]
+  });
+
+  const block = message.content.find((b) => b.type === "text");
+  const content = block && block.type === "text" ? block.text : "";
+  return parseVariantsFromContent(content, count);
+}
+
+/** Generate N ad copy variants. provider "split" = half OpenAI, half Anthropic (merged in order). */
+async function generateVariantsFromPrompt(
+  prompt: string,
+  platform: string,
+  count: number,
+  provider: AiProviderOption = "openai"
+): Promise<string[]> {
+  const useAnthropic = anthropic && (provider === "anthropic" || provider === "split");
+  const useOpenAI = provider === "openai" || provider === "split" || !useAnthropic;
+
+  if (provider === "split" && anthropic) {
+    const half = Math.ceil(count / 2);
+    const rest = count - half;
+    const [openaiCopies, anthropicCopies] = await Promise.all([
+      generateWithOpenAI(prompt, platform, half),
+      generateWithAnthropic(prompt, platform, rest)
+    ]);
+    return [...openaiCopies, ...anthropicCopies];
+  }
+
+  if (provider === "anthropic" && anthropic) {
+    return generateWithAnthropic(prompt, platform, count);
+  }
+
+  return generateWithOpenAI(prompt, platform, count);
 }
 
 // Create a new experiment with variants (Phase 2: creativesSource, prompt, variantCount)
@@ -588,8 +771,12 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     totalDailyBudget,
     prompt,
     variantCount,
-    creativesSource
+    creativesSource,
+    aiProvider: aiProviderBody
   } = req.body;
+
+  const aiProvider: AiProviderOption =
+    aiProviderBody === "anthropic" || aiProviderBody === "split" ? aiProviderBody : "openai";
 
   if (!name || !platform || typeof totalDailyBudget !== "number") {
     return res
@@ -625,7 +812,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     copies = Array.from({ length: count }, () => "");
   } else {
     try {
-      copies = await generateVariantsFromPrompt(promptText, platform, count);
+      copies = await generateVariantsFromPrompt(promptText, platform, count, aiProvider);
     } catch (err: any) {
       console.error("AI variant generation failed", err?.message || err);
       copies = Array.from({ length: count }, (_, i) => `[Variant ${i + 1}] ${promptText.slice(0, 80)}...`);
