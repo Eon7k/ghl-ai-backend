@@ -117,8 +117,8 @@ interface ExperimentRecord {
   totalDailyBudget: number;
   prompt?: string;
   variantCount?: number;
-  creativesSource?: "ai" | "own";
-  /** Which AI generated ad copy: openai, anthropic, or split (half each). Only set when creativesSource === "ai". */
+  creativesSource?: "ai" | "mix" | "own";
+  /** Which AI generated ad copy: openai, anthropic, or split (half each). Set when creativesSource === "ai" or "mix". */
   aiProvider?: "openai" | "anthropic" | "split";
   aiCreativeCount?: number; // set at launch: how many variants get AI-created creatives (0 = none)
   /** Optional: how the user wants the ad image/creative to look (used when generating AI creatives). */
@@ -1039,7 +1039,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
   }
 
   const count = Math.min(20, Math.max(1, Number(variantCount) || 3));
-  const source = creativesSource === "own" ? "own" : "ai";
+  const source = creativesSource === "own" ? "own" : creativesSource === "mix" ? "mix" : "ai";
   const promptText =
     typeof prompt === "string" && prompt.trim()
       ? prompt.trim()
@@ -1064,7 +1064,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     }
   }
 
-  const half = source === "ai" && (aiProvider === "split") ? Math.ceil(count / 2) : 0;
+  const half = (source === "ai" || source === "mix") && (aiProvider === "split") ? Math.ceil(count / 2) : 0;
   const createdExperimentIds: string[] = [];
 
   for (const platform of platformsList) {
@@ -1080,7 +1080,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       prompt: promptText,
       variantCount: count,
       creativesSource: source,
-      ...(source === "ai" && { aiProvider }),
+      ...((source === "ai" || source === "mix") && { aiProvider }),
       ...(creativePrompt && { creativePrompt }),
       ...(attachedCreativeIds.length > 0 && { attachedCreativeIds }),
     };
@@ -1091,7 +1091,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       const text = (typeof copy === "string" && copy.trim()) ? copy.trim() : "";
       const fallback = source === "own" ? "Paste your ad copy here..." : `Variant ${i + 1} — Ad copy`;
       let aiSource: "openai" | "anthropic" | undefined;
-      if (source === "ai" && aiProvider) {
+      if ((source === "ai" || source === "mix") && aiProvider) {
         if (aiProvider === "openai") aiSource = "openai";
         else if (aiProvider === "anthropic") aiSource = "anthropic";
         else if (aiProvider === "split") aiSource = i < half ? "openai" : "anthropic";
