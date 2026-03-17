@@ -121,9 +121,9 @@ interface ExperimentRecord {
   /** Which AI generated ad copy: openai, anthropic, or split (half each). Only set when creativesSource === "ai". */
   aiProvider?: "openai" | "anthropic" | "split";
   aiCreativeCount?: number; // set at launch: how many variants get AI-created creatives (0 = none)
-  /** When we create a campaign on Meta, store its ID here so we can fetch insights and update status */
+  /** Optional: how the user wants the ad image/creative to look (used when generating AI creatives). */
+  creativePrompt?: string;
   metaCampaignId?: string;
-  /** When we create an ad set on Meta, store its ID here so we can update budget */
   metaAdSetId?: string;
 }
 
@@ -811,7 +811,8 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     prompt,
     variantCount,
     creativesSource,
-    aiProvider: aiProviderBody
+    aiProvider: aiProviderBody,
+    creativePrompt: creativePromptBody,
   } = req.body;
 
   const aiProvider: AiProviderOption =
@@ -831,6 +832,8 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       : "Generate varied ad copy for this campaign.";
 
   const id = generateId();
+  const creativePrompt =
+    typeof creativePromptBody === "string" && creativePromptBody.trim() ? creativePromptBody.trim() : undefined;
   const newExperiment: ExperimentRecord = {
     id,
     userId: req.user!.id,
@@ -843,6 +846,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     variantCount: count,
     creativesSource: source,
     ...(source === "ai" && { aiProvider }),
+    ...(creativePrompt && { creativePrompt }),
   };
 
   experiments.push(newExperiment);
@@ -918,7 +922,9 @@ app.post("/experiments/:experimentId/variants/:variantId/generate-creative", req
   if (!variant) return res.status(404).json({ error: "Variant not found" });
 
   const copy = (variant.copy || "").trim().slice(0, 500);
+  const userCreativeDirection = (exp.creativePrompt || "").trim().slice(0, 500);
   const imagePrompt =
+    (userCreativeDirection ? `Creative direction: ${userCreativeDirection}. ` : "") +
     `Professional advertising image for a social media ad. Visual only, no text or words in the image. ` +
     `Style: clean, modern, high quality, suitable for Facebook or Instagram feed. ` +
     `Theme or mood inspired by: ${copy || "modern marketing"}.`;
