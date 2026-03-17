@@ -152,6 +152,9 @@ const META_APP_ID = (process.env.META_APP_ID || "").trim();
 const META_APP_SECRET = (process.env.META_APP_SECRET || "").trim();
 const TIKTOK_APP_ID = (process.env.TIKTOK_APP_ID || process.env.TIKTOK_CLIENT_KEY || "").trim();
 const TIKTOK_APP_SECRET = (process.env.TIKTOK_APP_SECRET || process.env.TIKTOK_CLIENT_SECRET || "").trim();
+const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || "").trim();
+const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || "").trim();
+const GOOGLE_ADS_DEVELOPER_TOKEN = (process.env.GOOGLE_ADS_DEVELOPER_TOKEN || "").trim();
 // Must be a full URL (https://...) so redirect after OAuth goes to the frontend, not a path on the backend
 function normalizeFrontendUrl(url: string): string {
   const trimmed = url.replace(/\/$/, "");
@@ -484,6 +487,143 @@ app.get("/integrations/tiktok/callback", async (req: Request, res: Response) => 
       ? (err as { response?: { data?: { message?: string } } }).response?.data?.message
       : err instanceof Error ? err.message : "Token exchange failed";
     res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(msg))}`);
+  }
+});
+
+// ----- Google OAuth (Google Ads API) -----
+const GOOGLE_ADS_SCOPE = "https://www.googleapis.com/auth/adwords";
+
+app.get("/integrations/google/connect", (req: Request, res: Response) => {
+  const tokenParam = (req.query.token as string) || "";
+  const token = tokenParam.trim() || (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null);
+  if (!token) {
+    return res.status(401).send("Missing token. Log in and use the Connect Google button from the Integrations page.");
+  }
+  let userId: string;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as { userId: string };
+    const user = usersById.get(payload.userId);
+    if (!user) return res.status(401).send("User not found");
+    userId = user.id;
+  } catch {
+    return res.status(401).send("Invalid or expired token. Please log in again.");
+  }
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    return res.status(503).send("Google integration is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET on the server.");
+  }
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
+  const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/google/callback`;
+  const state = userId;
+  const authUrl =
+    `https://accounts.google.com/o/oauth2/v2/auth?` +
+    `client_id=${encodeURIComponent(GOOGLE_CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&response_type=code` +
+    `&scope=${encodeURIComponent(GOOGLE_ADS_SCOPE)}` +
+    `&state=${encodeURIComponent(state)}` +
+    `&access_type=offline` +
+    `&prompt=consent`;
+  res.redirect(302, authUrl);
+});
+
+app.get("/integrations/google/callback", async (req: Request, res: Response) => {
+  const { code, state: userId, error: googleError } = req.query as { code?: string; state?: string; error?: string };
+  const frontendBase = FRONTEND_URL;
+  const integrationsPath = "/integrations";
+  if (googleError || !code) {
+    const err = googleError || "No authorization code received";
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(err))}`);
+    return;
+  }
+  if (!userId || !usersById.has(userId)) {
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("Invalid state")}`);
+    return;
+  }
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("Google not configured")}`);
+    return;
+  }
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
+  const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/google/callback`;
+  try {
+    const tokenRes = await axios.post<{ access_token?: string; refresh_token?: string }>(
+      "https://oauth2.googleapis.com/token",
+      new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: redirectUri,
+        grant_type: "authorization_code",
+      }).toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    const accessToken = tokenRes.data?.access_token;
+    if (!accessToken) {
+      res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent("No token from Google")}`);
+      return;
+    }
+    const refreshToken = tokenRes.data?.refresh_token;
+    const existing = connectedAccounts.filter((c) => c.userId === userId && c.platform === "google");
+    existing.forEach((c) => connectedAccountsById.delete(c.id));
+    const newList = connectedAccounts.filter((c) => !(c.userId === userId && c.platform === "google"));
+    connectedAccounts.length = 0;
+    connectedAccounts.push(...newList);
+
+    const id = generateIntegrationId();
+    const record: ConnectedAccountRecord = {
+      id,
+      userId,
+      platform: "google",
+      accessToken,
+      refreshToken,
+      createdAt: new Date().toISOString(),
+    };
+    connectedAccounts.push(record);
+    connectedAccountsById.set(id, record);
+    res.redirect(302, `${frontendBase}${integrationsPath}?connected=google`);
+  } catch (err: unknown) {
+    const msg = err && typeof err === "object" && "response" in err
+      ? (err as { response?: { data?: { error_description?: string } } }).response?.data?.error_description
+      : err instanceof Error ? err.message : "Token exchange failed";
+    res.redirect(302, `${frontendBase}${integrationsPath}?error=${encodeURIComponent(String(msg || "Google token exchange failed"))}`);
+  }
+});
+
+// Get Google Ads customer accounts (requires GOOGLE_ADS_DEVELOPER_TOKEN and connected Google OAuth).
+app.get("/integrations/google/ad-accounts", requireAuth, async (req: AuthRequest, res: Response) => {
+  const googleConn = connectedAccounts.find(
+    (c) => c.userId === req.user!.id && c.platform === "google"
+  );
+  if (!googleConn) {
+    return res.status(404).json({ error: "Google not connected. Connect Google in Integrations first." });
+  }
+  if (!GOOGLE_ADS_DEVELOPER_TOKEN) {
+    return res.status(503).json({
+      error: "Google Ads API developer token is not configured. Set GOOGLE_ADS_DEVELOPER_TOKEN on the server to list ad accounts.",
+    });
+  }
+  try {
+    const resAd = await axios.get<{ resourceNames?: string[] }>(
+      "https://googleads.googleapis.com/v20/customers:listAccessibleCustomers",
+      {
+        headers: {
+          Authorization: `Bearer ${googleConn.accessToken}`,
+          "developer-token": GOOGLE_ADS_DEVELOPER_TOKEN,
+        },
+      }
+    );
+    const resourceNames = resAd.data?.resourceNames || [];
+    const adAccounts = resourceNames.map((rn) => {
+      const id = rn.replace(/^customers\//, "");
+      return { id, name: `Customer ${id}`, accountId: id };
+    });
+    return res.json({ adAccounts });
+  } catch (err: unknown) {
+    const msg = err && typeof err === "object" && "response" in err
+      ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
+      : err instanceof Error ? err.message : "Failed to fetch Google Ads accounts";
+    console.error("[Google ad-accounts]", msg);
+    return res.status(502).json({ error: typeof msg === "string" ? msg : "Google Ads API error" });
   }
 });
 
