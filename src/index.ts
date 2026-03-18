@@ -905,6 +905,39 @@ app.get("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response)
   });
 });
 
+// Update experiment (e.g. creative direction for image generation). Body: { creativePrompt?: string }.
+app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: req.params.id, userId: uid } });
+  if (!exp) return res.status(404).json({ error: "Experiment not found" });
+  const creativePrompt =
+    req.body?.creativePrompt !== undefined
+      ? (typeof req.body.creativePrompt === "string" ? req.body.creativePrompt.trim() : null) || null
+      : undefined;
+  const data: { creativePrompt?: string | null } = {};
+  if (creativePrompt !== undefined) data.creativePrompt = creativePrompt || null;
+  if (Object.keys(data).length === 0) return res.status(400).json({ error: "Body must include at least one field to update (e.g. creativePrompt)" });
+  const updated = await prisma.experiment.update({ where: { id: exp.id }, data });
+  res.json({
+    id: updated.id,
+    name: updated.name,
+    platform: updated.platform,
+    status: updated.status,
+    phase: updated.phase,
+    totalDailyBudget: updated.totalDailyBudget,
+    prompt: updated.prompt ?? undefined,
+    creativesSource: updated.creativesSource ?? undefined,
+    creativePrompt: updated.creativePrompt ?? undefined,
+    variantCount: exp.variantCount ?? undefined,
+    aiProvider: updated.aiProvider ?? undefined,
+    aiCreativeCount: updated.aiCreativeCount ?? undefined,
+    campaignGroupId: updated.campaignGroupId ?? undefined,
+    metaCampaignId: updated.metaCampaignId ?? undefined,
+    metaAdSetId: updated.metaAdSetId ?? undefined,
+    attachedCreativeIds: updated.attachedCreativeIds ?? undefined,
+  });
+});
+
 // AI ad copy generation
 app.post("/ai/generate-ad-copy", async (req: Request, res: Response) => {
   const {
