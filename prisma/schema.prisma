@@ -8,96 +8,81 @@ datasource db {
 }
 
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  createdAt DateTime @default(now())
-  experiments Experiment[]
-  adAccounts  AdAccountConnection[]
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  /** single = one user, one account. agency = can switch between client accounts. */
+  accountType  String    @default("single") // "single" | "agency"
+  createdAt    DateTime  @default(now())
+  experiments  Experiment[]
+  creatives    Creative[]
+  accounts     ConnectedAccount[]
+  /** When this user is an agency: clients they can switch to. */
+  agencyClients   AgencyClient[]  @relation("AgencyClients")
+  /** When this user is a client: agencies that can view their data. */
+  managedByAgencies AgencyClient[]  @relation("AgencyManaged")
 }
 
-model AdAccountConnection {
-  id            String   @id @default(cuid())
-  user          User     @relation(fields: [userId], references: [id])
-  userId        String
-  platform      String
-  accountId     String
-  name          String?
-  accessToken   String
-  refreshToken  String?
-  tokenExpiresAt DateTime?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  experiments   Experiment[]
+model AgencyClient {
+  id             String   @id @default(cuid())
+  agencyUserId   String
+  agencyUser     User     @relation("AgencyClients", fields: [agencyUserId], references: [id], onDelete: Cascade)
+  clientUserId   String
+  clientUser     User     @relation("AgencyManaged", fields: [clientUserId], references: [id], onDelete: Cascade)
+  createdAt      DateTime @default(now())
+  @@unique([agencyUserId, clientUserId])
+}
+
+model ConnectedAccount {
+  id                   String   @id @default(cuid())
+  userId               String
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  platform             String   // meta | tiktok | google
+  accessToken          String
+  refreshToken         String?
+  platformAccountId    String?
+  platformAccountName  String?
+  createdAt            DateTime @default(now())
 }
 
 model Experiment {
   id                 String   @id @default(cuid())
-  user               User     @relation(fields: [userId], references: [id])
   userId             String
-  adAccount          AdAccountConnection @relation(fields: [adAccountId], references: [id])
-  adAccountId        String
-
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   name               String
   platform           String
-  status             String   // draft | running | paused | completed
-  phase              String   // explore | exploit | winners_scaled
-
-  offerDescription   String
-  audienceDescription String
-  brandVoice         String?
-
+  status             String   // draft | launched
+  phase              String   // setup | ...
   totalDailyBudget   Float
-  optimizationKpi    String
-  minImpressions     Int
-  minClicks          Int
-  minDays            Int
-  aggressiveness     String
-  targetTopVariants  Int
-
-  ghlLocationId      String?
-  ghlPipelineId      String?
-
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
-
-  variants           AdVariant[]
+  prompt             String?
+  variantCount       Int?
+  creativesSource    String?  // ai | mix | own
+  aiProvider         String?  // openai | anthropic | split
+  aiCreativeCount    Int?
+  creativePrompt     String?
+  campaignGroupId    String?
+  metaCampaignId     String?
+  metaAdSetId        String?
+  attachedCreativeIds String[] @default([]) // PostgreSQL array of creative ids
+  variants           Variant[]
 }
 
-model AdVariant {
-  id               String   @id @default(cuid())
-  experiment       Experiment @relation(fields: [experimentId], references: [id])
-  experimentId     String
-
-  headline         String
-  primaryText      String
-  description      String?
-
-  creativeId       String?
-  creativeUrl      String?
-
-  platformAdId     String?
-  status           String   // draft | live | paused | stopped
-  currentDailyBudget Float
-
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
-
-  metrics          AdMetricsSnapshot[]
+model Variant {
+  id           String   @id @default(cuid())
+  experimentId String
+  experiment   Experiment @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+  index        Int
+  copy         String
+  status       String
+  imageData    String?  // base64 PNG
+  aiSource     String?  // openai | anthropic
 }
 
-model AdMetricsSnapshot {
-  id          String   @id @default(cuid())
-  variant     AdVariant @relation(fields: [variantId], references: [id])
-  variantId   String
-
-  date        DateTime
-  impressions Int
-  clicks      Int
-  conversions Int
-  spend       Float
-
-  createdAt   DateTime @default(now())
-
-  @@unique([variantId, date])
+model Creative {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  imageData String   // base64
+  createdAt DateTime @default(now())
 }
-

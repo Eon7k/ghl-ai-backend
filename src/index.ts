@@ -7,6 +7,7 @@ import jwt from "jsonwebtoken";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildSystemPrompt, buildUserPrompt, buildVariantsFromOnePrompt, AdPlatform } from "./aiPromptTemplates";
+import { prisma } from "./db";
 
 // Only load .env file when NOT in production (so Render always uses its own env vars)
 if (process.env.NODE_ENV !== "production") {
@@ -53,27 +54,17 @@ app.use(express.json());
 const PORT = process.env.PORT || 4000;
 const OPTIMIZER_URL = process.env.OPTIMIZER_URL || "http://localhost:5001";
 
-// Auth: user and JWT
+// Auth: user and JWT (users stored in DB via Prisma)
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
-interface UserRecord {
-  id: string;
-  email: string;
-  passwordHash: string;
-  createdAt: string;
-}
-const usersByEmail = new Map<string, UserRecord>();
-const usersById = new Map<string, UserRecord>();
 
-function generateUserId(): string {
-  return `user-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-}
-
-// Extend Express Request so we can attach user
+// Extend Express Request so we can attach user and effective user (for agency viewing-as)
 interface AuthRequest extends Request {
-  user?: { id: string; email: string };
+  user?: { id: string; email: string; accountType?: string };
+  /** When agency views as a client, this is the client's userId for data scope. */
+  effectiveUserId?: string;
 }
 
-function requireAuth(req: AuthRequest, res: Response, next: NextFunction): void {
+async function requireAuthAsync(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
   if (!token) {
@@ -82,16 +73,30 @@ function requireAuth(req: AuthRequest, res: Response, next: NextFunction): void 
   }
   try {
     const payload = jwt.verify(token, JWT_SECRET) as { userId: string; email: string };
-    const user = usersById.get(payload.userId);
+    const user = await prisma.user.findUnique({ where: { id: payload.userId } });
     if (!user) {
       res.status(401).json({ error: "User not found" });
       return;
     }
-    req.user = { id: user.id, email: user.email };
+    const accountType = (user as { accountType?: string }).accountType ?? "single";
+    req.user = { id: user.id, email: user.email, accountType };
+    // Resolve effective user: agency can send X-Viewing-As: clientUserId to act as that client
+    const viewingAs = (req.headers["x-viewing-as"] ?? req.headers["viewing-as"]) as string | undefined;
+    if (accountType === "agency" && viewingAs && typeof viewingAs === "string" && viewingAs.trim()) {
+      const allowed = await prisma.agencyClient.findFirst({
+        where: { agencyUserId: user.id, clientUserId: viewingAs.trim() },
+      });
+      if (allowed) req.effectiveUserId = viewingAs.trim();
+    }
+    if (!req.effectiveUserId) req.effectiveUserId = user.id;
     next();
   } catch {
     res.status(401).json({ error: "Invalid or expired token" });
   }
+}
+
+function requireAuth(req: AuthRequest, res: Response, next: NextFunction): void {
+  requireAuthAsync(req, res, next).catch(next);
 }
 
 // Admin: only these emails can access /admin and see extra metrics
@@ -142,29 +147,9 @@ interface VariantRecord {
   aiSource?: "openai" | "anthropic";
 }
 
-// User creatives library (stored images; can be attached to campaigns)
-interface CreativeRecord {
-  id: string;
-  userId: string;
-  name: string;
-  /** base64 image data (e.g. data:image/png;base64,... or raw base64) */
-  imageData: string;
-  createdAt: string;
-}
-const creatives: CreativeRecord[] = [];
-const creativesById = new Map<string, CreativeRecord>();
-
-function generateCreativeId(): string {
-  return `creative-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-}
-
-// Temporary in-memory storage (no database yet)
-const experiments: ExperimentRecord[] = [];
-const variantsByExperimentId: Record<string, VariantRecord[]> = {};
-
-function variantToJson(v: VariantRecord): Omit<VariantRecord, "imageData"> & { hasCreative?: boolean } {
-  const { imageData, ...rest } = v;
-  return { ...rest, hasCreative: !!imageData };
+// Variant to API shape (omit imageData, add hasCreative)
+function variantToJson(v: { id: string; experimentId: string; index: number; copy: string; status: string; imageData?: string | null; aiSource?: string | null }): Record<string, unknown> {
+  return { id: v.id, experimentId: v.experimentId, index: v.index, copy: v.copy, status: v.status, hasCreative: !!v.imageData, aiSource: v.aiSource ?? undefined };
 }
 
 // ----- Integrations: connected ad accounts (Meta, TikTok, Google) -----
@@ -194,20 +179,7 @@ interface ConnectedAccountRecord {
   platformAccountName?: string;
   createdAt: string;
 }
-const connectedAccounts: ConnectedAccountRecord[] = [];
-const connectedAccountsById = new Map<string, ConnectedAccountRecord>();
-
-function generateIntegrationId(): string {
-  return `conn-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-}
-
-function generateId(): string {
-  return `exp-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-}
-
-function generateVariantId(): string {
-  return `var-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-}
+// IDs are generated by Prisma (cuid)
 
 type OptimizationKPI = "CPL" | "CPA" | "CTR";
 
@@ -263,16 +235,14 @@ app.post("/auth/register", async (req: Request, res: Response) => {
   if (passwordTrimmed.length < 8) {
     return res.status(400).json({ error: "Password must be at least 8 characters" });
   }
-  if (usersByEmail.has(emailNorm)) {
+  const existing = await prisma.user.findUnique({ where: { email: emailNorm } });
+  if (existing) {
     return res.status(400).json({ error: "An account with this email already exists" });
   }
-  const id = generateUserId();
   const passwordHash = await bcrypt.hash(passwordTrimmed, 10);
-  const user: UserRecord = { id, email: emailNorm, passwordHash, createdAt: new Date().toISOString() };
-  usersByEmail.set(emailNorm, user);
-  usersById.set(id, user);
-  const token = jwt.sign({ userId: id, email: emailNorm }, JWT_SECRET, { expiresIn: "7d" });
-  res.status(201).json({ token, user: { id, email: emailNorm } });
+  const user = await prisma.user.create({ data: { email: emailNorm, passwordHash } });
+  const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
+  res.status(201).json({ token, user: { id: user.id, email: user.email } });
 });
 
 app.post("/auth/login", async (req: Request, res: Response) => {
@@ -282,7 +252,7 @@ app.post("/auth/login", async (req: Request, res: Response) => {
   }
   const emailNorm = (email as string).trim().toLowerCase();
   const passwordTrimmed = (password as string).trim();
-  const user = usersByEmail.get(emailNorm);
+  const user = await prisma.user.findUnique({ where: { email: emailNorm } });
   if (!user) {
     return res.status(401).json({ error: "Invalid email or password" });
   }
@@ -294,7 +264,7 @@ app.post("/auth/login", async (req: Request, res: Response) => {
   res.json({ token, user: { id: user.id, email: user.email } });
 });
 
-app.get("/auth/me", (req: AuthRequest, res: Response) => {
+app.get("/auth/me", async (req: AuthRequest, res: Response) => {
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
   if (!token) {
@@ -302,9 +272,25 @@ app.get("/auth/me", (req: AuthRequest, res: Response) => {
   }
   try {
     const payload = jwt.verify(token, JWT_SECRET) as { userId: string; email: string };
-    const user = usersById.get(payload.userId);
+    const user = await prisma.user.findUnique({
+      where: { id: payload.userId },
+      include: { agencyClients: { include: { clientUser: { select: { id: true, email: true } } } } },
+    });
     if (!user) return res.status(401).json({ error: "User not found" });
-    res.json({ user: { id: user.id, email: user.email }, isAdmin: isAdmin(user.email) });
+    const accountType = (user as { accountType?: string }).accountType ?? "single";
+    const clients =
+      accountType === "agency"
+        ? (user as { agencyClients?: { clientUser: { id: string; email: string } }[] }).agencyClients?.map((ac) => ({
+            id: ac.clientUser.id,
+            email: ac.clientUser.email,
+          })) ?? []
+        : undefined;
+    res.json({
+      user: { id: user.id, email: user.email },
+      isAdmin: isAdmin(user.email),
+      accountType,
+      clients,
+    });
   } catch {
     res.status(401).json({ error: "Invalid or expired token" });
   }
@@ -319,32 +305,38 @@ function requireAdmin(req: AuthRequest, res: Response, next: NextFunction): void
 }
 
 // ----- Integrations: connect ad accounts (Meta, etc.) -----
-app.get("/integrations", requireAuth, (req: AuthRequest, res: Response) => {
-  const list = connectedAccounts
-    .filter((c) => c.userId === req.user!.id)
-    .map(({ id, platform, platformAccountId, platformAccountName, createdAt }) => ({
-      id,
-      platform,
-      platformAccountId,
-      platformAccountName,
-      createdAt,
-    }));
-  res.json({ integrations: list });
+app.get("/integrations", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const list = await prisma.connectedAccount.findMany({
+    where: { userId: uid },
+    select: { id: true, platform: true, platformAccountId: true, platformAccountName: true, createdAt: true },
+  });
+  res.json({ integrations: list.map((c) => ({ ...c, createdAt: c.createdAt.toISOString() })) });
 });
 
 // Start Meta OAuth: redirect user to Meta login. Call with ?token=JWT so we know the user (browser can't send Authorization on redirect).
-app.get("/integrations/meta/connect", (req: Request, res: Response) => {
+// For agency: ?token=JWT&viewingAs=clientUserId stores the Meta token for that client.
+app.get("/integrations/meta/connect", async (req: Request, res: Response) => {
   const tokenParam = (req.query.token as string) || "";
   const token = tokenParam.trim() || (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null);
   if (!token) {
     return res.status(401).send("Missing token. Log in and use the Connect Meta button from the Integrations page.");
   }
   let userId: string;
+  const viewingAs = typeof req.query.viewingAs === "string" ? req.query.viewingAs.trim() : "";
   try {
     const payload = jwt.verify(token, JWT_SECRET) as { userId: string };
-    const user = usersById.get(payload.userId);
+    const user = await prisma.user.findUnique({ where: { id: payload.userId } });
     if (!user) return res.status(401).send("User not found");
-    userId = user.id;
+    const accountType = (user as { accountType?: string }).accountType ?? "single";
+    if (accountType === "agency" && viewingAs) {
+      const allowed = await prisma.agencyClient.findFirst({
+        where: { agencyUserId: user.id, clientUserId: viewingAs },
+      });
+      userId = allowed ? viewingAs : user.id;
+    } else {
+      userId = user.id;
+    }
   } catch {
     return res.status(401).send("Invalid or expired token. Please log in again.");
   }
@@ -369,7 +361,8 @@ app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
     res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(err)}`);
     return;
   }
-  if (!userId || !usersById.has(userId)) {
+  const userMeta = userId ? await prisma.user.findUnique({ where: { id: userId } }) : null;
+  if (!userMeta) {
     res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("Invalid state")}`);
     return;
   }
@@ -387,25 +380,10 @@ app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
       res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("No token from Meta")}`);
       return;
     }
-    // Remove any existing Meta connection for this user (one Meta account per user for now)
-    const existing = connectedAccounts.filter((c) => c.userId === userId && c.platform === "meta");
-    existing.forEach((c) => {
-      connectedAccountsById.delete(c.id);
+    await prisma.connectedAccount.deleteMany({ where: { userId, platform: "meta" } });
+    await prisma.connectedAccount.create({
+      data: { userId, platform: "meta", accessToken },
     });
-    const newList = connectedAccounts.filter((c) => !(c.userId === userId && c.platform === "meta"));
-    connectedAccounts.length = 0;
-    connectedAccounts.push(...newList);
-
-    const id = generateIntegrationId();
-    const record: ConnectedAccountRecord = {
-      id,
-      userId,
-      platform: "meta",
-      accessToken,
-      createdAt: new Date().toISOString(),
-    };
-    connectedAccounts.push(record);
-    connectedAccountsById.set(id, record);
     res.redirect(302, `${frontendBase}${redirectPath}?connected=meta`);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Token exchange failed";
@@ -415,7 +393,7 @@ app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
 
 // ----- TikTok OAuth (Business / Marketing API) -----
 // Start TikTok OAuth: redirect user to TikTok. Call with ?token=JWT.
-app.get("/integrations/tiktok/connect", (req: Request, res: Response) => {
+app.get("/integrations/tiktok/connect", async (req: Request, res: Response) => {
   const tokenParam = (req.query.token as string) || "";
   const token = tokenParam.trim() || (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null);
   if (!token) {
@@ -424,7 +402,7 @@ app.get("/integrations/tiktok/connect", (req: Request, res: Response) => {
   let userId: string;
   try {
     const payload = jwt.verify(token, JWT_SECRET) as { userId: string };
-    const user = usersById.get(payload.userId);
+    const user = await prisma.user.findUnique({ where: { id: payload.userId } });
     if (!user) return res.status(401).send("User not found");
     userId = user.id;
   } catch {
@@ -452,7 +430,8 @@ app.get("/integrations/tiktok/callback", async (req: Request, res: Response) => 
     res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(err))}`);
     return;
   }
-  if (!userId || !usersById.has(userId)) {
+  const userTiktok = await prisma.user.findUnique({ where: { id: userId ?? "" } });
+  if (!userTiktok) {
     res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("Invalid state")}`);
     return;
   }
@@ -482,25 +461,10 @@ app.get("/integrations/tiktok/callback", async (req: Request, res: Response) => 
     }
     const refreshToken = data?.refresh_token;
     const openId = data?.open_id;
-    // Remove any existing TikTok connection for this user
-    const existing = connectedAccounts.filter((c) => c.userId === userId && c.platform === "tiktok");
-    existing.forEach((c) => connectedAccountsById.delete(c.id));
-    const newList = connectedAccounts.filter((c) => !(c.userId === userId && c.platform === "tiktok"));
-    connectedAccounts.length = 0;
-    connectedAccounts.push(...newList);
-
-    const id = generateIntegrationId();
-    const record: ConnectedAccountRecord = {
-      id,
-      userId,
-      platform: "tiktok",
-      accessToken,
-      refreshToken,
-      platformAccountId: openId,
-      createdAt: new Date().toISOString(),
-    };
-    connectedAccounts.push(record);
-    connectedAccountsById.set(id, record);
+    await prisma.connectedAccount.deleteMany({ where: { userId, platform: "tiktok" } });
+    await prisma.connectedAccount.create({
+      data: { userId, platform: "tiktok", accessToken, refreshToken: refreshToken ?? undefined, platformAccountId: openId },
+    });
     res.redirect(302, `${frontendBase}${redirectPath}?connected=tiktok`);
   } catch (err: unknown) {
     const msg = err && typeof err === "object" && "response" in err
@@ -513,7 +477,7 @@ app.get("/integrations/tiktok/callback", async (req: Request, res: Response) => 
 // ----- Google OAuth (Google Ads API) -----
 const GOOGLE_ADS_SCOPE = "https://www.googleapis.com/auth/adwords";
 
-app.get("/integrations/google/connect", (req: Request, res: Response) => {
+app.get("/integrations/google/connect", async (req: Request, res: Response) => {
   const tokenParam = (req.query.token as string) || "";
   const token = tokenParam.trim() || (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null);
   if (!token) {
@@ -522,7 +486,7 @@ app.get("/integrations/google/connect", (req: Request, res: Response) => {
   let userId: string;
   try {
     const payload = jwt.verify(token, JWT_SECRET) as { userId: string };
-    const user = usersById.get(payload.userId);
+    const user = await prisma.user.findUnique({ where: { id: payload.userId } });
     if (!user) return res.status(401).send("User not found");
     userId = user.id;
   } catch {
@@ -555,7 +519,8 @@ app.get("/integrations/google/callback", async (req: Request, res: Response) => 
     res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(err))}`);
     return;
   }
-  if (!userId || !usersById.has(userId)) {
+  const userGoogle = userId ? await prisma.user.findUnique({ where: { id: userId } }) : null;
+  if (!userGoogle) {
     res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("Invalid state")}`);
     return;
   }
@@ -583,23 +548,10 @@ app.get("/integrations/google/callback", async (req: Request, res: Response) => 
       return;
     }
     const refreshToken = tokenRes.data?.refresh_token;
-    const existing = connectedAccounts.filter((c) => c.userId === userId && c.platform === "google");
-    existing.forEach((c) => connectedAccountsById.delete(c.id));
-    const newList = connectedAccounts.filter((c) => !(c.userId === userId && c.platform === "google"));
-    connectedAccounts.length = 0;
-    connectedAccounts.push(...newList);
-
-    const id = generateIntegrationId();
-    const record: ConnectedAccountRecord = {
-      id,
-      userId,
-      platform: "google",
-      accessToken,
-      refreshToken,
-      createdAt: new Date().toISOString(),
-    };
-    connectedAccounts.push(record);
-    connectedAccountsById.set(id, record);
+    await prisma.connectedAccount.deleteMany({ where: { userId, platform: "google" } });
+    await prisma.connectedAccount.create({
+      data: { userId, platform: "google", accessToken, refreshToken: refreshToken ?? undefined },
+    });
     res.redirect(302, `${frontendBase}${redirectPath}?connected=google`);
   } catch (err: unknown) {
     const msg = err && typeof err === "object" && "response" in err
@@ -611,9 +563,9 @@ app.get("/integrations/google/callback", async (req: Request, res: Response) => 
 
 // Get Google Ads customer accounts (requires GOOGLE_ADS_DEVELOPER_TOKEN and connected Google OAuth).
 app.get("/integrations/google/ad-accounts", requireAuth, async (req: AuthRequest, res: Response) => {
-  const googleConn = connectedAccounts.find(
-    (c) => c.userId === req.user!.id && c.platform === "google"
-  );
+  const googleConn = await prisma.connectedAccount.findFirst({
+    where: { userId: req.effectiveUserId ?? req.user!.id, platform: "google" },
+  });
   if (!googleConn) {
     return res.status(404).json({ error: "Google not connected. Connect Google in Integrations first." });
   }
@@ -649,9 +601,9 @@ app.get("/integrations/google/ad-accounts", requireAuth, async (req: AuthRequest
 
 // Get TikTok ad accounts (advertisers) for the connected TikTok integration.
 app.get("/integrations/tiktok/ad-accounts", requireAuth, async (req: AuthRequest, res: Response) => {
-  const tiktokConn = connectedAccounts.find(
-    (c) => c.userId === req.user!.id && c.platform === "tiktok"
-  );
+  const tiktokConn = await prisma.connectedAccount.findFirst({
+    where: { userId: req.effectiveUserId ?? req.user!.id, platform: "tiktok" },
+  });
   if (!tiktokConn) {
     return res.status(404).json({ error: "TikTok not connected. Connect TikTok in Integrations first." });
   }
@@ -680,58 +632,54 @@ app.get("/integrations/tiktok/ad-accounts", requireAuth, async (req: AuthRequest
   }
 });
 
-app.delete("/integrations/:id", requireAuth, (req: AuthRequest, res: Response) => {
-  const conn = connectedAccountsById.get(req.params.id);
+app.delete("/integrations/:id", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const conn = await prisma.connectedAccount.findFirst({ where: { id: req.params.id, userId: uid } });
   if (!conn) return res.status(404).json({ error: "Connection not found" });
-  if (conn.userId !== req.user!.id) return res.status(404).json({ error: "Connection not found" });
-  connectedAccountsById.delete(conn.id);
-  const idx = connectedAccounts.findIndex((c) => c.id === conn.id);
-  if (idx !== -1) connectedAccounts.splice(idx, 1);
+  await prisma.connectedAccount.delete({ where: { id: conn.id } });
   res.json({ ok: true });
 });
 
 // ----- Creatives library (user uploads; can attach to campaigns) -----
-app.get("/creatives", requireAuth, (req: AuthRequest, res: Response) => {
-  const list = creatives
-    .filter((c) => c.userId === req.user!.id)
-    .map((c) => ({ id: c.id, name: c.name, createdAt: c.createdAt }));
-  res.json({ creatives: list });
+app.get("/creatives", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const list = await prisma.creative.findMany({
+    where: { userId: uid },
+    select: { id: true, name: true, createdAt: true },
+  });
+  res.json({ creatives: list.map((c) => ({ id: c.id, name: c.name, createdAt: c.createdAt.toISOString() })) });
 });
 
-app.post("/creatives", requireAuth, (req: AuthRequest, res: Response) => {
+app.post("/creatives", requireAuth, async (req: AuthRequest, res: Response) => {
   const { name, imageData } = req.body;
   if (!name || typeof name !== "string" || !imageData || typeof imageData !== "string") {
     return res.status(400).json({ error: "name and imageData (base64 string) are required" });
   }
   const base64 = imageData.replace(/^data:image\/[a-z]+;base64,/, "").trim();
   if (!base64.length) return res.status(400).json({ error: "imageData must be a valid base64 image" });
-  const id = generateCreativeId();
-  const creative: CreativeRecord = {
-    id,
-    userId: req.user!.id,
-    name: String(name).trim().slice(0, 200) || "Creative",
-    imageData: base64,
-    createdAt: new Date().toISOString(),
-  };
-  creatives.push(creative);
-  creativesById.set(id, creative);
-  res.status(201).json({ id: creative.id, name: creative.name, createdAt: creative.createdAt });
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const creative = await prisma.creative.create({
+    data: {
+      userId: uid,
+      name: String(name).trim().slice(0, 200) || "Creative",
+      imageData: base64,
+    },
+  });
+  res.status(201).json({ id: creative.id, name: creative.name, createdAt: creative.createdAt.toISOString() });
 });
 
-app.delete("/creatives/:id", requireAuth, (req: AuthRequest, res: Response) => {
-  const c = creativesById.get(req.params.id);
+app.delete("/creatives/:id", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const c = await prisma.creative.findFirst({ where: { id: req.params.id, userId: uid } });
   if (!c) return res.status(404).json({ error: "Creative not found" });
-  if (c.userId !== req.user!.id) return res.status(404).json({ error: "Creative not found" });
-  creativesById.delete(c.id);
-  const idx = creatives.findIndex((x) => x.id === c.id);
-  if (idx !== -1) creatives.splice(idx, 1);
+  await prisma.creative.delete({ where: { id: c.id } });
   res.json({ ok: true });
 });
 
-app.get("/creatives/:id/asset", requireAuth, (req: AuthRequest, res: Response) => {
-  const c = creativesById.get(req.params.id);
+app.get("/creatives/:id/asset", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const c = await prisma.creative.findFirst({ where: { id: req.params.id, userId: uid } });
   if (!c) return res.status(404).json({ error: "Creative not found" });
-  if (c.userId !== req.user!.id) return res.status(404).json({ error: "Creative not found" });
   const buf = Buffer.from(c.imageData, "base64");
   res.setHeader("Content-Type", "image/png");
   res.send(buf);
@@ -739,9 +687,10 @@ app.get("/creatives/:id/asset", requireAuth, (req: AuthRequest, res: Response) =
 
 // Get Meta ad accounts for the connected Meta integration (so we can show/use them for launching).
 app.get("/integrations/meta/ad-accounts", requireAuth, async (req: AuthRequest, res: Response) => {
-  const metaConn = connectedAccounts.find(
-    (c) => c.userId === req.user!.id && c.platform === "meta"
-  );
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const metaConn = await prisma.connectedAccount.findFirst({
+    where: { userId: uid, platform: "meta" },
+  });
   if (!metaConn) {
     return res.status(404).json({ error: "Meta not connected. Connect Meta in Integrations first." });
   }
@@ -761,27 +710,62 @@ app.get("/integrations/meta/ad-accounts", requireAuth, async (req: AuthRequest, 
 
 // ----- Experiments (auth required) -----
 // List all experiments for the logged-in user (with variants and variantCount)
-app.get("/experiments", requireAuth, (req: AuthRequest, res: Response) => {
-  const list = experiments
-    .filter((e) => e.userId === req.user!.id)
-    .map((e) => {
-      const variants = (variantsByExperimentId[e.id] || []).map(variantToJson);
-      return {
-        ...e,
-        variants,
-        variantCount: e.variantCount ?? variants.length
-      };
-    });
-  res.json(list);
+app.get("/experiments", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const list = await prisma.experiment.findMany({
+    where: { userId: uid },
+    include: { variants: true },
+  });
+  res.json(list.map((e) => ({
+    id: e.id,
+    userId: e.userId,
+    name: e.name,
+    platform: e.platform,
+    status: e.status,
+    phase: e.phase,
+    totalDailyBudget: e.totalDailyBudget,
+    prompt: e.prompt ?? undefined,
+    variantCount: e.variantCount ?? e.variants.length,
+    creativesSource: e.creativesSource ?? undefined,
+    aiProvider: e.aiProvider ?? undefined,
+    aiCreativeCount: e.aiCreativeCount ?? undefined,
+    creativePrompt: e.creativePrompt ?? undefined,
+    campaignGroupId: e.campaignGroupId ?? undefined,
+    metaCampaignId: e.metaCampaignId ?? undefined,
+    metaAdSetId: e.metaAdSetId ?? undefined,
+    attachedCreativeIds: e.attachedCreativeIds ?? undefined,
+    variants: e.variants.map(variantToJson),
+  })));
 });
 
 // Get one experiment with its variants (must belong to user). Variants omit imageData; use GET .../creative for image.
-app.get("/experiments/:id", requireAuth, (req: AuthRequest, res: Response) => {
-  const exp = experiments.find((e) => e.id === req.params.id);
+app.get("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({
+    where: { id: req.params.id, userId: uid },
+    include: { variants: true },
+  });
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
-  if (exp.userId !== req.user!.id) return res.status(404).json({ error: "Experiment not found" });
-  const variants = (variantsByExperimentId[exp.id] || []).map(variantToJson);
-  res.json({ ...exp, variants });
+  res.json({
+    id: exp.id,
+    userId: exp.userId,
+    name: exp.name,
+    platform: exp.platform,
+    status: exp.status,
+    phase: exp.phase,
+    totalDailyBudget: exp.totalDailyBudget,
+    prompt: exp.prompt ?? undefined,
+    variantCount: exp.variantCount ?? exp.variants.length,
+    creativesSource: exp.creativesSource ?? undefined,
+    aiProvider: exp.aiProvider ?? undefined,
+    aiCreativeCount: exp.aiCreativeCount ?? undefined,
+    creativePrompt: exp.creativePrompt ?? undefined,
+    campaignGroupId: exp.campaignGroupId ?? undefined,
+    metaCampaignId: exp.metaCampaignId ?? undefined,
+    metaAdSetId: exp.metaAdSetId ?? undefined,
+    attachedCreativeIds: exp.attachedCreativeIds ?? undefined,
+    variants: exp.variants.map(variantToJson),
+  });
 });
 
 // AI ad copy generation
@@ -1070,61 +1054,70 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
   const createdExperimentIds: string[] = [];
   const campaignGroupId = platformsList.length > 1 ? `cg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}` : undefined;
 
+  const uid = req.effectiveUserId ?? req.user!.id;
   for (const platform of platformsList) {
-    const id = generateId();
-    const newExperiment: ExperimentRecord = {
-      id,
-      userId: req.user!.id,
-      name,
-      platform,
-      status: "draft",
-      phase: "setup",
-      totalDailyBudget: Number(totalDailyBudget),
-      prompt: promptText,
-      variantCount: count,
-      creativesSource: source,
-      ...((source === "ai" || source === "mix") && { aiProvider }),
-      ...(creativePrompt && { creativePrompt }),
-      ...(attachedCreativeIds.length > 0 && { attachedCreativeIds }),
-      campaignGroupId: campaignGroupId ?? id,
-    };
-    experiments.push(newExperiment);
-    createdExperimentIds.push(id);
-
-    const variants: VariantRecord[] = copies.map((copy, i) => {
-      const text = (typeof copy === "string" && copy.trim()) ? copy.trim() : "";
-      const fallback = source === "own" ? "Paste your ad copy here..." : `Variant ${i + 1} — Ad copy`;
-      let aiSource: "openai" | "anthropic" | undefined;
-      if ((source === "ai" || source === "mix") && aiProvider) {
-        if (aiProvider === "openai") aiSource = "openai";
-        else if (aiProvider === "anthropic") aiSource = "anthropic";
-        else if (aiProvider === "split") aiSource = i < half ? "openai" : "anthropic";
-      }
-      return {
-        id: generateVariantId(),
-        experimentId: id,
-        index: i + 1,
-        copy: text || fallback,
+    const exp = await prisma.experiment.create({
+      data: {
+        userId: uid,
+        name,
+        platform,
         status: "draft",
-        ...(aiSource && { aiSource }),
-      };
+        phase: "setup",
+        totalDailyBudget: Number(totalDailyBudget),
+        prompt: promptText,
+        variantCount: count,
+        creativesSource: source,
+        ...((source === "ai" || source === "mix") && { aiProvider }),
+        ...(creativePrompt && { creativePrompt }),
+        ...(attachedCreativeIds.length > 0 && { attachedCreativeIds }),
+        campaignGroupId: campaignGroupId ?? undefined,
+        variants: {
+          create: copies.map((copy, i) => {
+            const text = (typeof copy === "string" && copy.trim()) ? copy.trim() : "";
+            const fallback = source === "own" ? "Paste your ad copy here..." : `Variant ${i + 1} — Ad copy`;
+            let aiSource: string | undefined;
+            if ((source === "ai" || source === "mix") && aiProvider) {
+              if (aiProvider === "openai") aiSource = "openai";
+              else if (aiProvider === "anthropic") aiSource = "anthropic";
+              else if (aiProvider === "split") aiSource = i < half ? "openai" : "anthropic";
+            }
+            return { index: i + 1, copy: text || fallback, status: "draft", ...(aiSource && { aiSource }) };
+          }),
+        },
+      },
+      include: { variants: true },
     });
-    variantsByExperimentId[id] = variants;
+    if (platformsList.length === 1) {
+      await prisma.experiment.update({ where: { id: exp.id }, data: { campaignGroupId: exp.id } });
+    }
+    createdExperimentIds.push(exp.id);
   }
 
   const firstId = createdExperimentIds[0];
-  const firstExp = experiments.find((e) => e.id === firstId)!;
-  const firstVariants = variantsByExperimentId[firstId] || [];
+  const firstExp = await prisma.experiment.findUniqueOrThrow({ where: { id: firstId }, include: { variants: true } });
 
   res.status(201).json({
-    ...firstExp,
-    variants: firstVariants.map(variantToJson),
+    id: firstExp.id,
+    userId: firstExp.userId,
+    name: firstExp.name,
+    platform: firstExp.platform,
+    status: firstExp.status,
+    phase: firstExp.phase,
+    totalDailyBudget: firstExp.totalDailyBudget,
+    prompt: firstExp.prompt ?? undefined,
+    variantCount: firstExp.variantCount ?? firstExp.variants.length,
+    creativesSource: firstExp.creativesSource ?? undefined,
+    aiProvider: firstExp.aiProvider ?? undefined,
+    creativePrompt: firstExp.creativePrompt ?? undefined,
+    campaignGroupId: firstExp.campaignGroupId ?? undefined,
+    attachedCreativeIds: firstExp.attachedCreativeIds ?? undefined,
+    variants: firstExp.variants.map(variantToJson),
     createdExperimentIds,
   });
 });
 
 // Update one variant's copy (Phase 2)
-app.patch("/experiments/:experimentId/variants/:variantId", requireAuth, (req: AuthRequest, res: Response) => {
+app.patch("/experiments/:experimentId/variants/:variantId", requireAuth, async (req: AuthRequest, res: Response) => {
   const { experimentId, variantId } = req.params;
   const { copy } = req.body;
 
@@ -1132,28 +1125,22 @@ app.patch("/experiments/:experimentId/variants/:variantId", requireAuth, (req: A
     return res.status(400).json({ error: "Body must include copy (string)" });
   }
 
-  const exp = experiments.find((e) => e.id === experimentId);
-  if (!exp || exp.userId !== req.user!.id) {
-    return res.status(404).json({ error: "Experiment not found" });
-  }
-  const variants = variantsByExperimentId[experimentId];
-  if (!variants) return res.status(404).json({ error: "Experiment not found" });
-  const variant = variants.find((v) => v.id === variantId);
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid } });
+  if (!exp) return res.status(404).json({ error: "Experiment not found" });
+  const variant = await prisma.variant.findFirst({ where: { id: variantId, experimentId } });
   if (!variant) return res.status(404).json({ error: "Variant not found" });
-  variant.copy = copy;
-  res.json(variantToJson(variant));
+  const updated = await prisma.variant.update({ where: { id: variantId }, data: { copy } });
+  res.json(variantToJson(updated));
 });
 
 // Generate AI creative (image) for a variant using DALL-E. Stores base64 PNG on variant.
 app.post("/experiments/:experimentId/variants/:variantId/generate-creative", requireAuth, async (req: AuthRequest, res: Response) => {
   const { experimentId, variantId } = req.params;
-  const exp = experiments.find((e) => e.id === experimentId);
-  if (!exp || exp.userId !== req.user!.id) {
-    return res.status(404).json({ error: "Experiment not found" });
-  }
-  const variants = variantsByExperimentId[experimentId];
-  if (!variants) return res.status(404).json({ error: "Experiment not found" });
-  const variant = variants.find((v) => v.id === variantId);
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid }, include: { variants: true } });
+  if (!exp) return res.status(404).json({ error: "Experiment not found" });
+  const variant = exp.variants.find((v) => v.id === variantId);
   if (!variant) return res.status(404).json({ error: "Variant not found" });
 
   const copy = (variant.copy || "").trim().slice(0, 500);
@@ -1177,7 +1164,7 @@ app.post("/experiments/:experimentId/variants/:variantId/generate-creative", req
     if (!b64) {
       return res.status(500).json({ error: "No image data from AI" });
     }
-    variant.imageData = b64;
+    await prisma.variant.update({ where: { id: variantId }, data: { imageData: b64 } });
     res.json({ hasCreative: true });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Image generation failed";
@@ -1187,17 +1174,13 @@ app.post("/experiments/:experimentId/variants/:variantId/generate-creative", req
 });
 
 // Serve variant creative image (PNG). No auth on URL so img src works; variant is scoped by experiment ownership.
-app.get("/experiments/:experimentId/variants/:variantId/creative", requireAuth, (req: AuthRequest, res: Response) => {
+app.get("/experiments/:experimentId/variants/:variantId/creative", requireAuth, async (req: AuthRequest, res: Response) => {
   const { experimentId, variantId } = req.params;
-  const exp = experiments.find((e) => e.id === experimentId);
-  if (!exp || exp.userId !== req.user!.id) {
-    return res.status(404).send();
-  }
-  const variants = variantsByExperimentId[experimentId];
-  const variant = variants?.find((v) => v.id === variantId);
-  if (!variant?.imageData) {
-    return res.status(404).send();
-  }
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid } });
+  if (!exp) return res.status(404).send();
+  const variant = await prisma.variant.findFirst({ where: { id: variantId, experimentId }, select: { imageData: true } });
+  if (!variant?.imageData) return res.status(404).send();
   const buf = Buffer.from(variant.imageData, "base64");
   res.setHeader("Content-Type", "image/png");
   res.setHeader("Cache-Control", "private, max-age=3600");
@@ -1207,47 +1190,181 @@ app.get("/experiments/:experimentId/variants/:variantId/creative", requireAuth, 
 // Regenerate one variant's copy with AI (same prompt, new angle)
 app.post("/experiments/:experimentId/variants/:variantId/regenerate", requireAuth, async (req: AuthRequest, res: Response) => {
   const { experimentId, variantId } = req.params;
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid } });
+  if (!exp) return res.status(404).json({ error: "Experiment not found" });
 
-  const exp = experiments.find((e) => e.id === experimentId);
-  if (!exp || exp.userId !== req.user!.id) {
-    return res.status(404).json({ error: "Experiment not found" });
-  }
-
-  const variants = variantsByExperimentId[experimentId];
-  if (!variants) {
-    return res.status(404).json({ error: "Experiment not found" });
-  }
-  const variant = variants.find((v) => v.id === variantId);
-  if (!variant) {
-    return res.status(404).json({ error: "Variant not found" });
-  }
+  const variant = await prisma.variant.findFirst({ where: { id: variantId, experimentId } });
+  if (!variant) return res.status(404).json({ error: "Variant not found" });
 
   const promptText = exp.prompt || "Generate a new, distinct ad copy variant.";
   try {
     const copies = await generateVariantsFromPrompt(promptText, exp.platform, 1);
     const newCopy = copies[0] || "";
-    variant.copy = newCopy;
-    variant.aiSource = "openai"; // regenerate always uses OpenAI
-    res.json({ copy: newCopy, variant: variantToJson(variant) });
+    const updated = await prisma.variant.update({
+      where: { id: variantId },
+      data: { copy: newCopy, aiSource: "openai" },
+    });
+    res.json({ copy: newCopy, variant: variantToJson(updated) });
   } catch (err: any) {
     console.error("Regenerate variant failed", err?.message || err);
     res.status(500).json({ error: "Failed to regenerate ad copy" });
   }
 });
 
-// Launch experiment (Phase 2)
-app.post("/experiments/:id/launch", requireAuth, (req: AuthRequest, res: Response) => {
-  const exp = experiments.find((e) => e.id === req.params.id);
-  if (!exp || exp.userId !== req.user!.id) {
-    return res.status(404).json({ error: "Experiment not found" });
-  }
+// Launch experiment (Phase 2). For Meta: pass metaAdAccountId (act_xxx) and optional landingPageUrl to create live campaign.
+app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({
+    where: { id: req.params.id, userId: uid },
+    include: { variants: true },
+  });
+  if (!exp) return res.status(404).json({ error: "Experiment not found" });
   const aiCreativeCount = req.body?.aiCreativeCount;
+  const metaAdAccountId = typeof req.body?.metaAdAccountId === "string" ? req.body.metaAdAccountId.trim() : undefined;
+  const landingPageUrl = typeof req.body?.landingPageUrl === "string" && req.body.landingPageUrl.trim()
+    ? req.body.landingPageUrl.trim()
+    : "https://example.com";
+
+  const data: { status: string; phase: string; aiCreativeCount?: number; metaCampaignId?: string; metaAdSetId?: string } = {
+    status: "launched",
+    phase: "running",
+  };
   if (typeof aiCreativeCount === "number" && aiCreativeCount >= 0) {
-    exp.aiCreativeCount = Math.min(aiCreativeCount, exp.variantCount ?? 20);
+    data.aiCreativeCount = Math.min(aiCreativeCount, exp.variantCount ?? 20);
   }
-  exp.status = "launched";
-  exp.phase = "running";
-  res.json(exp);
+
+  if (exp.platform === "meta" && metaAdAccountId) {
+    const metaConn = await prisma.connectedAccount.findFirst({
+      where: { userId: uid, platform: "meta" },
+    });
+    if (!metaConn) {
+      return res.status(400).json({ error: "Meta not connected. Connect Meta in Integrations first." });
+    }
+    const adAccountId = metaAdAccountId.startsWith("act_") ? metaAdAccountId : `act_${metaAdAccountId}`;
+    const token = metaConn.accessToken;
+
+    try {
+      // 1. Create Campaign
+      const campaignRes = await axios.post<{ id: string }>(
+        `https://graph.facebook.com/v21.0/${adAccountId}/campaigns`,
+        null,
+        {
+          params: {
+            name: exp.name.slice(0, 200),
+            objective: "OUTCOME_TRAFFIC",
+            status: "PAUSED",
+            special_ad_categories: "[]",
+            access_token: token,
+          },
+        }
+      );
+      const campaignId = campaignRes.data?.id;
+      if (!campaignId) {
+        throw new Error("Meta did not return campaign id");
+      }
+      data.metaCampaignId = campaignId;
+
+      // 2. Create Ad Set (daily_budget in cents)
+      const budgetCents = Math.round(exp.totalDailyBudget * 100);
+      const adSetRes = await axios.post<{ id: string }>(
+        `https://graph.facebook.com/v21.0/${adAccountId}/adsets`,
+        null,
+        {
+          params: {
+            name: `${exp.name} - Ad Set`.slice(0, 200),
+            campaign_id: campaignId,
+            daily_budget: String(budgetCents),
+            billing_event: "IMPRESSIONS",
+            optimization_goal: "LINK_CLICKS",
+            targeting: JSON.stringify({ geo_locations: { countries: ["US"] } }),
+            status: "PAUSED",
+            access_token: token,
+          },
+        }
+      );
+      const adSetId = adSetRes.data?.id;
+      if (!adSetId) {
+        throw new Error("Meta did not return ad set id");
+      }
+      data.metaAdSetId = adSetId;
+
+      // 3. Upload images and create creatives + ads for each variant that has image
+      const variantsWithImage = exp.variants.filter((v) => v.imageData);
+      for (let i = 0; i < variantsWithImage.length; i++) {
+        const v = variantsWithImage[i];
+        const imageBase64 = (v.imageData || "").replace(/^data:image\/[a-z]+;base64,/, "");
+        if (!imageBase64) continue;
+        const imageRes = await axios.post<{ images?: Record<string, { hash: string }> }>(
+          `https://graph.facebook.com/v21.0/${adAccountId}/adimages`,
+          new URLSearchParams({ bytes: imageBase64, access_token: token }).toString(),
+          {
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          }
+        );
+        const hash = imageRes.data?.images && Object.values(imageRes.data.images)[0]?.hash;
+        if (!hash) continue;
+
+        const objectStorySpec = JSON.stringify({
+          link_data: {
+            image_hash: hash,
+            link: landingPageUrl,
+            message: (v.copy || "").slice(0, 1250),
+            name: (exp.name + ` - Variant ${i + 1}`).slice(0, 40),
+            call_to_action: { type: "LEARN_MORE" },
+          },
+        });
+
+        const creativeRes = await axios.post<{ id: string }>(
+          `https://graph.facebook.com/v21.0/${adAccountId}/adcreatives`,
+          null,
+          {
+            params: {
+              name: `${exp.name} - Creative ${i + 1}`.slice(0, 200),
+              object_story_spec: objectStorySpec,
+              access_token: token,
+            },
+          }
+        );
+        const creativeId = creativeRes.data?.id;
+        if (!creativeId) continue;
+
+        await axios.post(`https://graph.facebook.com/v21.0/${adAccountId}/ads`, null, {
+          params: {
+            name: `${exp.name} - Ad ${i + 1}`.slice(0, 200),
+            adset_id: adSetId,
+            creative: JSON.stringify({ creative_id: creativeId }),
+            status: "PAUSED",
+            access_token: token,
+          },
+        });
+      }
+
+      // If we created at least one ad, set campaign and ad set to ACTIVE so it goes live
+      if (variantsWithImage.length > 0) {
+        await axios.post(
+          `https://graph.facebook.com/v21.0/${campaignId}`,
+          null,
+          { params: { status: "ACTIVE", access_token: token } }
+        );
+        await axios.post(
+          `https://graph.facebook.com/v21.0/${adSetId}`,
+          null,
+          { params: { status: "ACTIVE", access_token: token } }
+        );
+      }
+    } catch (err: unknown) {
+      const msg =
+        err && typeof err === "object" && "response" in err
+          ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
+          : err instanceof Error ? err.message : "Meta API error";
+      console.error("[Meta launch]", msg);
+      return res.status(502).json({ error: typeof msg === "string" ? msg : "Failed to create Meta campaign" });
+    }
+  }
+
+  const updated = await prisma.experiment.update({ where: { id: exp.id }, data });
+  res.json({ ...updated, aiProvider: updated.aiProvider ?? undefined, creativePrompt: updated.creativePrompt ?? undefined, campaignGroupId: updated.campaignGroupId ?? undefined, attachedCreativeIds: updated.attachedCreativeIds ?? undefined });
 });
 
 // Campaign metrics: full Meta-style metrics for dashboard. From Meta when we have metaCampaignId.
@@ -1352,8 +1469,9 @@ async function fetchMetaMetrics(
 }
 
 app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: Response) => {
-  const exp = experiments.find((e) => e.id === req.params.id);
-  if (!exp || exp.userId !== req.user!.id) {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: req.params.id, userId: uid } });
+  if (!exp) {
     return res.status(404).json({ error: "Campaign not found" });
   }
   if (exp.status !== "launched") {
@@ -1361,9 +1479,9 @@ app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: R
   }
 
   if (exp.platform === "meta" && exp.metaCampaignId) {
-    const metaConn = connectedAccounts.find(
-      (c) => c.userId === req.user!.id && c.platform === "meta"
-    );
+    const metaConn = await prisma.connectedAccount.findFirst({
+      where: { userId: uid, platform: "meta" },
+    });
     if (metaConn) {
       const m = await fetchMetaMetrics(exp.metaCampaignId, metaConn.accessToken);
       if (m) return res.json({ ...m, source: "meta" as const, datePreset: "last_7d" });
@@ -1375,8 +1493,9 @@ app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: R
 
 // Campaign adjustments: update status (pause/activate) or daily budget on Meta. Require metaCampaignId (and metaAdSetId for budget).
 app.patch("/experiments/:id/campaign-status", requireAuth, async (req: AuthRequest, res: Response) => {
-  const exp = experiments.find((e) => e.id === req.params.id);
-  if (!exp || exp.userId !== req.user!.id) {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: req.params.id, userId: uid } });
+  if (!exp) {
     return res.status(404).json({ error: "Campaign not found" });
   }
   const status = req.body?.status === "PAUSED" || req.body?.status === "ACTIVE" ? req.body.status : null;
@@ -1386,7 +1505,7 @@ app.patch("/experiments/:id/campaign-status", requireAuth, async (req: AuthReque
   if (!exp.metaCampaignId) {
     return res.status(400).json({ error: "Campaign is not linked to Meta. Launch to Meta first." });
   }
-  const metaConn = connectedAccounts.find((c) => c.userId === req.user!.id && c.platform === "meta");
+  const metaConn = await prisma.connectedAccount.findFirst({ where: { userId: uid, platform: "meta" } });
   if (!metaConn) {
     return res.status(400).json({ error: "Meta not connected. Connect Meta in Integrations." });
   }
@@ -1404,8 +1523,9 @@ app.patch("/experiments/:id/campaign-status", requireAuth, async (req: AuthReque
 });
 
 app.patch("/experiments/:id/campaign-budget", requireAuth, async (req: AuthRequest, res: Response) => {
-  const exp = experiments.find((e) => e.id === req.params.id);
-  if (!exp || exp.userId !== req.user!.id) {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: req.params.id, userId: uid } });
+  if (!exp) {
     return res.status(404).json({ error: "Campaign not found" });
   }
   const dailyBudget = typeof req.body?.dailyBudget === "number" ? req.body.dailyBudget : null;
@@ -1415,7 +1535,7 @@ app.patch("/experiments/:id/campaign-budget", requireAuth, async (req: AuthReque
   if (!exp.metaAdSetId) {
     return res.status(400).json({ error: "Campaign has no linked Meta ad set. Launch to Meta first." });
   }
-  const metaConn = connectedAccounts.find((c) => c.userId === req.user!.id && c.platform === "meta");
+  const metaConn = await prisma.connectedAccount.findFirst({ where: { userId: uid, platform: "meta" } });
   if (!metaConn) {
     return res.status(400).json({ error: "Meta not connected. Connect Meta in Integrations." });
   }
@@ -1433,24 +1553,105 @@ app.patch("/experiments/:id/campaign-budget", requireAuth, async (req: AuthReque
   }
 });
 
+// ----- Admin: user list, account type, agency clients (only for ADMIN_EMAILS) -----
+app.get("/admin/users", requireAuth, requireAdmin, async (_req: AuthRequest, res: Response) => {
+  const users = await prisma.user.findMany({
+    select: { id: true, email: true, accountType: true, createdAt: true },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json({
+    users: users.map((u) => ({
+      id: u.id,
+      email: u.email,
+      accountType: (u as { accountType?: string }).accountType ?? "single",
+      createdAt: u.createdAt.toISOString(),
+    })),
+  });
+});
+
+app.patch("/admin/users/:id", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  const accountType = req.body?.accountType;
+  if (accountType !== "single" && accountType !== "agency") {
+    return res.status(400).json({ error: "Body must include accountType: 'single' or 'agency'" });
+  }
+  const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+  if (!user) return res.status(404).json({ error: "User not found" });
+  await prisma.user.update({
+    where: { id: req.params.id },
+    data: { accountType },
+  });
+  res.json({ ok: true, accountType });
+});
+
+app.get("/admin/agencies/:userId/clients", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  const agencyUserId = req.params.userId;
+  const clients = await prisma.agencyClient.findMany({
+    where: { agencyUserId },
+    include: { clientUser: { select: { id: true, email: true } } },
+  });
+  res.json({
+    clients: clients.map((c) => ({ id: c.clientUserId, email: c.clientUser.email })),
+  });
+});
+
+app.post("/admin/agencies/:userId/clients", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  const agencyUserId = req.params.userId;
+  const clientUserId = req.body?.clientUserId ?? (typeof req.body?.email === "string" ? null : null);
+  let resolvedClientId: string;
+  if (clientUserId && typeof clientUserId === "string") {
+    resolvedClientId = clientUserId.trim();
+  } else if (typeof req.body?.email === "string" && req.body.email.trim()) {
+    const client = await prisma.user.findUnique({ where: { email: req.body.email.trim().toLowerCase() } });
+    if (!client) return res.status(404).json({ error: "No user found with that email" });
+    resolvedClientId = client.id;
+  } else {
+    return res.status(400).json({ error: "Body must include clientUserId or email" });
+  }
+  if (resolvedClientId === agencyUserId) {
+    return res.status(400).json({ error: "Agency cannot add themselves as a client" });
+  }
+  const agency = await prisma.user.findUnique({ where: { id: agencyUserId } });
+  if (!agency) return res.status(404).json({ error: "Agency user not found" });
+  await prisma.agencyClient.upsert({
+    where: {
+      agencyUserId_clientUserId: { agencyUserId, clientUserId: resolvedClientId },
+    },
+    create: { agencyUserId, clientUserId: resolvedClientId },
+    update: {},
+  });
+  const clientUser = await prisma.user.findUnique({ where: { id: resolvedClientId }, select: { id: true, email: true } });
+  res.status(201).json({ client: { id: resolvedClientId, email: clientUser?.email ?? "" } });
+});
+
+app.delete("/admin/agencies/:userId/clients/:clientUserId", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  const { userId: agencyUserId, clientUserId } = req.params;
+  const deleted = await prisma.agencyClient.deleteMany({
+    where: { agencyUserId, clientUserId },
+  });
+  if (deleted.count === 0) return res.status(404).json({ error: "Client link not found" });
+  res.json({ ok: true });
+});
+
 // ----- Admin: extra metrics and AI performance (only for ADMIN_EMAILS) -----
-app.get("/admin/overview", requireAuth, requireAdmin, (_req: AuthRequest, res: Response) => {
-  const totalUsers = usersById.size;
-  const totalCampaigns = experiments.length;
-  const launched = experiments.filter((e) => e.status === "launched");
+app.get("/admin/overview", requireAuth, requireAdmin, async (_req: AuthRequest, res: Response) => {
+  const [totalUsers, experimentsList] = await Promise.all([
+    prisma.user.count(),
+    prisma.experiment.findMany(),
+  ]);
+  const launched = experimentsList.filter((e) => e.status === "launched");
   const byPlatform: Record<string, number> = {};
   const byStatus: Record<string, number> = {};
-  for (const e of experiments) {
+  for (const e of experimentsList) {
     byPlatform[e.platform] = (byPlatform[e.platform] || 0) + 1;
     byStatus[e.status] = (byStatus[e.status] || 0) + 1;
   }
   res.json({
     totalUsers,
-    totalCampaigns,
+    totalCampaigns: experimentsList.length,
     launchedCampaigns: launched.length,
     byPlatform,
     byStatus,
-    funnel: { created: totalCampaigns, launched: launched.length },
+    funnel: { created: experimentsList.length, launched: launched.length },
   });
 });
 
@@ -1465,12 +1666,12 @@ app.get("/admin/ai-performance", requireAuth, requireAdmin, async (_req: AuthReq
     split: { campaigns: 0, spend: 0, impressions: 0, clicks: 0, conversions: 0, ctrSum: 0, cpcSum: 0 },
   };
 
-  const launchedWithAi = experiments.filter(
-    (e) => e.status === "launched" && e.aiProvider && e.platform === "meta" && e.metaCampaignId
-  );
+  const launchedWithAi = await prisma.experiment.findMany({
+    where: { status: "launched", platform: "meta", metaCampaignId: { not: null }, aiProvider: { not: null } },
+  });
 
   for (const exp of launchedWithAi) {
-    const metaConn = connectedAccounts.find((c) => c.userId === exp.userId && c.platform === "meta");
+    const metaConn = await prisma.connectedAccount.findFirst({ where: { userId: exp.userId, platform: "meta" } });
     if (!metaConn || !exp.metaCampaignId) continue;
     const m = await fetchMetaMetrics(exp.metaCampaignId, metaConn.accessToken);
     const provider = (exp.aiProvider || "openai") as ProviderKey;
@@ -1510,6 +1711,21 @@ app.get("/admin/ai-performance", requireAuth, requireAdmin, async (_req: AuthReq
   res.json({ byProvider });
 });
 
-app.listen(PORT, () => {
-  console.log(`Backend listening on port ${PORT}`);
-});
+async function start() {
+  if (!process.env.DATABASE_URL?.trim()) {
+    console.error("[FATAL] DATABASE_URL is required. Add it to .env (e.g. PostgreSQL from Render, Neon, or Supabase).");
+    process.exit(1);
+  }
+  try {
+    await prisma.$connect();
+    console.log("[DB] Connected to database.");
+  } catch (err) {
+    console.error("[FATAL] Database connection failed:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  }
+  app.listen(PORT, () => {
+    console.log(`Backend listening on port ${PORT}`);
+  });
+}
+
+start();
