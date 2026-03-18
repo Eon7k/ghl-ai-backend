@@ -380,9 +380,10 @@ app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
       res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("No token from Meta")}`);
       return;
     }
-    await prisma.connectedAccount.deleteMany({ where: { userId, platform: "meta" } });
+    const uid = userMeta.id;
+    await prisma.connectedAccount.deleteMany({ where: { userId: uid, platform: "meta" } });
     await prisma.connectedAccount.create({
-      data: { userId, platform: "meta", accessToken },
+      data: { userId: uid, platform: "meta", accessToken },
     });
     res.redirect(302, `${frontendBase}${redirectPath}?connected=meta`);
   } catch (err: unknown) {
