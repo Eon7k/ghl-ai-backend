@@ -223,45 +223,57 @@ app.get("/health", (_req: Request, res: Response) => {
 
 // ----- Auth (no auth required for these) -----
 app.post("/auth/register", async (req: Request, res: Response) => {
-  const { email, password } = req.body;
-  if (!email || typeof email !== "string" || !password || typeof password !== "string") {
-    return res.status(400).json({ error: "email and password are required" });
+  try {
+    const { email, password } = req.body;
+    if (!email || typeof email !== "string" || !password || typeof password !== "string") {
+      return res.status(400).json({ error: "email and password are required" });
+    }
+    const emailNorm = email.trim().toLowerCase();
+    const passwordTrimmed = (password as string).trim();
+    if (emailNorm.length < 3) {
+      return res.status(400).json({ error: "Invalid email" });
+    }
+    if (passwordTrimmed.length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters" });
+    }
+    const existing = await prisma.user.findUnique({ where: { email: emailNorm } });
+    if (existing) {
+      return res.status(400).json({ error: "An account with this email already exists" });
+    }
+    const passwordHash = await bcrypt.hash(passwordTrimmed, 10);
+    const user = await prisma.user.create({ data: { email: emailNorm, passwordHash } });
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
+    return res.status(201).json({ token, user: { id: user.id, email: user.email } });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Registration failed";
+    console.error("[auth/register]", err);
+    return res.status(500).json({ error: msg });
   }
-  const emailNorm = email.trim().toLowerCase();
-  const passwordTrimmed = (password as string).trim();
-  if (emailNorm.length < 3) {
-    return res.status(400).json({ error: "Invalid email" });
-  }
-  if (passwordTrimmed.length < 8) {
-    return res.status(400).json({ error: "Password must be at least 8 characters" });
-  }
-  const existing = await prisma.user.findUnique({ where: { email: emailNorm } });
-  if (existing) {
-    return res.status(400).json({ error: "An account with this email already exists" });
-  }
-  const passwordHash = await bcrypt.hash(passwordTrimmed, 10);
-  const user = await prisma.user.create({ data: { email: emailNorm, passwordHash } });
-  const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
-  res.status(201).json({ token, user: { id: user.id, email: user.email } });
 });
 
 app.post("/auth/login", async (req: Request, res: Response) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: "email and password are required" });
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: "email and password are required" });
+    }
+    const emailNorm = (email as string).trim().toLowerCase();
+    const passwordTrimmed = (password as string).trim();
+    const user = await prisma.user.findUnique({ where: { email: emailNorm } });
+    if (!user) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+    const match = await bcrypt.compare(passwordTrimmed, user.passwordHash);
+    if (!match) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
+    return res.json({ token, user: { id: user.id, email: user.email } });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Login failed";
+    console.error("[auth/login]", err);
+    return res.status(500).json({ error: msg });
   }
-  const emailNorm = (email as string).trim().toLowerCase();
-  const passwordTrimmed = (password as string).trim();
-  const user = await prisma.user.findUnique({ where: { email: emailNorm } });
-  if (!user) {
-    return res.status(401).json({ error: "Invalid email or password" });
-  }
-  const match = await bcrypt.compare(passwordTrimmed, user.passwordHash);
-  if (!match) {
-    return res.status(401).json({ error: "Invalid email or password" });
-  }
-  const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
-  res.json({ token, user: { id: user.id, email: user.email } });
 });
 
 app.get("/auth/me", async (req: AuthRequest, res: Response) => {
