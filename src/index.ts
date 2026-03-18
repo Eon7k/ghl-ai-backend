@@ -1444,6 +1444,11 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     : "https://example.com";
   /** When true: create campaign on Meta but leave it PAUSED so you can verify in Ads Manager with no spend. */
   const dryRun = req.body?.dryRun === true;
+  /** Optional: only launch these variant ids (must have imageData). If omitted, all variants with images are launched. */
+  const variantIds =
+    Array.isArray(req.body?.variantIds) && req.body.variantIds.length > 0
+      ? (req.body.variantIds as string[]).filter((id) => typeof id === "string" && id.trim()).map((id) => id.trim())
+      : undefined;
 
   const data: { status: string; phase: string; aiCreativeCount?: number; metaCampaignId?: string; metaAdSetId?: string } = {
     status: "launched",
@@ -1508,8 +1513,19 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
       }
       data.metaAdSetId = adSetId;
 
-      // 3. Upload images and create creatives + ads for each variant that has image
-      const variantsWithImage = exp.variants.filter((v) => v.imageData);
+      // 3. Upload images and create creatives + ads for each variant that has image (and is in variantIds if provided)
+      const variantIdSet = variantIds ? new Set(variantIds) : null;
+      const variantsWithImage = exp.variants.filter(
+        (v) => v.imageData && (!variantIdSet || variantIdSet.has(v.id))
+      );
+      if (variantsWithImage.length === 0) {
+        return res.status(400).json({
+          error: variantIds
+            ? "No selected variants have creatives. Generate images for at least one selected variant, or leave all selected to launch every variant with an image."
+            : "No variants have creatives yet. Generate creatives for at least one variant before launching.",
+        });
+      }
+      data.aiCreativeCount = variantsWithImage.length;
       for (let i = 0; i < variantsWithImage.length; i++) {
         const v = variantsWithImage[i];
         const imageBase64 = (v.imageData || "").replace(/^data:image\/[a-z]+;base64,/, "");
