@@ -822,6 +822,29 @@ app.get("/integrations/meta/ad-accounts", requireAuth, async (req: AuthRequest, 
   }
 });
 
+// Test Meta connection (token + ad account access). Use before launching to confirm integration works.
+app.get("/integrations/meta/test", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const metaConn = await prisma.connectedAccount.findFirst({
+    where: { userId: uid, platform: "meta" },
+  });
+  if (!metaConn) {
+    return res.status(400).json({ ok: false, error: "Meta not connected. Connect Meta in Integrations first." });
+  }
+  try {
+    const url = `https://graph.facebook.com/v21.0/me/adaccounts?fields=id&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+    const apiRes = await axios.get<{ data?: unknown[] }>(url);
+    const count = Array.isArray(apiRes.data?.data) ? apiRes.data.data.length : 0;
+    res.json({ ok: true, adAccountCount: count });
+  } catch (err: unknown) {
+    const msg = err && typeof err === "object" && "response" in err
+      ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
+      : err instanceof Error ? err.message : "Meta API error";
+    console.error("[Meta test]", msg);
+    res.status(502).json({ ok: false, error: typeof msg === "string" ? msg : "Meta API error" });
+  }
+});
+
 // ----- Experiments (auth required) -----
 // List all experiments for the logged-in user (with variants and variantCount)
 app.get("/experiments", requireAuth, async (req: AuthRequest, res: Response) => {
@@ -1339,6 +1362,8 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
   const landingPageUrl = typeof req.body?.landingPageUrl === "string" && req.body.landingPageUrl.trim()
     ? req.body.landingPageUrl.trim()
     : "https://example.com";
+  /** When true: create campaign on Meta but leave it PAUSED so you can verify in Ads Manager with no spend. */
+  const dryRun = req.body?.dryRun === true;
 
   const data: { status: string; phase: string; aiCreativeCount?: number; metaCampaignId?: string; metaAdSetId?: string } = {
     status: "launched",
@@ -1454,8 +1479,8 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
         });
       }
 
-      // If we created at least one ad, set campaign and ad set to ACTIVE so it goes live
-      if (variantsWithImage.length > 0) {
+      // If we created at least one ad and this is not a dry run, set campaign and ad set to ACTIVE so it goes live
+      if (variantsWithImage.length > 0 && !dryRun) {
         await axios.post(
           `https://graph.facebook.com/v21.0/${campaignId}`,
           null,
@@ -1478,7 +1503,9 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
   }
 
   const updated = await prisma.experiment.update({ where: { id: exp.id }, data });
-  res.json({ ...updated, aiProvider: updated.aiProvider ?? undefined, creativePrompt: updated.creativePrompt ?? undefined, campaignGroupId: updated.campaignGroupId ?? undefined, attachedCreativeIds: updated.attachedCreativeIds ?? undefined });
+  const payload: Record<string, unknown> = { ...updated, aiProvider: updated.aiProvider ?? undefined, creativePrompt: updated.creativePrompt ?? undefined, campaignGroupId: updated.campaignGroupId ?? undefined, attachedCreativeIds: updated.attachedCreativeIds ?? undefined };
+  if (exp.platform === "meta" && metaAdAccountId && dryRun) payload.dryRun = true;
+  res.json(payload);
 });
 
 // Campaign metrics: full Meta-style metrics for dashboard. From Meta when we have metaCampaignId.
