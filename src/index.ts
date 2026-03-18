@@ -1271,6 +1271,29 @@ app.patch("/experiments/:experimentId/variants/:variantId", requireAuth, async (
   res.json(variantToJson(updated));
 });
 
+// Reorder variants by new index order. Body: { variantIds: string[] } (ids in desired order).
+app.patch("/experiments/:experimentId/variants/reorder", requireAuth, async (req: AuthRequest, res: Response) => {
+  const { experimentId } = req.params;
+  const variantIds = req.body?.variantIds;
+  if (!Array.isArray(variantIds) || variantIds.length === 0) {
+    return res.status(400).json({ error: "Body must include variantIds (non-empty array)" });
+  }
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid }, include: { variants: true } });
+  if (!exp) return res.status(404).json({ error: "Experiment not found" });
+  const expVariantIds = new Set(exp.variants.map((v) => v.id));
+  for (const id of variantIds) {
+    if (typeof id !== "string" || !expVariantIds.has(id)) {
+      return res.status(400).json({ error: "variantIds must only contain variant ids belonging to this experiment" });
+    }
+  }
+  await prisma.$transaction(
+    variantIds.map((id, i) => prisma.variant.update({ where: { id }, data: { index: i + 1 } }))
+  );
+  const updated = await prisma.variant.findMany({ where: { experimentId }, orderBy: { index: "asc" } });
+  res.json({ variants: updated.map(variantToJson) });
+});
+
 // Generate AI creative (image) for a variant using DALL-E. Stores base64 PNG on variant.
 app.post("/experiments/:experimentId/variants/:variantId/generate-creative", requireAuth, async (req: AuthRequest, res: Response) => {
   const { experimentId, variantId } = req.params;
