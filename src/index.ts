@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import axios from "axios";
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
@@ -267,6 +268,9 @@ app.post("/auth/login", async (req: Request, res: Response) => {
     if (!user) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
+    if ((user as { loginDisabled?: boolean }).loginDisabled) {
+      return res.status(403).json({ error: "Login disabled for this account. Contact your agency." });
+    }
     const match = await bcrypt.compare(passwordTrimmed, user.passwordHash);
     if (!match) {
       return res.status(401).json({ error: "Invalid email or password" });
@@ -278,6 +282,91 @@ app.post("/auth/login", async (req: Request, res: Response) => {
     console.error("[auth/login]", err);
     return res.status(500).json({ error: msg });
   }
+});
+
+// ----- Agency: self-serve client management (agency users only) -----
+function requireAgency(req: AuthRequest, res: Response, next: NextFunction): void {
+  const type = req.user?.accountType ?? "single";
+  if (type !== "agency") {
+    res.status(403).json({ error: "Agency account required" });
+    return;
+  }
+  next();
+}
+
+function makeTempPassword(): string {
+  // 12 chars, URL-safe; good enough for a one-time temp credential.
+  return crypto.randomBytes(9).toString("base64url");
+}
+
+app.get("/agency/clients", requireAuth, requireAgency, async (req: AuthRequest, res: Response) => {
+  const list = await prisma.agencyClient.findMany({
+    where: { agencyUserId: req.user!.id },
+    include: { clientUser: { select: { id: true, email: true, loginDisabled: true, createdAt: true } } },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json({
+    clients: list.map((c) => ({
+      id: c.clientUser.id,
+      email: c.clientUser.email,
+      loginDisabled: c.clientUser.loginDisabled,
+      createdAt: c.clientUser.createdAt.toISOString(),
+    })),
+  });
+});
+
+app.post("/agency/clients", requireAuth, requireAgency, async (req: AuthRequest, res: Response) => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  const allowLogin = req.body?.allowLogin === true;
+  if (!email || email.length < 3 || !email.includes("@")) {
+    return res.status(400).json({ error: "Body must include a valid email" });
+  }
+  if (email === req.user!.email.toLowerCase()) {
+    return res.status(400).json({ error: "You cannot add yourself as a client" });
+  }
+
+  let client = await prisma.user.findUnique({ where: { email } });
+  let tempPassword: string | undefined;
+
+  if (!client) {
+    const pw = makeTempPassword();
+    tempPassword = allowLogin ? pw : undefined;
+    const passwordHash = await bcrypt.hash(pw, 10);
+    client = await prisma.user.create({
+      data: {
+        email,
+        passwordHash,
+        accountType: "single",
+        loginDisabled: !allowLogin,
+      },
+    });
+  } else {
+    // If the user already exists and the agency wants to disable login, only allow if it's already disabled.
+    const disabled = (client as { loginDisabled?: boolean }).loginDisabled ?? false;
+    if (!allowLogin && !disabled) {
+      return res.status(400).json({ error: "That email already has a login-enabled account. Ask them to use their existing login." });
+    }
+  }
+
+  await prisma.agencyClient.upsert({
+    where: { agencyUserId_clientUserId: { agencyUserId: req.user!.id, clientUserId: client.id } },
+    create: { agencyUserId: req.user!.id, clientUserId: client.id },
+    update: {},
+  });
+
+  res.status(201).json({
+    client: { id: client.id, email: client.email, loginDisabled: (client as { loginDisabled?: boolean }).loginDisabled ?? false },
+    ...(tempPassword ? { tempPassword } : {}),
+  });
+});
+
+app.delete("/agency/clients/:clientUserId", requireAuth, requireAgency, async (req: AuthRequest, res: Response) => {
+  const clientUserId = req.params.clientUserId;
+  const deleted = await prisma.agencyClient.deleteMany({
+    where: { agencyUserId: req.user!.id, clientUserId },
+  });
+  if (deleted.count === 0) return res.status(404).json({ error: "Client link not found" });
+  res.json({ ok: true });
 });
 
 app.get("/auth/me", async (req: AuthRequest, res: Response) => {

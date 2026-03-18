@@ -13,6 +13,8 @@ model User {
   passwordHash String
   /** single = one user, one account. agency = can switch between client accounts. */
   accountType  String    @default("single") // "single" | "agency"
+  /** If true, this user cannot log in (used for agency-managed clients without portal access). */
+  loginDisabled Boolean  @default(false)
   createdAt    DateTime  @default(now())
   experiments  Experiment[]
   creatives    Creative[]
