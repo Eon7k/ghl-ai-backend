@@ -1294,6 +1294,30 @@ app.patch("/experiments/:experimentId/variants/reorder", requireAuth, async (req
   res.json({ variants: updated.map(variantToJson) });
 });
 
+// Swap creatives (imageData) between two variants. Body: { variantIdA: string, variantIdB: string }.
+app.post("/experiments/:experimentId/variants/swap-creatives", requireAuth, async (req: AuthRequest, res: Response) => {
+  const { experimentId } = req.params;
+  const variantIdA = typeof req.body?.variantIdA === "string" ? req.body.variantIdA.trim() : undefined;
+  const variantIdB = typeof req.body?.variantIdB === "string" ? req.body.variantIdB.trim() : undefined;
+  if (!variantIdA || !variantIdB || variantIdA === variantIdB) {
+    return res.status(400).json({ error: "Body must include variantIdA and variantIdB (two different variant ids)" });
+  }
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid }, include: { variants: true } });
+  if (!exp) return res.status(404).json({ error: "Experiment not found" });
+  const va = exp.variants.find((v) => v.id === variantIdA);
+  const vb = exp.variants.find((v) => v.id === variantIdB);
+  if (!va || !vb) return res.status(404).json({ error: "One or both variants not found in this experiment" });
+  const imageA = va.imageData;
+  const imageB = vb.imageData;
+  await prisma.$transaction([
+    prisma.variant.update({ where: { id: variantIdA }, data: { imageData: imageB } }),
+    prisma.variant.update({ where: { id: variantIdB }, data: { imageData: imageA } }),
+  ]);
+  const updated = await prisma.variant.findMany({ where: { id: { in: [variantIdA, variantIdB] } } });
+  res.json({ variants: updated.map(variantToJson) });
+});
+
 // Generate AI creative (image) for a variant using DALL-E. Stores base64 PNG on variant.
 app.post("/experiments/:experimentId/variants/:variantId/generate-creative", requireAuth, async (req: AuthRequest, res: Response) => {
   const { experimentId, variantId } = req.params;
