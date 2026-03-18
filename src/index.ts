@@ -461,9 +461,16 @@ app.get("/integrations/tiktok/callback", async (req: Request, res: Response) => 
     }
     const refreshToken = data?.refresh_token;
     const openId = data?.open_id;
-    await prisma.connectedAccount.deleteMany({ where: { userId, platform: "tiktok" } });
+    const uid = userTiktok.id;
+    await prisma.connectedAccount.deleteMany({ where: { userId: uid, platform: "tiktok" } });
     await prisma.connectedAccount.create({
-      data: { userId, platform: "tiktok", accessToken, refreshToken: refreshToken ?? undefined, platformAccountId: openId },
+      data: {
+        userId: uid,
+        platform: "tiktok",
+        accessToken,
+        ...(refreshToken && { refreshToken }),
+        ...(openId && { platformAccountId: openId }),
+      },
     });
     res.redirect(302, `${frontendBase}${redirectPath}?connected=tiktok`);
   } catch (err: unknown) {
@@ -548,9 +555,10 @@ app.get("/integrations/google/callback", async (req: Request, res: Response) => 
       return;
     }
     const refreshToken = tokenRes.data?.refresh_token;
-    await prisma.connectedAccount.deleteMany({ where: { userId, platform: "google" } });
+    const uid = userGoogle.id;
+    await prisma.connectedAccount.deleteMany({ where: { userId: uid, platform: "google" } });
     await prisma.connectedAccount.create({
-      data: { userId, platform: "google", accessToken, refreshToken: refreshToken ?? undefined },
+      data: { userId: uid, platform: "google", accessToken, ...(refreshToken && { refreshToken }) },
     });
     res.redirect(302, `${frontendBase}${redirectPath}?connected=google`);
   } catch (err: unknown) {
