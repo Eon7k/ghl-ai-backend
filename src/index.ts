@@ -245,6 +245,10 @@ app.post("/auth/register", async (req: Request, res: Response) => {
     const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
     return res.status(201).json({ token, user: { id: user.id, email: user.email } });
   } catch (err: unknown) {
+    const code = err && typeof err === "object" && "code" in err ? (err as { code: string }).code : "";
+    if (code === "P2002") {
+      return res.status(400).json({ error: "An account with this email already exists" });
+    }
     const msg = err instanceof Error ? err.message : "Registration failed";
     console.error("[auth/register]", err);
     return res.status(500).json({ error: msg });
