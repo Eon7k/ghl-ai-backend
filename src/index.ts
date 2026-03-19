@@ -450,7 +450,8 @@ app.get("/integrations/meta/connect", async (req: Request, res: Response) => {
   }
   const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
   const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/meta/callback`;
-  const scope = "ads_management,ads_read,business_management";
+  // pages_show_list is needed so we can fetch a Page id for object_story_spec (required for link ad creatives).
+  const scope = "ads_management,ads_read,business_management,pages_show_list";
   const state = userId;
   const metaAuthUrl = `https://www.facebook.com/v21.0/dialog/oauth?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${encodeURIComponent(state)}`;
   res.redirect(302, metaAuthUrl);
@@ -492,8 +493,17 @@ app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
     });
     res.redirect(302, `${frontendBase}${redirectPath}?connected=meta`);
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Token exchange failed";
-    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(message))}`);
+    let message = "Token exchange failed";
+    if (err && typeof err === "object" && "response" in err) {
+      const ax = err as { response?: { data?: { error?: { message?: string; type?: string } } } };
+      const metaMsg = ax.response?.data?.error?.message;
+      const metaType = ax.response?.data?.error?.type;
+      if (metaMsg) message = metaType ? `${metaType}: ${metaMsg}` : metaMsg;
+    } else if (err instanceof Error) {
+      message = err.message;
+    }
+    console.error("[Meta callback]", message);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(message)}`);
   }
 });
 
@@ -1469,6 +1479,24 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     const token = metaConn.accessToken;
 
     try {
+      // Meta ad creatives for link ads typically require a Page id in object_story_spec.
+      // We fetch the first available Page the user can access.
+      let pageId: string | null = null;
+      try {
+        const pageRes = await axios.get<{ data?: Array<{ id: string }> }>(
+          `https://graph.facebook.com/v21.0/me/accounts?fields=id&limit=1&access_token=${encodeURIComponent(token)}`
+        );
+        pageId = pageRes.data?.data?.[0]?.id ?? null;
+      } catch {
+        pageId = null;
+      }
+      if (!pageId) {
+        return res.status(400).json({
+          error:
+            "Meta needs a Facebook Page connected to create ad creatives. Ensure the Meta user has access to at least one Page, and reconnect Meta (we request pages_show_list permission).",
+        });
+      }
+
       // 1. Create Campaign
       const campaignRes = await axios.post<{ id: string }>(
         `https://graph.facebook.com/v21.0/${adAccountId}/campaigns`,
@@ -1541,6 +1569,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
         if (!hash) continue;
 
         const objectStorySpec = JSON.stringify({
+          page_id: pageId,
           link_data: {
             image_hash: hash,
             link: landingPageUrl,
