@@ -877,6 +877,7 @@ app.get("/experiments", requireAuth, async (req: AuthRequest, res: Response) => 
     aiProvider: e.aiProvider ?? undefined,
     aiCreativeCount: e.aiCreativeCount ?? undefined,
     creativePrompt: e.creativePrompt ?? undefined,
+    targetAudiencePrompt: e.targetAudiencePrompt ?? undefined,
     campaignGroupId: e.campaignGroupId ?? undefined,
     metaCampaignId: e.metaCampaignId ?? undefined,
     metaAdSetId: e.metaAdSetId ?? undefined,
@@ -907,6 +908,7 @@ app.get("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response)
     aiProvider: exp.aiProvider ?? undefined,
     aiCreativeCount: exp.aiCreativeCount ?? undefined,
     creativePrompt: exp.creativePrompt ?? undefined,
+    targetAudiencePrompt: exp.targetAudiencePrompt ?? undefined,
     campaignGroupId: exp.campaignGroupId ?? undefined,
     metaCampaignId: exp.metaCampaignId ?? undefined,
     metaAdSetId: exp.metaAdSetId ?? undefined,
@@ -915,7 +917,7 @@ app.get("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response)
   });
 });
 
-// Update experiment (e.g. creative direction for image generation). Body: { creativePrompt?: string }.
+// Update experiment (e.g. creative direction, target audience description). Body: { creativePrompt?: string, targetAudiencePrompt?: string | null }.
 app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response) => {
   const uid = req.effectiveUserId ?? req.user!.id;
   const exp = await prisma.experiment.findFirst({ where: { id: req.params.id, userId: uid } });
@@ -924,9 +926,16 @@ app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Respons
     req.body?.creativePrompt !== undefined
       ? (typeof req.body.creativePrompt === "string" ? req.body.creativePrompt.trim() : null) || null
       : undefined;
-  const data: { creativePrompt?: string | null } = {};
+  const targetAudiencePrompt =
+    req.body?.targetAudiencePrompt !== undefined
+      ? (typeof req.body.targetAudiencePrompt === "string" ? req.body.targetAudiencePrompt.trim() : null) || null
+      : undefined;
+  const data: { creativePrompt?: string | null; targetAudiencePrompt?: string | null } = {};
   if (creativePrompt !== undefined) data.creativePrompt = creativePrompt || null;
-  if (Object.keys(data).length === 0) return res.status(400).json({ error: "Body must include at least one field to update (e.g. creativePrompt)" });
+  if (targetAudiencePrompt !== undefined) data.targetAudiencePrompt = targetAudiencePrompt || null;
+  if (Object.keys(data).length === 0) {
+    return res.status(400).json({ error: "Body must include at least one field to update (e.g. creativePrompt, targetAudiencePrompt)" });
+  }
   const updated = await prisma.experiment.update({ where: { id: exp.id }, data });
   res.json({
     id: updated.id,
@@ -938,6 +947,7 @@ app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Respons
     prompt: updated.prompt ?? undefined,
     creativesSource: updated.creativesSource ?? undefined,
     creativePrompt: updated.creativePrompt ?? undefined,
+    targetAudiencePrompt: updated.targetAudiencePrompt ?? undefined,
     variantCount: exp.variantCount ?? undefined,
     aiProvider: updated.aiProvider ?? undefined,
     aiCreativeCount: updated.aiCreativeCount ?? undefined,
@@ -946,6 +956,18 @@ app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Respons
     metaAdSetId: updated.metaAdSetId ?? undefined,
     attachedCreativeIds: updated.attachedCreativeIds ?? undefined,
   });
+});
+
+// Preview how a natural-language audience will be interpreted for Meta ad set targeting (no launch).
+app.post("/experiments/:id/preview-meta-targeting", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: req.params.id, userId: uid } });
+  if (!exp) return res.status(404).json({ error: "Experiment not found" });
+  if (exp.platform !== "meta") return res.status(400).json({ error: "Targeting preview is for Meta campaigns only." });
+  const text = typeof req.body?.targetAudiencePrompt === "string" ? req.body.targetAudiencePrompt.trim() : "";
+  if (!text) return res.status(400).json({ error: "targetAudiencePrompt is required" });
+  const targeting = await buildMetaTargetingFromDescription(text);
+  res.json({ targeting });
 });
 
 // AI ad copy generation
@@ -1093,6 +1115,74 @@ function parseVariantsFromContent(content: string, count: number): string[] {
     }
   }
   return copies.length >= count ? copies : [...copies, ...Array(Math.max(0, count - copies.length)).fill("Variant (missing)")].slice(0, count);
+}
+
+const DEFAULT_META_TARGETING: Record<string, unknown> = { geo_locations: { countries: ["US"] } };
+
+type AiMetaTargetingShape = {
+  countries?: string[];
+  age_min?: number;
+  age_max?: number;
+  gender?: "all" | "male" | "female";
+};
+
+function clampMetaAge(n: unknown, def: number, min: number, max: number): number {
+  const x = typeof n === "number" && !Number.isNaN(n) ? n : def;
+  return Math.min(max, Math.max(min, Math.round(x)));
+}
+
+function targetingShapeToMetaObject(ai: AiMetaTargetingShape): Record<string, unknown> {
+  const countries = Array.isArray(ai.countries) && ai.countries.length
+    ? ai.countries
+        .map((c) => String(c).toUpperCase().replace(/[^A-Z]/g, "").slice(0, 2))
+        .filter((c) => c.length === 2)
+    : [];
+  const uniqCountries = [...new Set(countries)].slice(0, 25);
+  const geo = uniqCountries.length ? { countries: uniqCountries } : { countries: ["US"] };
+  const ageMin = clampMetaAge(ai.age_min, 25, 18, 65);
+  let ageMax = clampMetaAge(ai.age_max, 54, 18, 65);
+  if (ageMax < ageMin) ageMax = Math.min(65, ageMin + 20);
+  let genders: number[] = [1, 2];
+  if (ai.gender === "male") genders = [1];
+  else if (ai.gender === "female") genders = [2];
+  return {
+    geo_locations: geo,
+    age_min: ageMin,
+    age_max: ageMax,
+    genders,
+  };
+}
+
+/** Convert natural-language audience description to Meta Marketing API targeting object (geo, age, gender). */
+async function buildMetaTargetingFromDescription(description: string): Promise<Record<string, unknown>> {
+  const trimmed = description.trim();
+  if (!trimmed) return { ...DEFAULT_META_TARGETING };
+  if (!OPENAI_API_KEY || OPENAI_API_KEY.length < 20) {
+    return { ...DEFAULT_META_TARGETING };
+  }
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You convert natural language ad audience descriptions into Meta (Facebook) ad set targeting parameters. " +
+            "Return ONLY valid JSON with keys: countries (array of 2-letter ISO country codes, e.g. [\"US\"]), " +
+            "age_min (integer 18-65), age_max (integer 18-65; use 65 when the audience is broad or older), " +
+            "gender (\"all\" | \"male\" | \"female\"). If location is ambiguous, use [\"US\"]. If ages are missing, use 25-54.",
+        },
+        { role: "user", content: trimmed.slice(0, 2000) },
+      ],
+      response_format: { type: "json_object" },
+    });
+    const raw = (completion.choices[0]?.message?.content || "").trim();
+    const parsed = JSON.parse(raw) as AiMetaTargetingShape;
+    return targetingShapeToMetaObject(parsed);
+  } catch (e) {
+    console.error("[Meta targeting AI]", e);
+    return { ...DEFAULT_META_TARGETING };
+  }
 }
 
 async function generateWithOpenAI(prompt: string, platform: string, count: number): Promise<string[]> {
@@ -1459,6 +1549,12 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     Array.isArray(req.body?.variantIds) && req.body.variantIds.length > 0
       ? (req.body.variantIds as string[]).filter((id) => typeof id === "string" && id.trim()).map((id) => id.trim())
       : undefined;
+  const targetAudienceOverride =
+    typeof req.body?.targetAudiencePrompt === "string" && req.body.targetAudiencePrompt.trim()
+      ? req.body.targetAudiencePrompt.trim()
+      : undefined;
+  const storedAudience = (exp.targetAudiencePrompt || "").trim();
+  const audienceForTargeting = targetAudienceOverride ?? storedAudience;
 
   const data: { status: string; phase: string; aiCreativeCount?: number; metaCampaignId?: string; metaAdSetId?: string } = {
     status: "launched",
@@ -1497,6 +1593,10 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
         });
       }
 
+      const metaTargeting = audienceForTargeting
+        ? await buildMetaTargetingFromDescription(audienceForTargeting)
+        : { ...DEFAULT_META_TARGETING };
+
       // 1. Create Campaign
       const campaignRes = await axios.post<{ id: string }>(
         `https://graph.facebook.com/v21.0/${adAccountId}/campaigns`,
@@ -1529,7 +1629,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
             daily_budget: String(budgetCents),
             billing_event: "IMPRESSIONS",
             optimization_goal: "LINK_CLICKS",
-            targeting: JSON.stringify({ geo_locations: { countries: ["US"] } }),
+            targeting: JSON.stringify(metaTargeting),
             status: "PAUSED",
             access_token: token,
           },

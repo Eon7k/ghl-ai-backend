@@ -62,6 +62,8 @@ model Experiment {
   aiProvider         String?  // openai | anthropic | split
   aiCreativeCount    Int?
   creativePrompt     String?
+  /** Natural-language target audience; AI converts to Meta ad set targeting at launch. */
+  targetAudiencePrompt String?
   campaignGroupId    String?
   metaCampaignId     String?
   metaAdSetId        String?
