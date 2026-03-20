@@ -1265,125 +1265,147 @@ async function generateVariantsFromPrompt(
 
 // Create one or more experiments (same campaign, one per platform when platforms[] has multiple)
 app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) => {
-  const {
-    name,
-    platform: platformBody,
-    platforms: platformsBody,
-    totalDailyBudget,
-    prompt,
-    variantCount,
-    creativesSource,
-    aiProvider: aiProviderBody,
-    creativePrompt: creativePromptBody,
-    attachedCreativeIds: attachedCreativeIdsBody,
-  } = req.body;
+  try {
+    const {
+      name,
+      platform: platformBody,
+      platforms: platformsBody,
+      totalDailyBudget,
+      prompt,
+      variantCount,
+      creativesSource,
+      aiProvider: aiProviderBody,
+      creativePrompt: creativePromptBody,
+      attachedCreativeIds: attachedCreativeIdsBody,
+    } = req.body;
 
-  const aiProvider: AiProviderOption =
-    aiProviderBody === "anthropic" || aiProviderBody === "split" ? aiProviderBody : "openai";
+    const aiProvider: AiProviderOption =
+      aiProviderBody === "anthropic" || aiProviderBody === "split" ? aiProviderBody : "openai";
 
-  const platformsList: string[] =
-    Array.isArray(platformsBody) && platformsBody.length > 0
-      ? platformsBody.filter((p: string) => p === "meta" || p === "google" || p === "tiktok")
-      : platformBody
-        ? [platformBody]
-        : [];
+    const platformsList: string[] =
+      Array.isArray(platformsBody) && platformsBody.length > 0
+        ? platformsBody.filter((p: string) => p === "meta" || p === "google" || p === "tiktok")
+        : platformBody
+          ? [platformBody]
+          : [];
 
-  if (!name || platformsList.length === 0 || typeof totalDailyBudget !== "number") {
-    return res
-      .status(400)
-      .json({ error: "name, platform or platforms (array), and totalDailyBudget are required" });
-  }
-
-  const count = Math.min(20, Math.max(1, Number(variantCount) || 3));
-  const source = creativesSource === "own" ? "own" : creativesSource === "mix" ? "mix" : "ai";
-  const promptText =
-    typeof prompt === "string" && prompt.trim()
-      ? prompt.trim()
-      : "Generate varied ad copy for this campaign.";
-  const creativePrompt =
-    typeof creativePromptBody === "string" && creativePromptBody.trim() ? creativePromptBody.trim() : undefined;
-  const attachedCreativeIds: string[] = Array.isArray(attachedCreativeIdsBody)
-    ? attachedCreativeIdsBody.filter((id: unknown) => typeof id === "string" && id.startsWith("creative-"))
-    : [];
-
-  const platformForAi = platformsList[0];
-
-  let copies: string[];
-  if (source === "own") {
-    copies = Array.from({ length: count }, () => "");
-  } else {
-    try {
-      copies = await generateVariantsFromPrompt(promptText, platformForAi, count, aiProvider);
-    } catch (err: any) {
-      console.error("AI variant generation failed", err?.message || err);
-      copies = Array.from({ length: count }, (_, i) => `Variant ${i + 1} — Ad copy (generation failed; use Regenerate to try again)`);
+    if (!name || platformsList.length === 0 || typeof totalDailyBudget !== "number") {
+      return res
+        .status(400)
+        .json({ error: "name, platform or platforms (array), and totalDailyBudget are required" });
     }
-  }
 
-  const half = (source === "ai" || source === "mix") && (aiProvider === "split") ? Math.ceil(count / 2) : 0;
-  const createdExperimentIds: string[] = [];
-  const campaignGroupId = platformsList.length > 1 ? `cg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}` : undefined;
+    const count = Math.min(20, Math.max(1, Number(variantCount) || 3));
+    const source = creativesSource === "own" ? "own" : creativesSource === "mix" ? "mix" : "ai";
+    const promptText =
+      typeof prompt === "string" && prompt.trim()
+        ? prompt.trim()
+        : "Generate varied ad copy for this campaign.";
+    const creativePrompt =
+      typeof creativePromptBody === "string" && creativePromptBody.trim() ? creativePromptBody.trim() : undefined;
+    const attachedCreativeIds: string[] = Array.isArray(attachedCreativeIdsBody)
+      ? attachedCreativeIdsBody.filter((id: unknown) => typeof id === "string" && id.startsWith("creative-"))
+      : [];
 
-  const uid = req.effectiveUserId ?? req.user!.id;
-  for (const platform of platformsList) {
-    const exp = await prisma.experiment.create({
-      data: {
-        userId: uid,
-        name,
-        platform,
-        status: "draft",
-        phase: "setup",
-        totalDailyBudget: Number(totalDailyBudget),
-        prompt: promptText,
-        variantCount: count,
-        creativesSource: source,
-        ...((source === "ai" || source === "mix") && { aiProvider }),
-        ...(creativePrompt && { creativePrompt }),
-        ...(attachedCreativeIds.length > 0 && { attachedCreativeIds }),
-        campaignGroupId: campaignGroupId ?? undefined,
-        variants: {
-          create: copies.map((copy, i) => {
-            const text = (typeof copy === "string" && copy.trim()) ? copy.trim() : "";
-            const fallback = source === "own" ? "Paste your ad copy here..." : `Variant ${i + 1} — Ad copy`;
-            let aiSource: string | undefined;
-            if ((source === "ai" || source === "mix") && aiProvider) {
-              if (aiProvider === "openai") aiSource = "openai";
-              else if (aiProvider === "anthropic") aiSource = "anthropic";
-              else if (aiProvider === "split") aiSource = i < half ? "openai" : "anthropic";
-            }
-            return { index: i + 1, copy: text || fallback, status: "draft", ...(aiSource && { aiSource }) };
-          }),
+    const platformForAi = platformsList[0];
+
+    let copies: string[];
+    if (source === "own") {
+      copies = Array.from({ length: count }, () => "");
+    } else {
+      try {
+        copies = await generateVariantsFromPrompt(promptText, platformForAi, count, aiProvider);
+      } catch (err: any) {
+        console.error("AI variant generation failed", err?.message || err);
+        copies = Array.from(
+          { length: count },
+          (_, i) => `Variant ${i + 1} — Ad copy (generation failed; use Regenerate to try again)`
+        );
+      }
+    }
+
+    const half = (source === "ai" || source === "mix") && aiProvider === "split" ? Math.ceil(count / 2) : 0;
+    const createdExperimentIds: string[] = [];
+    const campaignGroupId =
+      platformsList.length > 1 ? `cg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}` : undefined;
+
+    const uid = req.effectiveUserId ?? req.user!.id;
+    for (const platform of platformsList) {
+      const exp = await prisma.experiment.create({
+        data: {
+          userId: uid,
+          name,
+          platform,
+          status: "draft",
+          phase: "setup",
+          totalDailyBudget: Number(totalDailyBudget),
+          prompt: promptText,
+          variantCount: count,
+          creativesSource: source,
+          ...((source === "ai" || source === "mix") && { aiProvider }),
+          ...(creativePrompt && { creativePrompt }),
+          ...(attachedCreativeIds.length > 0 && { attachedCreativeIds }),
+          campaignGroupId: campaignGroupId ?? undefined,
+          variants: {
+            create: copies.map((copy, i) => {
+              const text = typeof copy === "string" && copy.trim() ? copy.trim() : "";
+              const fallback = source === "own" ? "Paste your ad copy here..." : `Variant ${i + 1} — Ad copy`;
+              let aiSource: string | undefined;
+              if ((source === "ai" || source === "mix") && aiProvider) {
+                if (aiProvider === "openai") aiSource = "openai";
+                else if (aiProvider === "anthropic") aiSource = "anthropic";
+                else if (aiProvider === "split") aiSource = i < half ? "openai" : "anthropic";
+              }
+              return { index: i + 1, copy: text || fallback, status: "draft", ...(aiSource && { aiSource }) };
+            }),
+          },
         },
-      },
+        include: { variants: true },
+      });
+      if (platformsList.length === 1) {
+        await prisma.experiment.update({ where: { id: exp.id }, data: { campaignGroupId: exp.id } });
+      }
+      createdExperimentIds.push(exp.id);
+    }
+
+    const firstId = createdExperimentIds[0];
+    const firstExp = await prisma.experiment.findUniqueOrThrow({
+      where: { id: firstId },
       include: { variants: true },
     });
-    if (platformsList.length === 1) {
-      await prisma.experiment.update({ where: { id: exp.id }, data: { campaignGroupId: exp.id } });
-    }
-    createdExperimentIds.push(exp.id);
+
+    res.status(201).json({
+      id: firstExp.id,
+      userId: firstExp.userId,
+      name: firstExp.name,
+      platform: firstExp.platform,
+      status: firstExp.status,
+      phase: firstExp.phase,
+      totalDailyBudget: firstExp.totalDailyBudget,
+      prompt: firstExp.prompt ?? undefined,
+      variantCount: firstExp.variantCount ?? firstExp.variants.length,
+      creativesSource: firstExp.creativesSource ?? undefined,
+      aiProvider: firstExp.aiProvider ?? undefined,
+      creativePrompt: firstExp.creativePrompt ?? undefined,
+      campaignGroupId: firstExp.campaignGroupId ?? undefined,
+      attachedCreativeIds: firstExp.attachedCreativeIds ?? undefined,
+      variants: firstExp.variants.map(variantToJson),
+      createdExperimentIds,
+    });
+  } catch (err: unknown) {
+    const code =
+      err && typeof err === "object" && "code" in err ? String((err as { code: string }).code) : "";
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[POST /experiments]", code || msg, msg);
+    const schemaHint =
+      /P20\d{2}|column|does not exist|relation|migration/i.test(msg)
+        ? " Database schema may be out of date — run `npx prisma db push` (or migrate) against production."
+        : "";
+    return res.status(500).json({
+      error: `Could not create campaign.${schemaHint ? ` ${schemaHint}` : ""}`,
+      details: process.env.NODE_ENV === "production" ? undefined : msg,
+    });
   }
-
-  const firstId = createdExperimentIds[0];
-  const firstExp = await prisma.experiment.findUniqueOrThrow({ where: { id: firstId }, include: { variants: true } });
-
-  res.status(201).json({
-    id: firstExp.id,
-    userId: firstExp.userId,
-    name: firstExp.name,
-    platform: firstExp.platform,
-    status: firstExp.status,
-    phase: firstExp.phase,
-    totalDailyBudget: firstExp.totalDailyBudget,
-    prompt: firstExp.prompt ?? undefined,
-    variantCount: firstExp.variantCount ?? firstExp.variants.length,
-    creativesSource: firstExp.creativesSource ?? undefined,
-    aiProvider: firstExp.aiProvider ?? undefined,
-    creativePrompt: firstExp.creativePrompt ?? undefined,
-    campaignGroupId: firstExp.campaignGroupId ?? undefined,
-    attachedCreativeIds: firstExp.attachedCreativeIds ?? undefined,
-    variants: firstExp.variants.map(variantToJson),
-    createdExperimentIds,
-  });
 });
 
 // Update one variant's copy (Phase 2)
