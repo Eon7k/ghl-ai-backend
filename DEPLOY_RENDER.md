@@ -61,3 +61,21 @@ npx prisma migrate deploy
 ## Render free web tier
 
 Instances **spin down** when idle; the first request can take **~50s+**. That is separate from DB connection closes but can look like “the app died” in the UI.
+
+---
+
+## Instance exited with status **134** (SIGABRT)
+
+On small instances this is often **Node/V8 running out of memory** while handling big responses (e.g. **many AI variants**, Prisma, JSON). The default V8 heap can overshoot the container’s RAM limit and the process **aborts**.
+
+**On Render → `ghl-ai-backend` → Environment**, add:
+
+| Key | Suggested value |
+|-----|-----------------|
+| `NODE_OPTIONS` | `--max-old-space-size=400` |
+
+Use **350–450** depending on stability; stay below the instance RAM so the OS doesn’t OOM-kill you.
+
+Then **Manual Deploy** or push to redeploy. Also try campaigns with **1–3 variants** first to confirm.
+
+If 134 persists, open **Logs** right before the crash (stack trace / “heap” / `prisma`); upgrade to a plan with **more RAM** if needed.

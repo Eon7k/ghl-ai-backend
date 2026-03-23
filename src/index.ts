@@ -25,7 +25,7 @@ if (!OPENAI_API_KEY || OPENAI_API_KEY.length < 20) {
   );
 } else if (!OPENAI_API_KEY.startsWith("sk-")) {
   console.warn("[WARN] OPENAI_API_KEY should start with sk-. Check for typos or extra characters in Render.");
-} else {
+} else if (!isProduction) {
   console.log("[OPENAI] Using key:", OPENAI_API_KEY.slice(0, 7) + "..." + OPENAI_API_KEY.slice(-4));
 }
 
@@ -1212,8 +1212,9 @@ async function generateWithAnthropic(prompt: string, platform: string, count: nu
     "Output only valid JSON: a single object with key \"variants\" whose value is an array of objects. Each object must have \"headline\" and \"primaryText\" as strings. Do not wrap the JSON in markdown code blocks.";
   const userPrompt = buildVariantsFromOnePrompt(prompt, platform as AdPlatform, count);
 
+  // claude-3-5-haiku-latest was retired; use current Haiku (alias tracks latest 4.5)
   const message = await anthropic!.messages.create({
-    model: "claude-3-5-haiku-latest",
+    model: process.env.ANTHROPIC_MODEL?.trim() || "claude-haiku-4-5",
     max_tokens: 4096,
     system: systemPrompt,
     messages: [{ role: "user", content: userPrompt }]
@@ -2099,7 +2100,17 @@ app.get("/admin/ai-performance", requireAuth, requireAdmin, async (_req: AuthReq
   res.json({ byProvider });
 });
 
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] uncaughtException:", err);
+});
+process.on("unhandledRejection", (reason, p) => {
+  console.error("[FATAL] unhandledRejection:", reason, p);
+});
+
 async function start() {
+  if (process.env.NODE_OPTIONS) {
+    console.log("[NODE] NODE_OPTIONS=" + process.env.NODE_OPTIONS);
+  }
   if (!process.env.DATABASE_URL?.trim()) {
     console.error("[FATAL] DATABASE_URL is required. Add it to .env (e.g. PostgreSQL from Render, Neon, or Supabase).");
     process.exit(1);
