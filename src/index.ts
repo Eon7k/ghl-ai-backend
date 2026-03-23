@@ -51,7 +51,8 @@ app.use(
     optionsSuccessStatus: 200,
   })
 );
-app.use(express.json());
+// Creative uploads send base64 JSON; default 100kb limit breaks "nothing happens" on the client.
+app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 4000;
 const OPTIMIZER_URL = process.env.OPTIMIZER_URL || "http://localhost:5001";
