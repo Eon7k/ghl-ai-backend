@@ -41,6 +41,9 @@ Your backend runs on **Render**. All config for the **live** backend is in Rende
 | `META_APP_SECRET` | From Meta for Developers app |
 | `TIKTOK_APP_ID` | From TikTok for Developers (if used) |
 | `TIKTOK_APP_SECRET` | From TikTok for Developers (if used) |
+| `TIKTOK_OBJECTIVE_TYPE` | (optional) Only if TikTok rejects default `TRAFFIC` — see **TIKTOK_LIVE_SETUP.md** |
+
+After schema changes for TikTok launch, run **`npx prisma db push`** against production. Full TikTok checklist: **`TIKTOK_LIVE_SETUP.md`**.
 | `GOOGLE_CLIENT_ID` | From Google Cloud (if used) |
 | `GOOGLE_CLIENT_SECRET` | From Google Cloud (if used) |
 

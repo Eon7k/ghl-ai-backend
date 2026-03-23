@@ -9,6 +9,7 @@ import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildSystemPrompt, buildUserPrompt, buildVariantsFromOnePrompt, AdPlatform } from "./aiPromptTemplates";
 import { prisma } from "./db";
+import { launchTikTokCampaign, tiktokListIdentities } from "./tiktokMarketing";
 
 // Only load .env file when NOT in production (so Render always uses its own env vars)
 if (process.env.NODE_ENV !== "production") {
@@ -135,6 +136,8 @@ interface ExperimentRecord {
   campaignGroupId?: string;
   metaCampaignId?: string;
   metaAdSetId?: string;
+  tiktokCampaignId?: string;
+  tiktokAdGroupId?: string;
 }
 
 interface VariantRecord {
@@ -148,9 +151,46 @@ interface VariantRecord {
   aiSource?: "openai" | "anthropic";
 }
 
-// Variant to API shape (omit imageData, add hasCreative)
-function variantToJson(v: { id: string; experimentId: string; index: number; copy: string; status: string; imageData?: string | null; aiSource?: string | null }): Record<string, unknown> {
-  return { id: v.id, experimentId: v.experimentId, index: v.index, copy: v.copy, status: v.status, hasCreative: !!v.imageData, aiSource: v.aiSource ?? undefined };
+/** Variant fields safe to load in bulk (excludes imageData blob — can be megabytes per row). */
+const VARIANT_PUBLIC_SELECT = {
+  id: true,
+  experimentId: true,
+  index: true,
+  copy: true,
+  status: true,
+  aiSource: true,
+} as const;
+
+type VariantPublic = {
+  id: string;
+  experimentId: string;
+  index: number;
+  copy: string;
+  status: string;
+  aiSource?: string | null;
+};
+
+// API shape (never embed base64 imageData in JSON)
+function variantToJson(v: VariantPublic, hasCreative: boolean): Record<string, unknown> {
+  return {
+    id: v.id,
+    experimentId: v.experimentId,
+    index: v.index,
+    copy: v.copy,
+    status: v.status,
+    hasCreative,
+    aiSource: v.aiSource ?? undefined,
+  };
+}
+
+/** Which variant ids have a stored creative (checks NOT NULL only; does not load blob bytes in SELECT). */
+async function variantIdsWithImageData(variantIds: string[]): Promise<Set<string>> {
+  if (variantIds.length === 0) return new Set();
+  const rows = await prisma.variant.findMany({
+    where: { id: { in: variantIds }, NOT: { imageData: null } },
+    select: { id: true },
+  });
+  return new Set(rows.map((r) => r.id));
 }
 
 // ----- Integrations: connected ad accounts (Meta, TikTok, Google) -----
@@ -756,6 +796,34 @@ app.get("/integrations/tiktok/ad-accounts", requireAuth, async (req: AuthRequest
   }
 });
 
+// List TikTok identities for an advertiser (needed to create ads — pick one in UI or we auto-pick).
+app.get("/integrations/tiktok/identities", requireAuth, async (req: AuthRequest, res: Response) => {
+  const advertiserId = typeof req.query.advertiser_id === "string" ? req.query.advertiser_id.trim() : "";
+  if (!advertiserId) {
+    return res.status(400).json({ error: "Query advertiser_id is required" });
+  }
+  const tiktokConn = await prisma.connectedAccount.findFirst({
+    where: { userId: req.effectiveUserId ?? req.user!.id, platform: "tiktok" },
+  });
+  if (!tiktokConn) {
+    return res.status(404).json({ error: "TikTok not connected. Connect TikTok in Integrations first." });
+  }
+  try {
+    const list = await tiktokListIdentities(tiktokConn.accessToken, advertiserId);
+    res.json({
+      identities: list.map((i) => ({
+        identityId: i.identity_id,
+        identityType: i.identity_type,
+        displayName: i.display_name ?? i.identity_id,
+      })),
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Failed to list identities";
+    console.error("[TikTok identities]", msg);
+    return res.status(502).json({ error: msg });
+  }
+});
+
 app.delete("/integrations/:id", requireAuth, async (req: AuthRequest, res: Response) => {
   const uid = req.effectiveUserId ?? req.user!.id;
   const conn = await prisma.connectedAccount.findFirst({ where: { id: req.params.id, userId: uid } });
@@ -861,8 +929,10 @@ app.get("/experiments", requireAuth, async (req: AuthRequest, res: Response) => 
   const uid = req.effectiveUserId ?? req.user!.id;
   const list = await prisma.experiment.findMany({
     where: { userId: uid },
-    include: { variants: true },
+    include: { variants: { select: VARIANT_PUBLIC_SELECT } },
   });
+  const allVIds = list.flatMap((e) => e.variants.map((v) => v.id));
+  const withCreative = await variantIdsWithImageData(allVIds);
   res.json(list.map((e) => ({
     id: e.id,
     userId: e.userId,
@@ -881,8 +951,10 @@ app.get("/experiments", requireAuth, async (req: AuthRequest, res: Response) => 
     campaignGroupId: e.campaignGroupId ?? undefined,
     metaCampaignId: e.metaCampaignId ?? undefined,
     metaAdSetId: e.metaAdSetId ?? undefined,
+    tiktokCampaignId: e.tiktokCampaignId ?? undefined,
+    tiktokAdGroupId: e.tiktokAdGroupId ?? undefined,
     attachedCreativeIds: e.attachedCreativeIds ?? undefined,
-    variants: e.variants.map(variantToJson),
+    variants: e.variants.map((v) => variantToJson(v, withCreative.has(v.id))),
   })));
 });
 
@@ -891,9 +963,10 @@ app.get("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response)
   const uid = req.effectiveUserId ?? req.user!.id;
   const exp = await prisma.experiment.findFirst({
     where: { id: req.params.id, userId: uid },
-    include: { variants: true },
+    include: { variants: { select: VARIANT_PUBLIC_SELECT } },
   });
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
+  const withCreativeOne = await variantIdsWithImageData(exp.variants.map((v) => v.id));
   res.json({
     id: exp.id,
     userId: exp.userId,
@@ -912,8 +985,10 @@ app.get("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response)
     campaignGroupId: exp.campaignGroupId ?? undefined,
     metaCampaignId: exp.metaCampaignId ?? undefined,
     metaAdSetId: exp.metaAdSetId ?? undefined,
+    tiktokCampaignId: exp.tiktokCampaignId ?? undefined,
+    tiktokAdGroupId: exp.tiktokAdGroupId ?? undefined,
     attachedCreativeIds: exp.attachedCreativeIds ?? undefined,
-    variants: exp.variants.map(variantToJson),
+    variants: exp.variants.map((v) => variantToJson(v, withCreativeOne.has(v.id))),
   });
 });
 
@@ -954,6 +1029,8 @@ app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Respons
     campaignGroupId: updated.campaignGroupId ?? undefined,
     metaCampaignId: updated.metaCampaignId ?? undefined,
     metaAdSetId: updated.metaAdSetId ?? undefined,
+    tiktokCampaignId: updated.tiktokCampaignId ?? undefined,
+    tiktokAdGroupId: updated.tiktokAdGroupId ?? undefined,
     attachedCreativeIds: updated.attachedCreativeIds ?? undefined,
   });
 });
@@ -1361,7 +1438,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
             }),
           },
         },
-        include: { variants: true },
+        include: { variants: { select: VARIANT_PUBLIC_SELECT } },
       });
       if (platformsList.length === 1) {
         await prisma.experiment.update({ where: { id: exp.id }, data: { campaignGroupId: exp.id } });
@@ -1372,7 +1449,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     const firstId = createdExperimentIds[0];
     const firstExp = await prisma.experiment.findUniqueOrThrow({
       where: { id: firstId },
-      include: { variants: true },
+      include: { variants: { select: VARIANT_PUBLIC_SELECT } },
     });
 
     res.status(201).json({
@@ -1389,8 +1466,12 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       aiProvider: firstExp.aiProvider ?? undefined,
       creativePrompt: firstExp.creativePrompt ?? undefined,
       campaignGroupId: firstExp.campaignGroupId ?? undefined,
+      metaCampaignId: firstExp.metaCampaignId ?? undefined,
+      metaAdSetId: firstExp.metaAdSetId ?? undefined,
+      tiktokCampaignId: firstExp.tiktokCampaignId ?? undefined,
+      tiktokAdGroupId: firstExp.tiktokAdGroupId ?? undefined,
       attachedCreativeIds: firstExp.attachedCreativeIds ?? undefined,
-      variants: firstExp.variants.map(variantToJson),
+      variants: firstExp.variants.map((v) => variantToJson(v, false)),
       createdExperimentIds,
     });
   } catch (err: unknown) {
@@ -1424,7 +1505,7 @@ app.patch("/experiments/:experimentId/variants/:variantId", requireAuth, async (
   const variant = await prisma.variant.findFirst({ where: { id: variantId, experimentId } });
   if (!variant) return res.status(404).json({ error: "Variant not found" });
   const updated = await prisma.variant.update({ where: { id: variantId }, data: { copy } });
-  res.json(variantToJson(updated));
+  res.json(variantToJson(updated, !!updated.imageData));
 });
 
 // Reorder variants by new index order. Body: { variantIds: string[] } (ids in desired order).
@@ -1435,7 +1516,10 @@ app.patch("/experiments/:experimentId/variants/reorder", requireAuth, async (req
     return res.status(400).json({ error: "Body must include variantIds (non-empty array)" });
   }
   const uid = req.effectiveUserId ?? req.user!.id;
-  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid }, include: { variants: true } });
+  const exp = await prisma.experiment.findFirst({
+    where: { id: experimentId, userId: uid },
+    include: { variants: { select: { id: true } } },
+  });
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
   const expVariantIds = new Set(exp.variants.map((v) => v.id));
   for (const id of variantIds) {
@@ -1446,8 +1530,13 @@ app.patch("/experiments/:experimentId/variants/reorder", requireAuth, async (req
   await prisma.$transaction(
     variantIds.map((id, i) => prisma.variant.update({ where: { id }, data: { index: i + 1 } }))
   );
-  const updated = await prisma.variant.findMany({ where: { experimentId }, orderBy: { index: "asc" } });
-  res.json({ variants: updated.map(variantToJson) });
+  const updated = await prisma.variant.findMany({
+    where: { experimentId },
+    orderBy: { index: "asc" },
+    select: VARIANT_PUBLIC_SELECT,
+  });
+  const withCreativeReorder = await variantIdsWithImageData(updated.map((v) => v.id));
+  res.json({ variants: updated.map((v) => variantToJson(v, withCreativeReorder.has(v.id))) });
 });
 
 // Swap creatives (imageData) between two variants. Body: { variantIdA: string, variantIdB: string }.
@@ -1459,10 +1548,12 @@ app.post("/experiments/:experimentId/variants/swap-creatives", requireAuth, asyn
     return res.status(400).json({ error: "Body must include variantIdA and variantIdB (two different variant ids)" });
   }
   const uid = req.effectiveUserId ?? req.user!.id;
-  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid }, include: { variants: true } });
+  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid } });
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
-  const va = exp.variants.find((v) => v.id === variantIdA);
-  const vb = exp.variants.find((v) => v.id === variantIdB);
+  const [va, vb] = await Promise.all([
+    prisma.variant.findFirst({ where: { id: variantIdA, experimentId } }),
+    prisma.variant.findFirst({ where: { id: variantIdB, experimentId } }),
+  ]);
   if (!va || !vb) return res.status(404).json({ error: "One or both variants not found in this experiment" });
   const imageA = va.imageData;
   const imageB = vb.imageData;
@@ -1470,17 +1561,27 @@ app.post("/experiments/:experimentId/variants/swap-creatives", requireAuth, asyn
     prisma.variant.update({ where: { id: variantIdA }, data: { imageData: imageB } }),
     prisma.variant.update({ where: { id: variantIdB }, data: { imageData: imageA } }),
   ]);
-  const updated = await prisma.variant.findMany({ where: { id: { in: [variantIdA, variantIdB] } } });
-  res.json({ variants: updated.map(variantToJson) });
+  const updated = await prisma.variant.findMany({
+    where: { id: { in: [variantIdA, variantIdB] } },
+    select: VARIANT_PUBLIC_SELECT,
+  });
+  const withCreativeSwap = await variantIdsWithImageData([variantIdA, variantIdB]);
+  res.json({ variants: updated.map((v) => variantToJson(v, withCreativeSwap.has(v.id))) });
 });
 
 // Generate AI creative (image) for a variant using DALL-E. Stores base64 PNG on variant.
 app.post("/experiments/:experimentId/variants/:variantId/generate-creative", requireAuth, async (req: AuthRequest, res: Response) => {
   const { experimentId, variantId } = req.params;
   const uid = req.effectiveUserId ?? req.user!.id;
-  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid }, include: { variants: true } });
+  const exp = await prisma.experiment.findFirst({
+    where: { id: experimentId, userId: uid },
+    select: { id: true, creativePrompt: true },
+  });
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
-  const variant = exp.variants.find((v) => v.id === variantId);
+  const variant = await prisma.variant.findFirst({
+    where: { id: variantId, experimentId },
+    select: { id: true, copy: true },
+  });
   if (!variant) return res.status(404).json({ error: "Variant not found" });
 
   const copy = (variant.copy || "").trim().slice(0, 500);
@@ -1545,7 +1646,7 @@ app.post("/experiments/:experimentId/variants/:variantId/regenerate", requireAut
       where: { id: variantId },
       data: { copy: newCopy, aiSource: "openai" },
     });
-    res.json({ copy: newCopy, variant: variantToJson(updated) });
+    res.json({ copy: newCopy, variant: variantToJson(updated, !!updated.imageData) });
   } catch (err: any) {
     console.error("Regenerate variant failed", err?.message || err);
     res.status(500).json({ error: "Failed to regenerate ad copy" });
@@ -1562,6 +1663,12 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
   const aiCreativeCount = req.body?.aiCreativeCount;
   const metaAdAccountId = typeof req.body?.metaAdAccountId === "string" ? req.body.metaAdAccountId.trim() : undefined;
+  const tiktokAdvertiserId =
+    typeof req.body?.tiktokAdvertiserId === "string" ? req.body.tiktokAdvertiserId.trim() : undefined;
+  const tiktokIdentityId =
+    typeof req.body?.tiktokIdentityId === "string" ? req.body.tiktokIdentityId.trim() : undefined;
+  const tiktokIdentityType =
+    typeof req.body?.tiktokIdentityType === "string" ? req.body.tiktokIdentityType.trim() : undefined;
   const landingPageUrl = typeof req.body?.landingPageUrl === "string" && req.body.landingPageUrl.trim()
     ? req.body.landingPageUrl.trim()
     : "https://example.com";
@@ -1579,7 +1686,15 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
   const storedAudience = (exp.targetAudiencePrompt || "").trim();
   const audienceForTargeting = targetAudienceOverride ?? storedAudience;
 
-  const data: { status: string; phase: string; aiCreativeCount?: number; metaCampaignId?: string; metaAdSetId?: string } = {
+  const data: {
+    status: string;
+    phase: string;
+    aiCreativeCount?: number;
+    metaCampaignId?: string;
+    metaAdSetId?: string;
+    tiktokCampaignId?: string;
+    tiktokAdGroupId?: string;
+  } = {
     status: "launched",
     phase: "running",
   };
@@ -1750,9 +1865,59 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     }
   }
 
+  if (exp.platform === "tiktok" && tiktokAdvertiserId) {
+    if (!landingPageUrl || landingPageUrl === "https://example.com") {
+      return res.status(400).json({
+        error: "Enter a real landing page URL for TikTok (required for website traffic ads).",
+      });
+    }
+    const tiktokConn = await prisma.connectedAccount.findFirst({
+      where: { userId: uid, platform: "tiktok" },
+    });
+    if (!tiktokConn) {
+      return res.status(400).json({ error: "TikTok not connected. Connect TikTok in Integrations first." });
+    }
+    const variantIdSetTt = variantIds ? new Set(variantIds) : null;
+    const variantsWithImageTt = exp.variants.filter(
+      (v) => v.imageData && (!variantIdSetTt || variantIdSetTt.has(v.id))
+    );
+    if (variantsWithImageTt.length === 0) {
+      return res.status(400).json({
+        error: variantIds
+          ? "No selected variants have creatives. Generate images for at least one selected variant."
+          : "No variants have creatives yet. Generate creatives for at least one variant before launching.",
+      });
+    }
+    data.aiCreativeCount = variantsWithImageTt.length;
+    try {
+      const ttResult = await launchTikTokCampaign({
+        accessToken: tiktokConn.accessToken,
+        advertiserId: tiktokAdvertiserId,
+        campaignName: exp.name,
+        dailyBudget: exp.totalDailyBudget,
+        landingPageUrl,
+        dryRun,
+        identityId: tiktokIdentityId,
+        identityType: tiktokIdentityType,
+        variants: variantsWithImageTt.map((v, i) => ({
+          title: `${exp.name} - ${i + 1}`.slice(0, 100),
+          adText: (v.copy || "").replace(/\n/g, " ").trim() || `${exp.name} — variant ${i + 1}`,
+          imagePngBase64: (v.imageData || "").replace(/^data:image\/[a-z]+;base64,/, ""),
+        })),
+      });
+      data.tiktokCampaignId = ttResult.campaignId;
+      data.tiktokAdGroupId = ttResult.adGroupId;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "TikTok API error";
+      console.error("[TikTok launch]", msg);
+      return res.status(502).json({ error: msg });
+    }
+  }
+
   const updated = await prisma.experiment.update({ where: { id: exp.id }, data });
   const payload: Record<string, unknown> = { ...updated, aiProvider: updated.aiProvider ?? undefined, creativePrompt: updated.creativePrompt ?? undefined, campaignGroupId: updated.campaignGroupId ?? undefined, attachedCreativeIds: updated.attachedCreativeIds ?? undefined };
   if (exp.platform === "meta" && metaAdAccountId && dryRun) payload.dryRun = true;
+  if (exp.platform === "tiktok" && tiktokAdvertiserId && dryRun) payload.dryRun = true;
   res.json(payload);
 });
 

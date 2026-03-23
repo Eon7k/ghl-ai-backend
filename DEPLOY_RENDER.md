@@ -64,6 +64,18 @@ Instances **spin down** when idle; the first request can take **~50s+**. That is
 
 ---
 
+## Render email: “exceeded memory limit” / “memory leak”
+
+Often this is **high peak memory**, not a true leak. This app used to load **every variant’s full base64 image** from the DB when listing or opening campaigns — that can use **hundreds of MB** with many creatives. The backend now loads **metadata only** for those routes and uses a small query to see which variants have an image (`hasCreative`).
+
+**Still helpful on small instances:**
+
+- Set `NODE_OPTIONS=--max-old-space-size=400` (see below).
+- Avoid creating **many large image variants** in one request (launch / heavy pages).
+- Upgrade to a Render plan with **more RAM** if peaks remain high.
+
+---
+
 ## Instance exited with status **134** (SIGABRT)
 
 On small instances this is often **Node/V8 running out of memory** while handling big responses (e.g. **many AI variants**, Prisma, JSON). The default V8 heap can overshoot the container’s RAM limit and the process **aborts**.
