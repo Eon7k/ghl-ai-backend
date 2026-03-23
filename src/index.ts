@@ -1342,6 +1342,57 @@ async function generateVariantsFromPrompt(
   return generateWithOpenAI(prompt, platform, count);
 }
 
+/** Copy library creative imageData onto variants after experiment create (own = all; mix = from slot N onward, N = AI creative count). */
+async function copyLibraryCreativesToVariants(
+  userId: string,
+  experimentId: string,
+  attachedCreativeIds: string[],
+  source: "own" | "mix" | "ai",
+  mixAiCreativeVariantCount: number | undefined
+): Promise<void> {
+  if (source === "ai" || attachedCreativeIds.length === 0) return;
+  const creatives = await prisma.creative.findMany({
+    where: { userId, id: { in: attachedCreativeIds } },
+    select: { id: true, imageData: true },
+  });
+  const byId = new Map(creatives.map((c) => [c.id, c.imageData]));
+  const orderedImages: string[] = [];
+  for (const id of attachedCreativeIds) {
+    const img = byId.get(id);
+    if (img) orderedImages.push(img);
+  }
+  if (orderedImages.length === 0) return;
+
+  const variants = await prisma.variant.findMany({
+    where: { experimentId },
+    orderBy: { index: "asc" },
+    select: { id: true },
+  });
+
+  let aiSlots = 0;
+  if (source === "mix") {
+    const raw =
+      typeof mixAiCreativeVariantCount === "number" && !Number.isNaN(mixAiCreativeVariantCount)
+        ? Math.floor(mixAiCreativeVariantCount)
+        : 0;
+    aiSlots = Math.max(0, Math.min(variants.length, raw));
+  }
+
+  const updates: { id: string; imageData: string }[] = [];
+  for (let i = 0; i < variants.length; i++) {
+    if (source === "mix" && i < aiSlots) continue;
+    const libIdx = source === "own" ? i : i - aiSlots;
+    updates.push({
+      id: variants[i].id,
+      imageData: orderedImages[libIdx % orderedImages.length],
+    });
+  }
+  if (updates.length === 0) return;
+  await prisma.$transaction(
+    updates.map((u) => prisma.variant.update({ where: { id: u.id }, data: { imageData: u.imageData } }))
+  );
+}
+
 // Create one or more experiments (same campaign, one per platform when platforms[] has multiple)
 app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) => {
   try {
@@ -1356,6 +1407,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       aiProvider: aiProviderBody,
       creativePrompt: creativePromptBody,
       attachedCreativeIds: attachedCreativeIdsBody,
+      mixAiCreativeVariantCount: mixAiCreativeVariantCountBody,
     } = req.body;
 
     const aiProvider: AiProviderOption =
@@ -1385,6 +1437,10 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     const attachedCreativeIds: string[] = Array.isArray(attachedCreativeIdsBody)
       ? attachedCreativeIdsBody.filter((id: unknown) => typeof id === "string" && id.startsWith("creative-"))
       : [];
+    const mixAiCreativeVariantCount =
+      typeof mixAiCreativeVariantCountBody === "number" && !Number.isNaN(mixAiCreativeVariantCountBody)
+        ? Math.floor(mixAiCreativeVariantCountBody)
+        : undefined;
 
     const platformForAi = platformsList[0];
 
@@ -1444,6 +1500,13 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       if (platformsList.length === 1) {
         await prisma.experiment.update({ where: { id: exp.id }, data: { campaignGroupId: exp.id } });
       }
+      await copyLibraryCreativesToVariants(
+        uid,
+        exp.id,
+        attachedCreativeIds,
+        source,
+        mixAiCreativeVariantCount
+      );
       createdExperimentIds.push(exp.id);
     }
 
@@ -1452,6 +1515,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       where: { id: firstId },
       include: { variants: { select: VARIANT_PUBLIC_SELECT } },
     });
+    const firstExpCreativeIds = await variantIdsWithImageData(firstExp.variants.map((v) => v.id));
 
     res.status(201).json({
       id: firstExp.id,
@@ -1472,7 +1536,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       tiktokCampaignId: firstExp.tiktokCampaignId ?? undefined,
       tiktokAdGroupId: firstExp.tiktokAdGroupId ?? undefined,
       attachedCreativeIds: firstExp.attachedCreativeIds ?? undefined,
-      variants: firstExp.variants.map((v) => variantToJson(v, false)),
+      variants: firstExp.variants.map((v) => variantToJson(v, firstExpCreativeIds.has(v.id))),
       createdExperimentIds,
     });
   } catch (err: unknown) {
@@ -1568,6 +1632,46 @@ app.post("/experiments/:experimentId/variants/swap-creatives", requireAuth, asyn
   });
   const withCreativeSwap = await variantIdsWithImageData([variantIdA, variantIdB]);
   res.json({ variants: updated.map((v) => variantToJson(v, withCreativeSwap.has(v.id))) });
+});
+
+// Attach a library creative or raw upload (base64 / data URL) to a variant.
+app.post("/experiments/:experimentId/variants/:variantId/set-creative", requireAuth, async (req: AuthRequest, res: Response) => {
+  const { experimentId, variantId } = req.params;
+  const creativeId = typeof req.body?.creativeId === "string" ? req.body.creativeId.trim() : undefined;
+  const imageDataRaw = typeof req.body?.imageData === "string" ? req.body.imageData : undefined;
+  if ((creativeId && imageDataRaw) || (!creativeId && !imageDataRaw)) {
+    return res
+      .status(400)
+      .json({ error: "Provide exactly one of creativeId (library) or imageData (base64 or data URL)" });
+  }
+  if (creativeId && !creativeId.startsWith("creative-")) {
+    return res.status(400).json({ error: "Invalid creativeId" });
+  }
+
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid } });
+  if (!exp) return res.status(404).json({ error: "Experiment not found" });
+  const variant = await prisma.variant.findFirst({ where: { id: variantId, experimentId } });
+  if (!variant) return res.status(404).json({ error: "Variant not found" });
+
+  let imageData: string;
+  if (creativeId) {
+    const c = await prisma.creative.findFirst({ where: { id: creativeId, userId: uid } });
+    if (!c) return res.status(404).json({ error: "Creative not found" });
+    imageData = c.imageData;
+  } else {
+    imageData = imageDataRaw!.replace(/^data:image\/[a-z]+;base64,/, "").trim();
+    if (!imageData.length) {
+      return res.status(400).json({ error: "imageData must be a valid base64 image" });
+    }
+  }
+
+  const updated = await prisma.variant.update({
+    where: { id: variantId },
+    data: { imageData },
+    select: VARIANT_PUBLIC_SELECT,
+  });
+  res.json({ variant: variantToJson(updated, true) });
 });
 
 // Generate AI creative (image) for a variant using DALL-E. Stores base64 PNG on variant.
