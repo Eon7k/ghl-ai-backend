@@ -147,6 +147,7 @@ interface ExperimentRecord {
   tiktokAdGroupId?: string;
   googleCampaignId?: string;
   googleAdGroupId?: string;
+  aiOptimizationMode?: string;
 }
 
 interface VariantRecord {
@@ -1017,6 +1018,7 @@ app.get("/experiments", requireAuth, async (req: AuthRequest, res: Response) => 
     tiktokAdGroupId: e.tiktokAdGroupId ?? undefined,
     googleCampaignId: e.googleCampaignId ?? undefined,
     googleAdGroupId: e.googleAdGroupId ?? undefined,
+    aiOptimizationMode: e.aiOptimizationMode ?? undefined,
     attachedCreativeIds: e.attachedCreativeIds ?? undefined,
     variants: e.variants.map((v) => variantToJson(v, withCreative.has(v.id))),
   })));
@@ -1053,12 +1055,13 @@ app.get("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response)
     tiktokAdGroupId: exp.tiktokAdGroupId ?? undefined,
     googleCampaignId: exp.googleCampaignId ?? undefined,
     googleAdGroupId: exp.googleAdGroupId ?? undefined,
+    aiOptimizationMode: exp.aiOptimizationMode ?? undefined,
     attachedCreativeIds: exp.attachedCreativeIds ?? undefined,
     variants: exp.variants.map((v) => variantToJson(v, withCreativeOne.has(v.id))),
   });
 });
 
-// Update experiment (e.g. creative direction, target audience description). Body: { creativePrompt?: string, targetAudiencePrompt?: string | null }.
+// Update experiment (e.g. creative direction, target audience, AI optimization mode).
 app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response) => {
   const uid = req.effectiveUserId ?? req.user!.id;
   const exp = await prisma.experiment.findFirst({ where: { id: req.params.id, userId: uid } });
@@ -1071,11 +1074,27 @@ app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Respons
     req.body?.targetAudiencePrompt !== undefined
       ? (typeof req.body.targetAudiencePrompt === "string" ? req.body.targetAudiencePrompt.trim() : null) || null
       : undefined;
-  const data: { creativePrompt?: string | null; targetAudiencePrompt?: string | null } = {};
+  let aiOptimizationMode: string | undefined;
+  if (req.body?.aiOptimizationMode !== undefined) {
+    const raw = String(req.body.aiOptimizationMode).trim().toLowerCase();
+    if (raw !== "off" && raw !== "suggestions" && raw !== "auto") {
+      return res.status(400).json({ error: "aiOptimizationMode must be off, suggestions, or auto" });
+    }
+    aiOptimizationMode = raw;
+  }
+  const data: {
+    creativePrompt?: string | null;
+    targetAudiencePrompt?: string | null;
+    aiOptimizationMode?: string;
+  } = {};
   if (creativePrompt !== undefined) data.creativePrompt = creativePrompt || null;
   if (targetAudiencePrompt !== undefined) data.targetAudiencePrompt = targetAudiencePrompt || null;
+  if (aiOptimizationMode !== undefined) data.aiOptimizationMode = aiOptimizationMode;
   if (Object.keys(data).length === 0) {
-    return res.status(400).json({ error: "Body must include at least one field to update (e.g. creativePrompt, targetAudiencePrompt)" });
+    return res.status(400).json({
+      error:
+        "Body must include at least one field to update (e.g. creativePrompt, targetAudiencePrompt, aiOptimizationMode)",
+    });
   }
   const updated = await prisma.experiment.update({ where: { id: exp.id }, data });
   res.json({
@@ -1099,6 +1118,7 @@ app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Respons
     tiktokAdGroupId: updated.tiktokAdGroupId ?? undefined,
     googleCampaignId: updated.googleCampaignId ?? undefined,
     googleAdGroupId: updated.googleAdGroupId ?? undefined,
+    aiOptimizationMode: updated.aiOptimizationMode ?? undefined,
     attachedCreativeIds: updated.attachedCreativeIds ?? undefined,
   });
 });
@@ -1607,6 +1627,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       tiktokAdGroupId: firstExp.tiktokAdGroupId ?? undefined,
       googleCampaignId: firstExp.googleCampaignId ?? undefined,
       googleAdGroupId: firstExp.googleAdGroupId ?? undefined,
+      aiOptimizationMode: firstExp.aiOptimizationMode ?? undefined,
       attachedCreativeIds: firstExp.attachedCreativeIds ?? undefined,
       variants: firstExp.variants.map((v) => variantToJson(v, firstExpCreativeIds.has(v.id))),
       createdExperimentIds,
@@ -2270,6 +2291,26 @@ async function fetchMetaMetrics(
   }
 }
 
+/** Live Meta metrics when linked; other platforms return placeholders until native reporting is integrated. */
+async function getResolvedCampaignMetrics(
+  uid: string,
+  exp: { status: string; platform: string; metaCampaignId: string | null }
+): Promise<CampaignMetricsResponse> {
+  if (exp.status !== "launched") {
+    return { ...placeholderMetrics };
+  }
+  if (exp.platform === "meta" && exp.metaCampaignId) {
+    const metaConn = await prisma.connectedAccount.findFirst({
+      where: { userId: uid, platform: "meta" },
+    });
+    if (metaConn) {
+      const m = await fetchMetaMetrics(exp.metaCampaignId, metaConn.accessToken);
+      if (m) return { ...m, source: "meta", datePreset: "last_7d" };
+    }
+  }
+  return { ...placeholderMetrics };
+}
+
 app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: Response) => {
   const uid = req.effectiveUserId ?? req.user!.id;
   const exp = await prisma.experiment.findFirst({ where: { id: req.params.id, userId: uid } });
@@ -2279,18 +2320,134 @@ app.get("/experiments/:id/metrics", requireAuth, async (req: AuthRequest, res: R
   if (exp.status !== "launched") {
     return res.status(400).json({ error: "Campaign is not launched" });
   }
+  const metrics = await getResolvedCampaignMetrics(uid, exp);
+  return res.json(metrics);
+});
 
-  if (exp.platform === "meta" && exp.metaCampaignId) {
-    const metaConn = await prisma.connectedAccount.findFirst({
-      where: { userId: uid, platform: "meta" },
-    });
-    if (metaConn) {
-      const m = await fetchMetaMetrics(exp.metaCampaignId, metaConn.accessToken);
-      if (m) return res.json({ ...m, source: "meta" as const, datePreset: "last_7d" });
-    }
+// AI reads latest metrics (all platforms; live data where available) and returns suggestions. Mode "auto" may apply Meta ad-set budget only.
+app.post("/experiments/:id/ai-performance-insights", requireAuth, async (req: AuthRequest, res: Response) => {
+  if (!OPENAI_API_KEY || OPENAI_API_KEY.length < 20) {
+    return res.status(503).json({ error: "OpenAI is not configured for AI performance insights." });
+  }
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const exp = await prisma.experiment.findFirst({ where: { id: req.params.id, userId: uid } });
+  if (!exp) return res.status(404).json({ error: "Campaign not found" });
+  if (exp.status !== "launched") {
+    return res.status(400).json({ error: "Campaign must be launched to analyze performance." });
   }
 
-  return res.json(placeholderMetrics);
+  const metrics = await getResolvedCampaignMetrics(uid, exp);
+  const mode = (exp.aiOptimizationMode || "off").toLowerCase();
+
+  const systemPrompt =
+    "You are a senior performance marketer. Analyze the JSON campaign snapshot for the given ad platform (meta, google, or tiktok). " +
+    "If metrics are mostly zero or the data source is placeholder, state clearly that in-app data is limited and the user should verify spend and delivery in the native ad manager — still give 2–3 platform-appropriate optimization ideas. " +
+    "Do not invent specific numbers that are not implied by the data. " +
+    'Respond with ONLY valid JSON (no markdown) in this exact shape: {"summary":"one short paragraph","suggestions":["..."],"recommendedDailyBudget": number or null}. ' +
+    "Rules for recommendedDailyBudget (USD, total daily budget for this campaign): " +
+    "Use null unless you have meaningful performance signals (e.g. Meta live metrics with real spend). " +
+    "If you do suggest a number, keep it within ±25% of totalDailyBudgetUsd when adjusting. " +
+    "For Google Ads or TikTok when metrics are placeholder, always use null.";
+
+  const userPayload = {
+    platform: exp.platform,
+    campaignName: exp.name,
+    totalDailyBudgetUsd: exp.totalDailyBudget,
+    variantCount: exp.variantCount,
+    optimizationMode: mode,
+    metricsSource: metrics.source,
+    metrics,
+  };
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: JSON.stringify(userPayload) },
+      ],
+      response_format: { type: "json_object" },
+    });
+    const raw = completion.choices[0]?.message?.content || "{}";
+    let parsed: { summary?: string; suggestions?: unknown; recommendedDailyBudget?: unknown };
+    try {
+      parsed = JSON.parse(raw) as typeof parsed;
+    } catch {
+      return res.status(502).json({ error: "AI returned invalid JSON" });
+    }
+
+    const summary = typeof parsed.summary === "string" ? parsed.summary : "";
+    const suggestions = Array.isArray(parsed.suggestions)
+      ? parsed.suggestions.filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+      : [];
+    const recRaw = parsed.recommendedDailyBudget;
+    const rec =
+      typeof recRaw === "number" && !Number.isNaN(recRaw) && recRaw > 0 ? recRaw : null;
+
+    let budgetAutoApplied = false;
+    let budgetNote: string | undefined;
+    let newTotalDailyBudget: number | undefined;
+
+    if (mode === "auto" && rec != null) {
+      if (exp.platform !== "meta" || !exp.metaAdSetId) {
+        budgetNote =
+          "Automatic budget updates are only available for Meta campaigns with a linked ad set. Use Google Ads or TikTok Ads Manager to change budgets for those platforms.";
+      } else {
+        const cur = exp.totalDailyBudget;
+        const low = Math.max(1, Math.round(cur * 0.75 * 100) / 100);
+        const high = Math.max(low, Math.round(cur * 1.25 * 100) / 100);
+        const next = Math.max(low, Math.min(rec, high));
+        const metaConn = await prisma.connectedAccount.findFirst({
+          where: { userId: uid, platform: "meta" },
+        });
+        if (!metaConn) {
+          budgetNote = "Meta is not connected; budget was not changed.";
+        } else {
+          try {
+            const budgetCents = Math.round(next * 100);
+            const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(exp.metaAdSetId)}?daily_budget=${budgetCents}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+            await axios.post(url);
+            await prisma.experiment.update({
+              where: { id: exp.id },
+              data: { totalDailyBudget: next },
+            });
+            budgetAutoApplied = true;
+            newTotalDailyBudget = next;
+            budgetNote = `Meta ad set daily budget updated to $${next}/day (clamped between $${low} and $${high} from prior $${cur}/day).`;
+          } catch (err: unknown) {
+            const msg =
+              err && typeof err === "object" && "response" in err
+                ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
+                : err instanceof Error
+                  ? err.message
+                  : "Meta API error";
+            budgetNote = typeof msg === "string" ? `Meta budget update failed: ${msg}` : "Meta budget update failed.";
+          }
+        }
+      }
+    } else if (mode === "suggestions") {
+      budgetNote =
+        "Suggestions only — change optimization mode to Auto to allow Meta ad-set budget updates when the AI recommends a budget.";
+    } else if (mode === "off") {
+      budgetNote =
+        "Mode is Off — suggestions above are informational only. Use Suggestions or Auto if you want Meta budget recommendations or automatic Meta budget updates on each review.";
+    }
+
+    return res.json({
+      summary,
+      suggestions,
+      recommendedDailyBudget: rec,
+      budgetAutoApplied,
+      budgetNote,
+      metricsSource: metrics.source,
+      platform: exp.platform,
+      ...(newTotalDailyBudget != null && { newTotalDailyBudget }),
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "AI insights failed";
+    console.error("[ai-performance-insights]", msg);
+    return res.status(500).json({ error: msg });
+  }
 });
 
 // Campaign adjustments: update status (pause/activate) or daily budget on Meta. Require metaCampaignId (and metaAdSetId for budget).

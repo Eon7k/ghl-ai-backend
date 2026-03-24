@@ -76,6 +76,8 @@ model Experiment {
   /** Google Ads ad group resource id (numeric string) after launch. */
   googleAdGroupId    String?
   attachedCreativeIds String[] @default([]) // PostgreSQL array of creative ids
+  /** AI optimization: off | suggestions | auto (auto applies Meta ad-set budget only when API recommends). */
+  aiOptimizationMode  String   @default("off")
   variants           Variant[]
 }
 
