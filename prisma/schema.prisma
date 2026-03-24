@@ -71,6 +71,10 @@ model Experiment {
   tiktokCampaignId   String?
   /** TikTok ad group id after launch. */
   tiktokAdGroupId    String?
+  /** Google Ads campaign resource id (numeric string) after launch. */
+  googleCampaignId   String?
+  /** Google Ads ad group resource id (numeric string) after launch. */
+  googleAdGroupId    String?
   attachedCreativeIds String[] @default([]) // PostgreSQL array of creative ids
   variants           Variant[]
 }

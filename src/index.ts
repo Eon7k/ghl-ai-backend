@@ -10,6 +10,12 @@ import Anthropic from "@anthropic-ai/sdk";
 import { buildSystemPrompt, buildUserPrompt, buildVariantsFromOnePrompt, AdPlatform } from "./aiPromptTemplates";
 import { prisma } from "./db";
 import { launchTikTokCampaign, tiktokListIdentities } from "./tiktokMarketing";
+import {
+  launchGoogleDisplayCampaign,
+  refreshAndStoreGoogleAccessToken,
+  googleAdsApiErrorMessage,
+  googleAdsApiHeaders,
+} from "./googleMarketing";
 
 // Only load .env file when NOT in production (so Render always uses its own env vars)
 if (process.env.NODE_ENV !== "production") {
@@ -139,6 +145,8 @@ interface ExperimentRecord {
   metaAdSetId?: string;
   tiktokCampaignId?: string;
   tiktokAdGroupId?: string;
+  googleCampaignId?: string;
+  googleAdGroupId?: string;
 }
 
 interface VariantRecord {
@@ -647,12 +655,21 @@ app.get("/integrations/google/connect", async (req: Request, res: Response) => {
   if (!token) {
     return res.status(401).send("Missing token. Log in and use the Connect Google button from the Integrations page.");
   }
+  const viewingAs = typeof req.query.viewingAs === "string" ? req.query.viewingAs.trim() : "";
   let userId: string;
   try {
     const payload = jwt.verify(token, JWT_SECRET) as { userId: string };
     const user = await prisma.user.findUnique({ where: { id: payload.userId } });
     if (!user) return res.status(401).send("User not found");
-    userId = user.id;
+    const accountType = (user as { accountType?: string }).accountType ?? "single";
+    if (accountType === "agency" && viewingAs) {
+      const allowed = await prisma.agencyClient.findFirst({
+        where: { agencyUserId: user.id, clientUserId: viewingAs },
+      });
+      userId = allowed ? viewingAs : user.id;
+    } else {
+      userId = user.id;
+    }
   } catch {
     return res.status(401).send("Invalid or expired token. Please log in again.");
   }
@@ -739,14 +756,20 @@ app.get("/integrations/google/ad-accounts", requireAuth, async (req: AuthRequest
       error: "Google Ads API developer token is not configured. Set GOOGLE_ADS_DEVELOPER_TOKEN on the server to list ad accounts.",
     });
   }
+  let accessToken = googleConn.accessToken;
   try {
+    if (googleConn.refreshToken && GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
+      accessToken = await refreshAndStoreGoogleAccessToken(
+        prisma,
+        googleConn,
+        GOOGLE_CLIENT_ID,
+        GOOGLE_CLIENT_SECRET
+      );
+    }
     const resAd = await axios.get<{ resourceNames?: string[] }>(
       "https://googleads.googleapis.com/v20/customers:listAccessibleCustomers",
       {
-        headers: {
-          Authorization: `Bearer ${googleConn.accessToken}`,
-          "developer-token": GOOGLE_ADS_DEVELOPER_TOKEN,
-        },
+        headers: googleAdsApiHeaders(accessToken, GOOGLE_ADS_DEVELOPER_TOKEN),
       }
     );
     const resourceNames = resAd.data?.resourceNames || [];
@@ -756,11 +779,49 @@ app.get("/integrations/google/ad-accounts", requireAuth, async (req: AuthRequest
     });
     return res.json({ adAccounts });
   } catch (err: unknown) {
-    const msg = err && typeof err === "object" && "response" in err
-      ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
-      : err instanceof Error ? err.message : "Failed to fetch Google Ads accounts";
+    const msg = googleAdsApiErrorMessage(err);
     console.error("[Google ad-accounts]", msg);
     return res.status(502).json({ error: typeof msg === "string" ? msg : "Google Ads API error" });
+  }
+});
+
+// Test Google Ads connection (token + developer token + list accessible customers).
+app.get("/integrations/google/test", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const googleConn = await prisma.connectedAccount.findFirst({
+    where: { userId: uid, platform: "google" },
+  });
+  if (!googleConn) {
+    return res.status(400).json({ ok: false, error: "Google not connected. Connect Google in Integrations first." });
+  }
+  if (!GOOGLE_ADS_DEVELOPER_TOKEN) {
+    return res.status(400).json({
+      ok: false,
+      error: "GOOGLE_ADS_DEVELOPER_TOKEN is not set on the server. Add it in Render (or .env) to use Google Ads API.",
+    });
+  }
+  try {
+    let accessToken = googleConn.accessToken;
+    if (googleConn.refreshToken && GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
+      accessToken = await refreshAndStoreGoogleAccessToken(
+        prisma,
+        googleConn,
+        GOOGLE_CLIENT_ID,
+        GOOGLE_CLIENT_SECRET
+      );
+    }
+    const resAd = await axios.get<{ resourceNames?: string[] }>(
+      "https://googleads.googleapis.com/v20/customers:listAccessibleCustomers",
+      {
+        headers: googleAdsApiHeaders(accessToken, GOOGLE_ADS_DEVELOPER_TOKEN),
+      }
+    );
+    const n = resAd.data?.resourceNames?.length ?? 0;
+    res.json({ ok: true, customerCount: n });
+  } catch (err: unknown) {
+    const msg = googleAdsApiErrorMessage(err);
+    console.error("[Google test]", msg);
+    res.status(502).json({ ok: false, error: msg });
   }
 });
 
@@ -954,6 +1015,8 @@ app.get("/experiments", requireAuth, async (req: AuthRequest, res: Response) => 
     metaAdSetId: e.metaAdSetId ?? undefined,
     tiktokCampaignId: e.tiktokCampaignId ?? undefined,
     tiktokAdGroupId: e.tiktokAdGroupId ?? undefined,
+    googleCampaignId: e.googleCampaignId ?? undefined,
+    googleAdGroupId: e.googleAdGroupId ?? undefined,
     attachedCreativeIds: e.attachedCreativeIds ?? undefined,
     variants: e.variants.map((v) => variantToJson(v, withCreative.has(v.id))),
   })));
@@ -988,6 +1051,8 @@ app.get("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response)
     metaAdSetId: exp.metaAdSetId ?? undefined,
     tiktokCampaignId: exp.tiktokCampaignId ?? undefined,
     tiktokAdGroupId: exp.tiktokAdGroupId ?? undefined,
+    googleCampaignId: exp.googleCampaignId ?? undefined,
+    googleAdGroupId: exp.googleAdGroupId ?? undefined,
     attachedCreativeIds: exp.attachedCreativeIds ?? undefined,
     variants: exp.variants.map((v) => variantToJson(v, withCreativeOne.has(v.id))),
   });
@@ -1032,6 +1097,8 @@ app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Respons
     metaAdSetId: updated.metaAdSetId ?? undefined,
     tiktokCampaignId: updated.tiktokCampaignId ?? undefined,
     tiktokAdGroupId: updated.tiktokAdGroupId ?? undefined,
+    googleCampaignId: updated.googleCampaignId ?? undefined,
+    googleAdGroupId: updated.googleAdGroupId ?? undefined,
     attachedCreativeIds: updated.attachedCreativeIds ?? undefined,
   });
 });
@@ -1535,6 +1602,8 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       metaAdSetId: firstExp.metaAdSetId ?? undefined,
       tiktokCampaignId: firstExp.tiktokCampaignId ?? undefined,
       tiktokAdGroupId: firstExp.tiktokAdGroupId ?? undefined,
+      googleCampaignId: firstExp.googleCampaignId ?? undefined,
+      googleAdGroupId: firstExp.googleAdGroupId ?? undefined,
       attachedCreativeIds: firstExp.attachedCreativeIds ?? undefined,
       variants: firstExp.variants.map((v) => variantToJson(v, firstExpCreativeIds.has(v.id))),
       createdExperimentIds,
@@ -1768,6 +1837,9 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
   const aiCreativeCount = req.body?.aiCreativeCount;
   const metaAdAccountId = typeof req.body?.metaAdAccountId === "string" ? req.body.metaAdAccountId.trim() : undefined;
+  const googleAdsCustomerIdBody =
+    typeof req.body?.googleAdsCustomerId === "string" ? req.body.googleAdsCustomerId.trim() : "";
+  const googleAdsCustomerDigits = googleAdsCustomerIdBody.replace(/\D/g, "");
   const tiktokAdvertiserId =
     typeof req.body?.tiktokAdvertiserId === "string" ? req.body.tiktokAdvertiserId.trim() : undefined;
   const tiktokIdentityId =
@@ -1799,6 +1871,8 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     metaAdSetId?: string;
     tiktokCampaignId?: string;
     tiktokAdGroupId?: string;
+    googleCampaignId?: string;
+    googleAdGroupId?: string;
   } = {
     status: "launched",
     phase: "running",
@@ -1872,6 +1946,8 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
             daily_budget: String(budgetCents),
             billing_event: "IMPRESSIONS",
             optimization_goal: "LINK_CLICKS",
+            destination_type: "WEBSITE",
+            promoted_object: JSON.stringify({ link: landingPageUrl }),
             targeting: JSON.stringify(metaTargeting),
             status: "PAUSED",
             access_token: token,
@@ -2019,10 +2095,78 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     }
   }
 
+  if (exp.platform === "google" && googleAdsCustomerDigits.length >= 6) {
+    if (!GOOGLE_ADS_DEVELOPER_TOKEN) {
+      return res.status(503).json({
+        error: "Google Ads API is not configured. Set GOOGLE_ADS_DEVELOPER_TOKEN on the server.",
+      });
+    }
+    if (!landingPageUrl || landingPageUrl === "https://example.com") {
+      return res.status(400).json({
+        error: "Enter a real landing page URL for Google Ads (required for your ad final URLs).",
+      });
+    }
+    const googleConn = await prisma.connectedAccount.findFirst({
+      where: { userId: uid, platform: "google" },
+    });
+    if (!googleConn) {
+      return res.status(400).json({ error: "Google not connected. Connect Google in Integrations first." });
+    }
+    if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+      return res.status(400).json({ error: "Google OAuth is not configured on the server." });
+    }
+    const variantIdSetG = variantIds ? new Set(variantIds) : null;
+    const variantsWithImageG = exp.variants.filter(
+      (v) => v.imageData && (!variantIdSetG || variantIdSetG.has(v.id))
+    );
+    if (variantsWithImageG.length === 0) {
+      return res.status(400).json({
+        error: variantIds
+          ? "No selected variants have creatives. Generate or attach images for at least one selected variant."
+          : "No variants have creatives yet. Add creatives before launching.",
+      });
+    }
+    data.aiCreativeCount = variantsWithImageG.length;
+    try {
+      let accessToken = googleConn.accessToken;
+      if (googleConn.refreshToken) {
+        accessToken = await refreshAndStoreGoogleAccessToken(
+          prisma,
+          googleConn,
+          GOOGLE_CLIENT_ID,
+          GOOGLE_CLIENT_SECRET
+        );
+      }
+      const businessName = exp.name.slice(0, 25) || "Advertiser";
+      const gg = await launchGoogleDisplayCampaign({
+        customerIdDigits: googleAdsCustomerDigits,
+        accessToken,
+        developerToken: GOOGLE_ADS_DEVELOPER_TOKEN,
+        campaignName: exp.name.slice(0, 200),
+        dailyBudgetUsd: exp.totalDailyBudget,
+        finalUrl: landingPageUrl,
+        businessName,
+        experimentName: exp.name,
+        variants: variantsWithImageG.map((v) => ({
+          copy: (v.copy || "").trim(),
+          imageBase64: (v.imageData || "").replace(/^data:image\/[a-z]+;base64,/, ""),
+        })),
+        dryRun,
+      });
+      data.googleCampaignId = gg.campaignId;
+      data.googleAdGroupId = gg.adGroupId;
+    } catch (err: unknown) {
+      const msg = googleAdsApiErrorMessage(err);
+      console.error("[Google launch]", msg);
+      return res.status(502).json({ error: msg });
+    }
+  }
+
   const updated = await prisma.experiment.update({ where: { id: exp.id }, data });
   const payload: Record<string, unknown> = { ...updated, aiProvider: updated.aiProvider ?? undefined, creativePrompt: updated.creativePrompt ?? undefined, campaignGroupId: updated.campaignGroupId ?? undefined, attachedCreativeIds: updated.attachedCreativeIds ?? undefined };
   if (exp.platform === "meta" && metaAdAccountId && dryRun) payload.dryRun = true;
   if (exp.platform === "tiktok" && tiktokAdvertiserId && dryRun) payload.dryRun = true;
+  if (exp.platform === "google" && googleAdsCustomerDigits.length >= 6 && dryRun) payload.dryRun = true;
   res.json(payload);
 });
 
