@@ -1501,8 +1501,11 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
         : "Generate varied ad copy for this campaign.";
     const creativePrompt =
       typeof creativePromptBody === "string" && creativePromptBody.trim() ? creativePromptBody.trim() : undefined;
+    /** Library creative ids are Prisma cuids (not a creative- prefix). */
     const attachedCreativeIds: string[] = Array.isArray(attachedCreativeIdsBody)
-      ? attachedCreativeIdsBody.filter((id: unknown) => typeof id === "string" && id.startsWith("creative-"))
+      ? attachedCreativeIdsBody
+          .filter((id: unknown) => typeof id === "string" && String(id).trim().length > 0)
+          .map((id: string) => id.trim())
       : [];
     const mixAiCreativeVariantCount =
       typeof mixAiCreativeVariantCountBody === "number" && !Number.isNaN(mixAiCreativeVariantCountBody)
@@ -1713,10 +1716,6 @@ app.post("/experiments/:experimentId/variants/:variantId/set-creative", requireA
       .status(400)
       .json({ error: "Provide exactly one of creativeId (library) or imageData (base64 or data URL)" });
   }
-  if (creativeId && !creativeId.startsWith("creative-")) {
-    return res.status(400).json({ error: "Invalid creativeId" });
-  }
-
   const uid = req.effectiveUserId ?? req.user!.id;
   const exp = await prisma.experiment.findFirst({ where: { id: experimentId, userId: uid } });
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
