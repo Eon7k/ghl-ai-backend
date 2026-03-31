@@ -1994,25 +1994,26 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
       }
       data.metaCampaignId = campaignId;
 
-      // 2. Create Ad Set (daily_budget in cents). Link lives on creatives; promoted_object+link here often triggers vague "Invalid parameter".
+      // 2. Create Ad Set (daily_budget in cents). Meta expects bid fields in POST body; query-only `params` often drops
+      //    bid_strategy (subcode 2490487). Empty bid_constraints pairs with LOWEST_COST_WITHOUT_CAP per bidding docs.
       const budgetCents = Math.round(exp.totalDailyBudget * 100);
+      const adSetForm = new URLSearchParams({
+        name: `${exp.name} - Ad Set`.slice(0, 200),
+        campaign_id: campaignId,
+        daily_budget: String(budgetCents),
+        billing_event: "IMPRESSIONS",
+        bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+        bid_constraints: "{}",
+        optimization_goal: "LINK_CLICKS",
+        destination_type: "WEBSITE",
+        targeting: JSON.stringify(metaTargeting),
+        status: "PAUSED",
+        access_token: token,
+      });
       const adSetRes = await axios.post<{ id: string }>(
         `https://graph.facebook.com/v21.0/${adAccountId}/adsets`,
-        null,
-        {
-          params: {
-            name: `${exp.name} - Ad Set`.slice(0, 200),
-            campaign_id: campaignId,
-            daily_budget: String(budgetCents),
-            billing_event: "IMPRESSIONS",
-            bid_strategy: "LOWEST_COST_WITHOUT_CAP",
-            optimization_goal: "LINK_CLICKS",
-            destination_type: "WEBSITE",
-            targeting: JSON.stringify(metaTargeting),
-            status: "PAUSED",
-            access_token: token,
-          },
-        }
+        adSetForm.toString(),
+        { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
       );
       const adSetId = adSetRes.data?.id;
       if (!adSetId) {
