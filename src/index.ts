@@ -1284,6 +1284,30 @@ function parseVariantsFromContent(content: string, count: number): string[] {
 
 const DEFAULT_META_TARGETING: Record<string, unknown> = { geo_locations: { countries: ["US"] } };
 
+/** User-visible detail from Meta Graph / Marketing API errors (helps debug "Invalid parameter"). */
+function metaMarketingApiErrorDetail(err: unknown): string {
+  if (err && typeof err === "object" && "response" in err) {
+    const ax = err as { response?: { data?: { error?: Record<string, unknown> } } };
+    const e = ax.response?.data?.error;
+    if (e && typeof e === "object") {
+      const message = typeof e.message === "string" ? e.message : "";
+      const userMsg = typeof e.error_user_msg === "string" ? e.error_user_msg : "";
+      const userTitle = typeof e.error_user_title === "string" ? e.error_user_title : "";
+      const subcode = e.error_subcode != null ? String(e.error_subcode) : "";
+      const blame = e.blame_field_specs;
+      const blameStr =
+        blame == null ? "" : typeof blame === "string" ? blame : JSON.stringify(blame);
+      const head = [message, userTitle, userMsg].filter((s) => s.trim()).join(" — ");
+      const base = head || "Meta API error";
+      const tail = [subcode && `subcode ${subcode}`, blameStr && blameStr !== "{}" && `fields ${blameStr}`]
+        .filter(Boolean)
+        .join("; ");
+      return tail ? `${base} (${tail})` : base;
+    }
+  }
+  return err instanceof Error ? err.message : "Meta API error";
+}
+
 type AiMetaTargetingShape = {
   countries?: string[];
   age_min?: number;
@@ -1911,6 +1935,21 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     const adAccountId = metaAdAccountId.startsWith("act_") ? metaAdAccountId : `act_${metaAdAccountId}`;
     const token = metaConn.accessToken;
 
+    if (!landingPageUrl || landingPageUrl === "https://example.com") {
+      return res.status(400).json({
+        error:
+          "Enter a real landing page URL (https://…) where ad clicks should go. A Facebook Page is only for the ad identity; it is not the same as this website link.",
+      });
+    }
+    try {
+      new URL(landingPageUrl);
+    } catch {
+      return res.status(400).json({ error: "Landing page URL must be a full URL, e.g. https://yoursite.com/booking" });
+    }
+    if (!/^https:\/\//i.test(landingPageUrl)) {
+      return res.status(400).json({ error: "Use an https:// URL for the landing page (Meta link ads require a valid secure URL)." });
+    }
+
     try {
       // Meta ad creatives for link ads typically require a Page id in object_story_spec.
       // We fetch the first available Page the user can access.
@@ -1954,7 +1993,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
       }
       data.metaCampaignId = campaignId;
 
-      // 2. Create Ad Set (daily_budget in cents)
+      // 2. Create Ad Set (daily_budget in cents). Link lives on creatives; promoted_object+link here often triggers vague "Invalid parameter".
       const budgetCents = Math.round(exp.totalDailyBudget * 100);
       const adSetRes = await axios.post<{ id: string }>(
         `https://graph.facebook.com/v21.0/${adAccountId}/adsets`,
@@ -1967,7 +2006,6 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
             billing_event: "IMPRESSIONS",
             optimization_goal: "LINK_CLICKS",
             destination_type: "WEBSITE",
-            promoted_object: JSON.stringify({ link: landingPageUrl }),
             targeting: JSON.stringify(metaTargeting),
             status: "PAUSED",
             access_token: token,
@@ -2014,7 +2052,8 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
             link: landingPageUrl,
             message: (v.copy || "").slice(0, 1250),
             name: (exp.name + ` - Variant ${i + 1}`).slice(0, 40),
-            call_to_action: { type: "LEARN_MORE" },
+            // Meta rejects many link ads without value.link on the CTA ("Invalid parameter").
+            call_to_action: { type: "LEARN_MORE", value: { link: landingPageUrl } },
           },
         });
 
@@ -2057,12 +2096,13 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
         );
       }
     } catch (err: unknown) {
-      const msg =
+      const msg = metaMarketingApiErrorDetail(err);
+      const full =
         err && typeof err === "object" && "response" in err
-          ? (err as { response?: { data?: { error?: { message?: string } } } }).response?.data?.error?.message
-          : err instanceof Error ? err.message : "Meta API error";
-      console.error("[Meta launch]", msg);
-      return res.status(502).json({ error: typeof msg === "string" ? msg : "Failed to create Meta campaign" });
+          ? (err as { response?: { data?: unknown } }).response?.data
+          : undefined;
+      console.error("[Meta launch]", msg, full ? JSON.stringify(full) : "");
+      return res.status(502).json({ error: msg });
     }
   }
 
