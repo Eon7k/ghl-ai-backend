@@ -2005,6 +2005,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
             campaign_id: campaignId,
             daily_budget: String(budgetCents),
             billing_event: "IMPRESSIONS",
+            bid_strategy: "LOWEST_COST_WITHOUT_CAP",
             optimization_goal: "LINK_CLICKS",
             destination_type: "WEBSITE",
             targeting: JSON.stringify(metaTargeting),
