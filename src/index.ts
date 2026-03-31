@@ -1973,7 +1973,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
         ? await buildMetaTargetingFromDescription(audienceForTargeting)
         : { ...DEFAULT_META_TARGETING };
 
-      // 1. Create Campaign
+      // 1. Create Campaign (ad set has daily_budget, so not CBO — Meta requires explicit is_adset_budget_sharing_enabled)
       const campaignRes = await axios.post<{ id: string }>(
         `https://graph.facebook.com/v21.0/${adAccountId}/campaigns`,
         null,
@@ -1983,6 +1983,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
             objective: "OUTCOME_TRAFFIC",
             status: "PAUSED",
             special_ad_categories: "[]",
+            is_adset_budget_sharing_enabled: "false",
             access_token: token,
           },
         }
