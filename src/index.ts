@@ -2808,22 +2808,36 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
   const pt = pageToken || userToken;
   const pid = pageId;
 
-  await push("pages_manage_ads", "pages_manage_ads", ["captureLeads"], `GET ${META_V}/{{pageId}}/ads`, async () => {
-    if (!pid) return { ok: false, detail: "Skipped — no page id (fix pages_show_list first)." };
-    try {
-      const q = new URLSearchParams({ fields: "id", limit: "1", access_token: pt });
-      await axios.get(`${graphBase}/${pid}/ads?${q}`);
-      return { ok: true };
-    } catch {
-      try {
-        const q2 = new URLSearchParams({ fields: "id", limit: "1", access_token: pt });
-        await axios.get(`${graphBase}/${pid}/promotable_posts?${q2}`);
-        return { ok: true };
-      } catch (e2) {
-        return { ok: false, detail: metaMarketingApiErrorDetail(e2) };
+  // pages_manage_ads: /promotable_posts was removed (error #100). Prefer ads_posts (NPE) then /ads; try page + user tokens.
+  await push(
+    "pages_manage_ads",
+    "pages_manage_ads",
+    ["captureLeads"],
+    `GET ${META_V}/{{pageId}}/ads_posts → /ads`,
+    async () => {
+      if (!pid) return { ok: false, detail: "Skipped — no page id (fix pages_show_list first)." };
+      const tries: { path: string; token: string; extra?: Record<string, string> }[] = [
+        { path: `${pid}/ads_posts`, token: pt, extra: { limit: "1" } },
+        { path: `${pid}/ads_posts`, token: userToken, extra: { limit: "1" } },
+        { path: `${pid}/ads`, token: pt, extra: { fields: "id", limit: "1" } },
+        { path: `${pid}/ads`, token: userToken, extra: { fields: "id", limit: "1" } },
+      ];
+      let lastDetail = "";
+      for (const t of tries) {
+        try {
+          const q = new URLSearchParams({ access_token: t.token, ...(t.extra || {}) });
+          await axios.get(`${graphBase}/${t.path}?${q}`);
+          return { ok: true };
+        } catch (e) {
+          lastDetail = metaMarketingApiErrorDetail(e);
+        }
       }
+      return {
+        ok: false,
+        detail: `${lastDetail} — In Meta Business Suite, give this Facebook user ADVERTISE or Full control on the Page, then disconnect/reconnect Meta.`,
+      };
     }
-  });
+  );
 
   await push(
     "leads_retrieval",
@@ -2832,13 +2846,20 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
     `GET ${META_V}/{{pageId}}/leadgen_forms`,
     async () => {
       if (!pid) return { ok: false, detail: "Skipped — no page id (fix pages_show_list first)." };
-      try {
-        const q = new URLSearchParams({ fields: "id", limit: "10", access_token: pt });
-        await axios.get(`${graphBase}/${pid}/leadgen_forms?${q}`);
-        return { ok: true };
-      } catch (e) {
-        return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+      let lastDetail = "";
+      for (const token of [pt, userToken]) {
+        try {
+          const q = new URLSearchParams({ fields: "id", limit: "10", access_token: token });
+          await axios.get(`${graphBase}/${pid}/leadgen_forms?${q}`);
+          return { ok: true };
+        } catch (e) {
+          lastDetail = metaMarketingApiErrorDetail(e);
+        }
       }
+      return {
+        ok: false,
+        detail: `${lastDetail} — Needs pages_manage_ads + Page access to lead forms; fix pages_manage_ads row and Page roles first.`,
+      };
     }
   );
 
