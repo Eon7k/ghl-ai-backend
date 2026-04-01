@@ -500,8 +500,9 @@ app.get("/integrations/meta/connect", async (req: Request, res: Response) => {
   }
   const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
   const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/meta/callback`;
-  // pages_show_list is needed so we can fetch a Page id for object_story_spec (required for link ad creatives).
-  const scope = "ads_management,ads_read,business_management,pages_show_list";
+  // Includes permissions needed for Meta App Dashboard permission testing (leads, pages, ads_read, profile/email).
+  const scope =
+    "public_profile,email,ads_management,ads_read,business_management,pages_show_list,pages_manage_ads,leads_retrieval";
   const state = userId;
   const metaAuthUrl = `https://www.facebook.com/v21.0/dialog/oauth?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${encodeURIComponent(state)}`;
   res.redirect(302, metaAuthUrl);
@@ -2711,6 +2712,202 @@ app.get("/admin/ai-performance", requireAuth, requireAdmin, async (_req: AuthReq
   );
 
   res.json({ byProvider });
+});
+
+/** Meta App Dashboard: exercise Marketing API permissions (Graph calls) using the admin user's stored Meta token. */
+app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  const META_V = "v21.0";
+  const graphBase = `https://graph.facebook.com/${META_V}`;
+  const uid = req.user!.id;
+  const metaConn = await prisma.connectedAccount.findFirst({
+    where: { userId: uid, platform: "meta" },
+  });
+  if (!metaConn) {
+    return res.status(400).json({
+      error:
+        "No Meta token on this admin user. Sign in as this admin, open Integrations, connect Meta, then reconnect if you just added permissions in Meta.",
+    });
+  }
+  const userToken = metaConn.accessToken;
+
+  type UC = "captureLeads" | "measurePerformance";
+  type Row = { id: string; label: string; useCases: UC[]; request: string; ok: boolean; detail?: string };
+  const results: Row[] = [];
+
+  const push = async (
+    id: string,
+    label: string,
+    useCases: UC[],
+    request: string,
+    fn: () => Promise<{ ok: boolean; detail?: string }>
+  ) => {
+    const r = await fn();
+    results.push({ id, label, useCases, request, ok: r.ok, detail: r.detail });
+  };
+
+  let pageId: string | null = null;
+  let pageToken: string | null = null;
+  let adAct: string | null = null;
+
+  await push(
+    "public_profile",
+    "public_profile",
+    ["captureLeads", "measurePerformance"],
+    `GET ${META_V}/me?fields=id,name`,
+    async () => {
+      try {
+        const q = new URLSearchParams({ fields: "id,name", access_token: userToken });
+        await axios.get(`${graphBase}/me?${q}`);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+      }
+    }
+  );
+
+  await push("email", "email", ["captureLeads", "measurePerformance"], `GET ${META_V}/me?fields=email`, async () => {
+    try {
+      const q = new URLSearchParams({ fields: "email", access_token: userToken });
+      await axios.get(`${graphBase}/me?${q}`);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+    }
+  });
+
+  await push(
+    "pages_show_list",
+    "pages_show_list",
+    ["captureLeads", "measurePerformance"],
+    `GET ${META_V}/me/accounts?fields=id,name,access_token`,
+    async () => {
+      try {
+        const q = new URLSearchParams({
+          fields: "id,name,access_token",
+          limit: "10",
+          access_token: userToken,
+        });
+        const r = await axios.get<{ data?: { id: string; access_token?: string }[] }>(`${graphBase}/me/accounts?${q}`);
+        const first = r.data?.data?.[0];
+        if (!first?.id) {
+          return {
+            ok: false,
+            detail:
+              "No Pages returned for this user. Create a Facebook Page and grant access, then reconnect Meta.",
+          };
+        }
+        pageId = first.id;
+        pageToken = first.access_token || userToken;
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+      }
+    }
+  );
+
+  const pt = pageToken || userToken;
+  const pid = pageId;
+
+  await push("pages_manage_ads", "pages_manage_ads", ["captureLeads"], `GET ${META_V}/{{pageId}}/ads`, async () => {
+    if (!pid) return { ok: false, detail: "Skipped — no page id (fix pages_show_list first)." };
+    try {
+      const q = new URLSearchParams({ fields: "id", limit: "1", access_token: pt });
+      await axios.get(`${graphBase}/${pid}/ads?${q}`);
+      return { ok: true };
+    } catch {
+      try {
+        const q2 = new URLSearchParams({ fields: "id", limit: "1", access_token: pt });
+        await axios.get(`${graphBase}/${pid}/promotable_posts?${q2}`);
+        return { ok: true };
+      } catch (e2) {
+        return { ok: false, detail: metaMarketingApiErrorDetail(e2) };
+      }
+    }
+  });
+
+  await push(
+    "leads_retrieval",
+    "leads_retrieval",
+    ["captureLeads"],
+    `GET ${META_V}/{{pageId}}/leadgen_forms`,
+    async () => {
+      if (!pid) return { ok: false, detail: "Skipped — no page id (fix pages_show_list first)." };
+      try {
+        const q = new URLSearchParams({ fields: "id", limit: "10", access_token: pt });
+        await axios.get(`${graphBase}/${pid}/leadgen_forms?${q}`);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+      }
+    }
+  );
+
+  const bodyAct = typeof req.body?.metaAdAccountId === "string" ? req.body.metaAdAccountId.trim() : "";
+  if (bodyAct) {
+    adAct = bodyAct.startsWith("act_") ? bodyAct : `act_${bodyAct}`;
+  } else {
+    try {
+      const q = new URLSearchParams({ fields: "id", limit: "1", access_token: userToken });
+      const r = await axios.get<{ data?: { id: string }[] }>(`${graphBase}/me/adaccounts?${q}`);
+      adAct = r.data?.data?.[0]?.id ?? null;
+    } catch {
+      adAct = null;
+    }
+  }
+
+  await push(
+    "ads_management_standard",
+    "Ads Management Standard Access",
+    ["captureLeads", "measurePerformance"],
+    `GET ${META_V}/act_*/campaigns`,
+    async () => {
+      if (!adAct) {
+        return {
+          ok: false,
+          detail:
+            "No ad account — add metaAdAccountId in the request body (e.g. act_5051…) or ensure this Meta user has ad accounts.",
+        };
+      }
+      try {
+        const q = new URLSearchParams({ fields: "id,name", limit: "1", access_token: userToken });
+        await axios.get(`${graphBase}/${adAct}/campaigns?${q}`);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+      }
+    }
+  );
+
+  await push(
+    "ads_account_insights",
+    "Ad account insights (measure performance / ads_read)",
+    ["measurePerformance"],
+    `GET ${META_V}/act_*/insights?fields=impressions`,
+    async () => {
+      if (!adAct) return { ok: false, detail: "Skipped — no ad account id." };
+      try {
+        const q = new URLSearchParams({
+          fields: "impressions",
+          date_preset: "last_7d",
+          limit: "1",
+          access_token: userToken,
+        });
+        await axios.get(`${graphBase}/${adAct}/insights?${q}`);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+      }
+    }
+  );
+
+  res.json({
+    summary: {
+      adAccountId: adAct,
+      pageId: pid,
+      allOk: results.every((r) => r.ok),
+    },
+    results,
+  });
 });
 
 process.on("uncaughtException", (err) => {
