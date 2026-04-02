@@ -500,9 +500,9 @@ app.get("/integrations/meta/connect", async (req: Request, res: Response) => {
   }
   const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
   const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/meta/callback`;
-  // Includes permissions needed for Meta App Dashboard permission testing (leads, pages, ads_read, profile/email).
+  // Meta App Review / Testing: profile, email, Page tasks (read + manage ads), leads, Marketing API read.
   const scope =
-    "public_profile,email,ads_management,ads_read,business_management,pages_show_list,pages_manage_ads,leads_retrieval";
+    "public_profile,email,ads_management,ads_read,business_management,pages_show_list,pages_read_engagement,pages_manage_ads,leads_retrieval";
   const state = userId;
   const metaAuthUrl = `https://www.facebook.com/v21.0/dialog/oauth?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${encodeURIComponent(state)}`;
   res.redirect(302, metaAuthUrl);
@@ -2747,6 +2747,8 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
 
   let pageId: string | null = null;
   let pageToken: string | null = null;
+  /** Page tasks from me/accounts (e.g. ADVERTISE, MANAGE) — required for ads_posts / leadgen on many Pages. */
+  let pageTasks: string[] = [];
   let adAct: string | null = null;
 
   await push(
@@ -2779,15 +2781,17 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
     "pages_show_list",
     "pages_show_list",
     ["captureLeads", "measurePerformance"],
-    `GET ${META_V}/me/accounts?fields=id,name,access_token`,
+    `GET ${META_V}/me/accounts?fields=id,name,access_token,tasks`,
     async () => {
       try {
         const q = new URLSearchParams({
-          fields: "id,name,access_token",
+          fields: "id,name,access_token,tasks",
           limit: "10",
           access_token: userToken,
         });
-        const r = await axios.get<{ data?: { id: string; access_token?: string }[] }>(`${graphBase}/me/accounts?${q}`);
+        const r = await axios.get<{
+          data?: { id: string; access_token?: string; tasks?: string[] }[];
+        }>(`${graphBase}/me/accounts?${q}`);
         const first = r.data?.data?.[0];
         if (!first?.id) {
           return {
@@ -2798,6 +2802,7 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
         }
         pageId = first.id;
         pageToken = first.access_token || userToken;
+        pageTasks = Array.isArray(first.tasks) ? first.tasks : [];
         return { ok: true };
       } catch (e) {
         return { ok: false, detail: metaMarketingApiErrorDetail(e) };
@@ -2805,22 +2810,52 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
     }
   );
 
+  await push(
+    "pages_read_engagement",
+    "pages_read_engagement",
+    ["captureLeads", "measurePerformance"],
+    `GET ${META_V}/{{pageId}}/feed?fields=id`,
+    async () => {
+      if (!pageId) return { ok: false, detail: "Skipped — no page id." };
+      const tok = pageToken || userToken;
+      let last = "";
+      for (const token of [tok, userToken]) {
+        try {
+          const q = new URLSearchParams({ fields: "id", limit: "1", access_token: token });
+          await axios.get(`${graphBase}/${pageId}/feed?${q}`);
+          return { ok: true };
+        } catch (e) {
+          last = metaMarketingApiErrorDetail(e);
+        }
+      }
+      return { ok: false, detail: last };
+    }
+  );
+
   const pt = pageToken || userToken;
   const pid = pageId;
 
-  // pages_manage_ads: /promotable_posts was removed (error #100). Prefer ads_posts (NPE) then /ads; try page + user tokens.
+  // pages_manage_ads: try NPE ads_posts first, then classic /ads, published_posts; page token + user token.
   await push(
     "pages_manage_ads",
     "pages_manage_ads",
     ["captureLeads"],
-    `GET ${META_V}/{{pageId}}/ads_posts → /ads`,
+    `GET ads_posts → ads → published_posts (page + user token)`,
     async () => {
       if (!pid) return { ok: false, detail: "Skipped — no page id (fix pages_show_list first)." };
+      const taskHint =
+        pageTasks.length && !pageTasks.some((x) => String(x).toUpperCase().includes("ADVERTISE"))
+          ? ` Your Page tasks from Graph: [${pageTasks.join(", ")}] — add ADVERTISE (or Full control) for this profile on this Page in Business settings.`
+          : pageTasks.length
+            ? ` Page tasks: [${pageTasks.join(", ")}].`
+            : "";
       const tries: { path: string; token: string; extra?: Record<string, string> }[] = [
         { path: `${pid}/ads_posts`, token: pt, extra: { limit: "1" } },
         { path: `${pid}/ads_posts`, token: userToken, extra: { limit: "1" } },
         { path: `${pid}/ads`, token: pt, extra: { fields: "id", limit: "1" } },
         { path: `${pid}/ads`, token: userToken, extra: { fields: "id", limit: "1" } },
+        { path: `${pid}/published_posts`, token: pt, extra: { fields: "id", limit: "1" } },
+        { path: `${pid}/published_posts`, token: userToken, extra: { fields: "id", limit: "1" } },
       ];
       let lastDetail = "";
       for (const t of tries) {
@@ -2834,7 +2869,7 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
       }
       return {
         ok: false,
-        detail: `${lastDetail} — In Meta Business Suite, give this Facebook user ADVERTISE or Full control on the Page, then disconnect/reconnect Meta.`,
+        detail: `${lastDetail}.${taskHint} If all edges fail, switch the Page to New Page Experience (Meta Page settings) or use an ad Page tied to your ad account, then reconnect Meta.`,
       };
     }
   );
@@ -2843,22 +2878,43 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
     "leads_retrieval",
     "leads_retrieval",
     ["captureLeads"],
-    `GET ${META_V}/{{pageId}}/leadgen_forms`,
+    `GET leadgen_forms then GET {{formId}}/leads`,
     async () => {
       if (!pid) return { ok: false, detail: "Skipped — no page id (fix pages_show_list first)." };
+      let formsBody: { data?: { id: string }[] } | null = null;
       let lastDetail = "";
       for (const token of [pt, userToken]) {
         try {
-          const q = new URLSearchParams({ fields: "id", limit: "10", access_token: token });
-          await axios.get(`${graphBase}/${pid}/leadgen_forms?${q}`);
-          return { ok: true };
+          const q = new URLSearchParams({ fields: "id", limit: "25", access_token: token });
+          const r = await axios.get<{ data?: { id: string }[] }>(`${graphBase}/${pid}/leadgen_forms?${q}`);
+          formsBody = r.data;
+          if (Array.isArray(formsBody?.data)) {
+            const formId = formsBody!.data![0]?.id;
+            if (formId) {
+              try {
+                const ql = new URLSearchParams({
+                  fields: "id,created_time",
+                  limit: "1",
+                  access_token: token,
+                });
+                await axios.get(`${graphBase}/${formId}/leads?${ql}`);
+              } catch (le) {
+                lastDetail = `Forms OK; leads edge: ${metaMarketingApiErrorDetail(le)}`;
+                /* listing forms succeeded — still count as partial success for debugging */
+              }
+            } else {
+              lastDetail =
+                "leadgen_forms returned 0 forms. Create at least one Instant Form on this Page (Meta Ads / Page Publishing Tools) so /leads can be tested.";
+            }
+            return { ok: true, detail: lastDetail || undefined };
+          }
         } catch (e) {
           lastDetail = metaMarketingApiErrorDetail(e);
         }
       }
       return {
         ok: false,
-        detail: `${lastDetail} — Needs pages_manage_ads + Page access to lead forms; fix pages_manage_ads row and Page roles first.`,
+        detail: `${lastDetail} — Fix pages_manage_ads + Page ADVERTISE task first; then create a lead form on the Page.`,
       };
     }
   );
@@ -2921,11 +2977,61 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
     }
   );
 
+  /** Extra ads_read ping: campaign insights (helps “Measure ad performance” checklist). */
+  await push(
+    "campaign_insights",
+    "Campaign insights (ads_read)",
+    ["measurePerformance"],
+    `GET campaign → insights`,
+    async () => {
+      if (!adAct) return { ok: false, detail: "Skipped — no ad account id." };
+      try {
+        const qc = new URLSearchParams({ fields: "id", limit: "1", access_token: userToken });
+        const cr = await axios.get<{ data?: { id: string }[] }>(`${graphBase}/${adAct}/campaigns?${qc}`);
+        const cid = cr.data?.data?.[0]?.id;
+        if (!cid) return { ok: true, detail: "No campaigns in account — ad account insights above still ran." };
+        const qi = new URLSearchParams({
+          fields: "impressions",
+          date_preset: "last_7d",
+          limit: "1",
+          access_token: userToken,
+        });
+        await axios.get(`${graphBase}/${cid}/insights?${qi}`);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+      }
+    }
+  );
+
+  const suggestions: string[] = [];
+  if (pageTasks.length && !pageTasks.some((x) => String(x).toUpperCase().includes("ADVERTISE"))) {
+    suggestions.push(
+      "Give this Facebook profile the ADVERTISE (or Admin / Full control) task on the Page used for ads (Business settings → Accounts → Pages)."
+    );
+  }
+  if (!results.find((r) => r.id === "pages_manage_ads")?.ok) {
+    suggestions.push(
+      "After fixing Page roles: Integrations → Disconnect Meta → Connect Meta again so the token includes pages_manage_ads."
+    );
+  }
+  suggestions.push(
+    "In developers.facebook.com → App → Testing: open each grey permission for “View details” — Meta may require one specific call; our button runs common calls for Ai Ad."
+  );
+  suggestions.push(
+    "Grey bubbles with high call counts: finish the whole use case (all required permissions green / 1 of 1 done), then use “Complete testing” if Meta shows it — not more random volume."
+  );
+  suggestions.push(
+    "To go Live for real ads: Publish app + App Review (Advanced Access) for ads permissions — testing alone is not production access."
+  );
+
   res.json({
     summary: {
       adAccountId: adAct,
       pageId: pid,
+      pageTasks,
       allOk: results.every((r) => r.ok),
+      suggestions,
     },
     results,
   });
