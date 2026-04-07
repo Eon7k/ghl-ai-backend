@@ -39,7 +39,7 @@ model ConnectedAccount {
   id                   String   @id @default(cuid())
   userId               String
   user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  platform             String   // meta | tiktok | google
+  platform             String   // meta | tiktok | google | linkedin
   accessToken          String
   refreshToken         String?
   platformAccountId    String?

@@ -1,4 +1,4 @@
-export type AdPlatform = "meta" | "google" | "tiktok";
+export type AdPlatform = "meta" | "google" | "tiktok" | "linkedin";
 
 export interface AdCopyPromptInput {
   offerDescription: string;
@@ -25,6 +25,11 @@ export function buildSystemPrompt(platform: AdPlatform): string {
       return (
         "You are an expert TikTok ads copywriter. " +
         "Write short, thumb-stopping copy with strong hooks and clear CTAs."
+      );
+    case "linkedin":
+      return (
+        "You are an expert LinkedIn ads copywriter. " +
+        "Write professional B2B-friendly copy with clear value props and CTAs suitable for LinkedIn feed and message ads."
       );
     default:
       return "You are a performance marketing ads copywriter.";
@@ -65,7 +70,9 @@ export function buildVariantsFromOnePrompt(adIdea: string, platform: AdPlatform,
       ? "Meta (Facebook/Instagram) feed ads: hook, benefit, CTA."
       : platform === "google"
         ? "Google Ads: headlines and short descriptions."
-        : "TikTok/short-form: punchy, scroll-stopping copy.";
+        : platform === "linkedin"
+          ? "LinkedIn: professional tone, headline + intro text, credible CTA."
+          : "TikTok/short-form: punchy, scroll-stopping copy.";
   return [
     "Below is an ad IDEA (topic/angle). Your job: write " + count + " completely NEW ad copies inspired by this idea.",
     "CRITICAL: Do NOT copy or repeat the idea text. Write fresh headlines and body text that SELL the idea (e.g. different hooks, benefits, CTAs). Each variant must be original ad copy, not the idea pasted again.",

@@ -16,6 +16,11 @@ import {
   googleAdsApiErrorMessage,
   googleAdsApiHeaders,
 } from "./googleMarketing";
+import {
+  listLinkedInAdAccounts,
+  refreshAndStoreLinkedInAccessToken,
+  linkedInApiErrorMessage,
+} from "./linkedinMarketing";
 
 // Only load .env file when NOT in production (so Render always uses its own env vars)
 if (process.env.NODE_ENV !== "production") {
@@ -211,6 +216,12 @@ const TIKTOK_APP_SECRET = (process.env.TIKTOK_APP_SECRET || process.env.TIKTOK_C
 const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || "").trim();
 const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || "").trim();
 const GOOGLE_ADS_DEVELOPER_TOKEN = (process.env.GOOGLE_ADS_DEVELOPER_TOKEN || "").trim();
+const LINKEDIN_CLIENT_ID = (process.env.LINKEDIN_CLIENT_ID || "").trim();
+const LINKEDIN_CLIENT_SECRET = (process.env.LINKEDIN_CLIENT_SECRET || "").trim();
+/** Space-separated OAuth scopes; default requests Marketing API read/write for ad accounts. Override if your app uses different approved scopes. */
+const LINKEDIN_OAUTH_SCOPES = (
+  process.env.LINKEDIN_OAUTH_SCOPES || "r_ads rw_ads"
+).trim();
 // Must be a full URL (https://...) so redirect after OAuth goes to the frontend, not a path on the backend
 function normalizeFrontendUrl(url: string): string {
   const trimmed = url.replace(/\/$/, "");
@@ -223,7 +234,7 @@ const FRONTEND_URL = normalizeFrontendUrl(process.env.FRONTEND_URL || "http://lo
 interface ConnectedAccountRecord {
   id: string;
   userId: string;
-  platform: "meta" | "tiktok" | "google";
+  platform: "meta" | "tiktok" | "google" | "linkedin";
   accessToken: string;
   refreshToken?: string;
   platformAccountId?: string;
@@ -742,6 +753,186 @@ app.get("/integrations/google/callback", async (req: Request, res: Response) => 
       ? (err as { response?: { data?: { error_description?: string } } }).response?.data?.error_description
       : err instanceof Error ? err.message : "Token exchange failed";
     res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(msg || "Google token exchange failed"))}`);
+  }
+});
+
+// ----- LinkedIn OAuth (Marketing API) -----
+app.get("/integrations/linkedin/connect", async (req: Request, res: Response) => {
+  const tokenParam = (req.query.token as string) || "";
+  const token =
+    tokenParam.trim() || (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null);
+  if (!token) {
+    return res.status(401).send("Missing token. Log in and use the Connect LinkedIn button from the app home.");
+  }
+  const viewingAs = typeof req.query.viewingAs === "string" ? req.query.viewingAs.trim() : "";
+  let userId: string;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as { userId: string };
+    const user = await prisma.user.findUnique({ where: { id: payload.userId } });
+    if (!user) return res.status(401).send("User not found");
+    const accountType = (user as { accountType?: string }).accountType ?? "single";
+    if (accountType === "agency" && viewingAs) {
+      const allowed = await prisma.agencyClient.findFirst({
+        where: { agencyUserId: user.id, clientUserId: viewingAs },
+      });
+      userId = allowed ? viewingAs : user.id;
+    } else {
+      userId = user.id;
+    }
+  } catch {
+    return res.status(401).send("Invalid or expired token. Please log in again.");
+  }
+  if (!LINKEDIN_CLIENT_ID || !LINKEDIN_CLIENT_SECRET) {
+    return res
+      .status(503)
+      .send("LinkedIn integration is not configured. Set LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET on the server.");
+  }
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
+  const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/linkedin/callback`;
+  const state = userId;
+  const scopeEncoded = encodeURIComponent(LINKEDIN_OAUTH_SCOPES.replace(/,/g, " ").replace(/\s+/g, " ").trim());
+  const authUrl =
+    `https://www.linkedin.com/oauth/v2/authorization?` +
+    `response_type=code` +
+    `&client_id=${encodeURIComponent(LINKEDIN_CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&state=${encodeURIComponent(state)}` +
+    `&scope=${scopeEncoded}`;
+  res.redirect(302, authUrl);
+});
+
+app.get("/integrations/linkedin/callback", async (req: Request, res: Response) => {
+  const { code, state: userId, error: liError } = req.query as { code?: string; state?: string; error?: string };
+  const frontendBase = FRONTEND_URL;
+  const redirectPath = "/";
+  if (liError || !code) {
+    const err = liError || "No authorization code received";
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(err))}`);
+    return;
+  }
+  const userLi = userId ? await prisma.user.findUnique({ where: { id: userId } }) : null;
+  if (!userLi) {
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("Invalid state")}`);
+    return;
+  }
+  if (!LINKEDIN_CLIENT_ID || !LINKEDIN_CLIENT_SECRET) {
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("LinkedIn not configured")}`);
+    return;
+  }
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
+  const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/linkedin/callback`;
+  try {
+    const tokenRes = await axios.post<{
+      access_token?: string;
+      expires_in?: number;
+      refresh_token?: string;
+      refresh_token_expires_in?: number;
+    }>(
+      "https://www.linkedin.com/oauth/v2/accessToken",
+      new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: LINKEDIN_CLIENT_ID,
+        client_secret: LINKEDIN_CLIENT_SECRET,
+      }).toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    const accessToken = tokenRes.data?.access_token;
+    if (!accessToken) {
+      res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent("No token from LinkedIn")}`);
+      return;
+    }
+    const refreshToken = tokenRes.data?.refresh_token;
+    const uid = userLi.id;
+    await prisma.connectedAccount.deleteMany({ where: { userId: uid, platform: "linkedin" } });
+    await prisma.connectedAccount.create({
+      data: {
+        userId: uid,
+        platform: "linkedin",
+        accessToken,
+        ...(refreshToken && { refreshToken }),
+      },
+    });
+    res.redirect(302, `${frontendBase}${redirectPath}?connected=linkedin`);
+  } catch (err: unknown) {
+    const msg =
+      err && typeof err === "object" && "response" in err
+        ? (err as { response?: { data?: { error?: string; error_description?: string } } }).response?.data
+            ?.error_description ||
+          (err as { response?: { data?: { error?: string } } }).response?.data?.error
+        : err instanceof Error
+          ? err.message
+          : "Token exchange failed";
+    console.error("[LinkedIn callback]", err);
+    res.redirect(302, `${frontendBase}${redirectPath}?error=${encodeURIComponent(String(msg || "LinkedIn token exchange failed"))}`);
+  }
+});
+
+app.get("/integrations/linkedin/ad-accounts", requireAuth, async (req: AuthRequest, res: Response) => {
+  const liConn = await prisma.connectedAccount.findFirst({
+    where: { userId: req.effectiveUserId ?? req.user!.id, platform: "linkedin" },
+  });
+  if (!liConn) {
+    return res.status(404).json({ error: "LinkedIn not connected. Connect LinkedIn on the home page first." });
+  }
+  let accessToken = liConn.accessToken;
+  try {
+    try {
+      const adAccounts = await listLinkedInAdAccounts(accessToken);
+      return res.json({ adAccounts });
+    } catch (first: unknown) {
+      const status = axios.isAxiosError(first) ? first.response?.status : undefined;
+      if (status === 401 && liConn.refreshToken && LINKEDIN_CLIENT_ID && LINKEDIN_CLIENT_SECRET) {
+        accessToken = await refreshAndStoreLinkedInAccessToken(
+          prisma,
+          liConn,
+          LINKEDIN_CLIENT_ID,
+          LINKEDIN_CLIENT_SECRET
+        );
+        const adAccounts = await listLinkedInAdAccounts(accessToken);
+        return res.json({ adAccounts });
+      }
+      throw first;
+    }
+  } catch (err: unknown) {
+    const msg = linkedInApiErrorMessage(err);
+    console.error("[LinkedIn ad-accounts]", msg);
+    return res.status(502).json({ error: msg });
+  }
+});
+
+app.get("/integrations/linkedin/test", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const liConn = await prisma.connectedAccount.findFirst({
+    where: { userId: uid, platform: "linkedin" },
+  });
+  if (!liConn) {
+    return res.status(400).json({ ok: false, error: "LinkedIn not connected." });
+  }
+  const linkedInConn = liConn;
+  async function countAccounts(): Promise<number> {
+    try {
+      return (await listLinkedInAdAccounts(linkedInConn.accessToken)).length;
+    } catch (first: unknown) {
+      const status = axios.isAxiosError(first) ? first.response?.status : undefined;
+      if (status === 401 && linkedInConn.refreshToken && LINKEDIN_CLIENT_ID && LINKEDIN_CLIENT_SECRET) {
+        const accessToken = await refreshAndStoreLinkedInAccessToken(
+          prisma,
+          linkedInConn,
+          LINKEDIN_CLIENT_ID,
+          LINKEDIN_CLIENT_SECRET
+        );
+        return (await listLinkedInAdAccounts(accessToken)).length;
+      }
+      throw first;
+    }
+  }
+  try {
+    const adAccountCount = await countAccounts();
+    return res.json({ ok: true, adAccountCount });
+  } catch (e: unknown) {
+    return res.status(502).json({ ok: false, error: linkedInApiErrorMessage(e) });
   }
 });
 
@@ -1309,6 +1500,25 @@ function metaMarketingApiErrorDetail(err: unknown): string {
   return err instanceof Error ? err.message : "Meta API error";
 }
 
+/** Shows whether `pages_read_engagement` is on the user token (needs META_APP_ID + META_APP_SECRET on server). */
+async function metaDebugUserTokenScopesSummary(userToken: string): Promise<string> {
+  if (!META_APP_ID || !META_APP_SECRET) return "";
+  try {
+    const appToken = `${META_APP_ID}|${META_APP_SECRET}`;
+    const q = new URLSearchParams({ input_token: userToken, access_token: appToken });
+    const r = await axios.get<{ data?: { scopes?: string[] } }>(`https://graph.facebook.com/v21.0/debug_token?${q}`);
+    const scopes = r.data?.data?.scopes;
+    if (Array.isArray(scopes) && scopes.length) {
+      const has = scopes.includes("pages_read_engagement");
+      const preview = scopes.length > 25 ? `${scopes.slice(0, 25).join(", ")}, …` : scopes.join(", ");
+      return ` Token scopes (debug_token): pages_read_engagement=${String(has)} · [${preview}]`;
+    }
+  } catch {
+    /* ignore */
+  }
+  return "";
+}
+
 type AiMetaTargetingShape = {
   countries?: string[];
   age_min?: number;
@@ -1527,7 +1737,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
 
     const platformsList: string[] =
       Array.isArray(platformsBody) && platformsBody.length > 0
-        ? platformsBody.filter((p: string) => p === "meta" || p === "google" || p === "tiktok")
+        ? platformsBody.filter((p: string) => p === "meta" || p === "google" || p === "tiktok" || p === "linkedin")
         : platformBody
           ? [platformBody]
           : [];
@@ -1880,6 +2090,12 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     include: { variants: true },
   });
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
+  if (exp.platform === "linkedin") {
+    return res.status(400).json({
+      error:
+        "LinkedIn Ads campaign launch is not implemented in this version. Connect LinkedIn to list ad accounts and build drafts here; publish from LinkedIn Campaign Manager for now.",
+    });
+  }
   const aiCreativeCount = req.body?.aiCreativeCount;
   const metaAdAccountId = typeof req.body?.metaAdAccountId === "string" ? req.body.metaAdAccountId.trim() : undefined;
   const googleAdsCustomerIdBody =
@@ -2384,7 +2600,7 @@ app.post("/experiments/:id/ai-performance-insights", requireAuth, async (req: Au
   const mode = (exp.aiOptimizationMode || "off").toLowerCase();
 
   const systemPrompt =
-    "You are a senior performance marketer. Analyze the JSON campaign snapshot for the given ad platform (meta, google, or tiktok). " +
+    "You are a senior performance marketer. Analyze the JSON campaign snapshot for the given ad platform (meta, google, tiktok, or linkedin). " +
     "If metrics are mostly zero or the data source is placeholder, state clearly that in-app data is limited and the user should verify spend and delivery in the native ad manager — still give 2–3 platform-appropriate optimization ideas. " +
     "Do not invent specific numbers that are not implied by the data. " +
     'Respond with ONLY valid JSON (no markdown) in this exact shape: {"summary":"one short paragraph","suggestions":["..."],"recommendedDailyBudget": number or null}. ' +
@@ -2814,21 +3030,32 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
     "pages_read_engagement",
     "pages_read_engagement",
     ["captureLeads", "measurePerformance"],
-    `GET ${META_V}/{{pageId}}/feed?fields=id`,
+    `GET feed / published_posts / photos (page + user token)`,
     async () => {
       if (!pageId) return { ok: false, detail: "Skipped — no page id." };
       const tok = pageToken || userToken;
+      const edges: { rel: string; params: Record<string, string> }[] = [
+        { rel: "feed", params: { fields: "id", limit: "1" } },
+        { rel: "published_posts", params: { fields: "id", limit: "1" } },
+        { rel: "photos", params: { fields: "id", limit: "1" } },
+      ];
       let last = "";
       for (const token of [tok, userToken]) {
-        try {
-          const q = new URLSearchParams({ fields: "id", limit: "1", access_token: token });
-          await axios.get(`${graphBase}/${pageId}/feed?${q}`);
-          return { ok: true };
-        } catch (e) {
-          last = metaMarketingApiErrorDetail(e);
+        for (const edge of edges) {
+          try {
+            const q = new URLSearchParams({ ...edge.params, access_token: token });
+            await axios.get(`${graphBase}/${pageId}/${edge.rel}?${q}`);
+            return { ok: true };
+          } catch (e) {
+            last = metaMarketingApiErrorDetail(e);
+          }
         }
       }
-      return { ok: false, detail: last };
+      const scopeHint = await metaDebugUserTokenScopesSummary(userToken);
+      return {
+        ok: false,
+        detail: `${last}.${scopeHint} Error (#10): your saved Meta token must include pages_read_engagement — open Integrations → Disconnect Meta → Connect Meta and accept every Page permission (then run tests again).`,
+      };
     }
   );
 
@@ -3005,6 +3232,11 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
   );
 
   const suggestions: string[] = [];
+  if (!results.find((r) => r.id === "pages_read_engagement")?.ok) {
+    suggestions.push(
+      "pages_read_engagement (#10): Reconnect Meta in your app (Disconnect → Connect) so the token includes that scope. Old tokens from before we added it to OAuth will always fail /feed until you reconnect."
+    );
+  }
   if (pageTasks.length && !pageTasks.some((x) => String(x).toUpperCase().includes("ADVERTISE"))) {
     suggestions.push(
       "Give this Facebook profile the ADVERTISE (or Admin / Full control) task on the Page used for ads (Business settings → Accounts → Pages)."
