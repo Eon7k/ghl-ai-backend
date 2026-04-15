@@ -1166,6 +1166,7 @@ export function createExpansionRouter(): Router {
         where: { id: watch.id },
         include: {
           insights: { orderBy: { generatedAt: "desc" }, take: 10 },
+          ads: { orderBy: { lastSeenAt: "desc" }, take: 30 },
           _count: { select: { ads: true, insights: true } },
         },
       });
