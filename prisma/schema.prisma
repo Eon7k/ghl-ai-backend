@@ -13,6 +13,8 @@ model User {
   passwordHash String
   /** single = one user, one account. agency = can switch between client accounts. */
   accountType  String    @default("single") // "single" | "agency"
+  /** Optional role for expansion RBAC: super_admin | agency_admin | agency_member | client_admin | client_member */
+  role         String    @default("user")
   /** If true, this user cannot log in (used for agency-managed clients without portal access). */
   loginDisabled Boolean  @default(false)
   createdAt    DateTime  @default(now())
@@ -23,6 +25,284 @@ model User {
   agencyClients   AgencyClient[]  @relation("AgencyClients")
   /** When this user is a client: agencies that can view their data. */
   managedByAgencies AgencyClient[]  @relation("AgencyManaged")
+  agencyBranding           AgencyBranding?
+  agencyKits               AgencyKit[]
+  landingPagesAsAgency     LandingPage[]       @relation("LandingPageAgency")
+  landingPagesAsClient     LandingPage[]       @relation("LandingPageClient")
+  reportConfigsAsAgency    ReportConfig[]      @relation("ReportConfigAgency")
+  reportConfigsAsClient    ReportConfig[]      @relation("ReportConfigClient")
+  generatedReportsAgency   GeneratedReport[]   @relation("GeneratedReportAgency")
+  generatedReportsClient   GeneratedReport[]   @relation("GeneratedReportClient")
+  dfyEngagementsAsAgency   DfyEngagement[]     @relation("DfyAgency")
+  dfyEngagementsAsClient   DfyEngagement[]     @relation("DfyClient")
+  competitorWatchesAgency  CompetitorWatch[]   @relation("CompetitorWatchAgency")
+  competitorWatchesClient  CompetitorWatch[]   @relation("CompetitorWatchClient")
+}
+
+// ----- MODULE 1: White-label branding (agency user = owner) -----
+model AgencyBranding {
+  id                            String   @id @default(cuid())
+  userId                        String   @unique
+  user                          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  brandName                     String   @db.VarChar(100)
+  logoUrl                       String?  @db.VarChar(500)
+  faviconUrl                    String?  @db.VarChar(500)
+  primaryColor                  String   @default("#2563eb") @db.VarChar(7)
+  secondaryColor                String   @default("#64748b") @db.VarChar(7)
+  accentColor                   String   @default("#7c3aed") @db.VarChar(7)
+  customDomain                  String?  @unique @db.VarChar(255)
+  customDomainVerified          Boolean  @default(false)
+  customDomainVerificationToken String?  @db.VarChar(100)
+  supportEmail                  String?  @db.VarChar(255)
+  supportUrl                    String?  @db.VarChar(500)
+  hidePoweredBy                 Boolean  @default(false)
+  onboardingWelcomeMessage      String?  @db.Text
+  createdAt                     DateTime @default(now())
+  updatedAt                     DateTime @updatedAt
+}
+
+// ----- MODULE 2: Vertical kits -----
+model VerticalKit {
+  id               String            @id @default(cuid())
+  name             String            @db.VarChar(100)
+  slug             String            @unique @db.VarChar(100)
+  description      String?           @db.Text
+  coverImageUrl    String?           @db.VarChar(500)
+  industryCategory String?           @db.VarChar(100)
+  isActive         Boolean           @default(true)
+  priceMonthly     Decimal           @default(0) @db.Decimal(10, 2)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  items            VerticalKitItem[]
+  agencyKits       AgencyKit[]
+}
+
+model VerticalKitItem {
+  id        String      @id @default(cuid())
+  kitId     String
+  kit       VerticalKit @relation(fields: [kitId], references: [id], onDelete: Cascade)
+  itemType  String      @db.VarChar(50) // ad_template | audience_preset | landing_page_template | campaign_structure | email_sequence
+  itemName  String      @db.VarChar(200)
+  itemData  Json
+  platform  String?     @db.VarChar(50)
+  createdAt DateTime    @default(now())
+}
+
+model AgencyKit {
+  id          String      @id @default(cuid())
+  agencyId    String
+  agency      User        @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  kitId       String
+  kit         VerticalKit @relation(fields: [kitId], references: [id], onDelete: Cascade)
+  assignedAt  DateTime    @default(now())
+  assignedBy  String?
+  isActive    Boolean     @default(true)
+  assets      AgencyKitAsset[]
+
+  @@unique([agencyId, kitId])
+}
+
+model AgencyKitAsset {
+  id        String   @id @default(cuid())
+  agencyKitId String
+  agencyKit   AgencyKit @relation(fields: [agencyKitId], references: [id], onDelete: Cascade)
+  itemType  String   @db.VarChar(50)
+  itemName  String   @db.VarChar(200)
+  itemData  Json
+  platform  String?  @db.VarChar(50)
+  createdAt DateTime @default(now())
+}
+
+// ----- MODULE 3: Landing pages -----
+model LandingPage {
+  id String    @id @default(cuid())
+  agencyId               String
+  agency                 User      @relation("LandingPageAgency", fields: [agencyId], references: [id], onDelete: Cascade)
+  clientId               String
+  client                 User      @relation("LandingPageClient", fields: [clientId], references: [id], onDelete: Cascade)
+  campaignId             String?
+  experiment Experiment? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  title                  String    @db.VarChar(200)
+  slug                   String    @db.VarChar(200)
+  status                 String    @default("draft") // draft | published | archived
+  hostingType            String    @default("platform") // platform | export
+  subdomain              String?   @db.VarChar(100)
+  pageData               Json @default("{}")
+  aiGenerationPrompt     String?   @db.Text
+  conversionGoal         String?   @db.VarChar(200)
+  conversionTrackingPixel String?  @db.Text
+  publishedAt            DateTime?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+  analytics              LandingPageAnalytics[]
+
+  @@unique([clientId, slug])
+}
+
+model LandingPageAnalytics {
+  id              String       @id @default(cuid())
+  pageId          String
+  page            LandingPage  @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  date            DateTime     @db.Date
+  visits          Int          @default(0)
+  uniqueVisits    Int          @default(0)
+  conversions     Int          @default(0)
+  avgTimeOnPage   Int          @default(0)
+  bounceRate      Decimal?     @db.Decimal(5, 2)
+  sourceBreakdown Json?
+
+  @@unique([pageId, date])
+}
+
+// ----- MODULE 4: Reports -----
+model ReportConfig {
+  id               String    @id @default(cuid())
+  agencyId         String
+  agency           User      @relation("ReportConfigAgency", fields: [agencyId], references: [id], onDelete: Cascade)
+  clientId         String
+  client           User      @relation("ReportConfigClient", fields: [clientId], references: [id], onDelete: Cascade)
+  reportName       String    @db.VarChar(200)
+  frequency        String    @db.VarChar(20) // weekly | biweekly | monthly | on_demand
+  sendDay          Int?
+  sendTime         String?   @db.VarChar(8)
+  emailRecipients  Json      @default("[]")
+  includeSections  Json      @default("{}")
+  reportFormat     String    @default("pdf") // pdf | html | both
+  isActive         Boolean   @default(true)
+  lastSentAt       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  generatedReports GeneratedReport[]
+}
+
+model GeneratedReport {
+  id                String       @id @default(cuid())
+  configId          String
+  config            ReportConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+  agencyId          String
+  agency            User         @relation("GeneratedReportAgency", fields: [agencyId], references: [id], onDelete: Cascade)
+  clientId          String
+  client            User         @relation("GeneratedReportClient", fields: [clientId], references: [id], onDelete: Cascade)
+  reportPeriodStart DateTime     @db.Date
+  reportPeriodEnd   DateTime     @db.Date
+  fileUrlPdf        String?      @db.VarChar(500)
+  fileUrlHtml       String?      @db.VarChar(500)
+  status            String       @default("generating") // generating | ready | failed
+  sentAt            DateTime?
+  sentTo            Json?
+  createdAt         DateTime     @default(now())
+}
+
+// ----- MODULE 5: DFY -----
+model DfyEngagement {
+  id                    String   @id @default(cuid())
+  agencyId              String
+  agency                User     @relation("DfyAgency", fields: [agencyId], references: [id], onDelete: Cascade)
+  clientId              String
+  client                User     @relation("DfyClient", fields: [clientId], references: [id], onDelete: Cascade)
+  status                String   @default("onboarding")
+  serviceTier           String?  @db.VarChar(100)
+  monthlyAdBudget       Decimal? @db.Decimal(12, 2)
+  managementFee         Decimal? @db.Decimal(10, 2)
+  billingCycle          String?  @db.VarChar(20)
+  startDate             DateTime @db.Date
+  endDate               DateTime? @db.Date
+  onboardingCompletedAt DateTime?
+  notes                 String?  @db.Text
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  onboardingSteps       DfyOnboardingStep[]
+  activityLog           DfyActivityLog[]
+  clientMessages        DfyClientMessage[]
+}
+
+model DfyOnboardingStep {
+  id String        @id @default(cuid())
+  engagementId   String
+  engagement     DfyEngagement @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+  stepName       String        @db.VarChar(200)
+  stepOrder      Int
+  status         String        @default("pending")
+  assignedTo     String?
+  dueDate        DateTime?     @db.Date
+  completedAt    DateTime?
+  notes          String?       @db.Text
+}
+
+model DfyActivityLog {
+  id String        @id @default(cuid())
+  engagementId String
+  engagement   DfyEngagement @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+  loggedBy     String
+  activityType String        @db.VarChar(50)
+  title        String        @db.VarChar(200)
+  body         String?       @db.Text
+  createdAt    DateTime      @default(now())
+}
+
+model DfyClientMessage {
+  id           String        @id @default(cuid())
+  engagementId String
+  engagement   DfyEngagement @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+  senderId     String
+  senderType   String        @db.VarChar(20)
+  message      String        @db.Text
+  isRead       Boolean       @default(false)
+  createdAt    DateTime      @default(now())
+}
+
+// ----- MODULE 6: Competitor spy -----
+model CompetitorWatch {
+  id                         String   @id @default(cuid())
+  agencyId                   String
+  agency                     User     @relation("CompetitorWatchAgency", fields: [agencyId], references: [id], onDelete: Cascade)
+  clientId                   String
+  client                     User     @relation("CompetitorWatchClient", fields: [clientId], references: [id], onDelete: Cascade)
+  competitorName             String   @db.VarChar(200)
+  competitorWebsite          String?  @db.VarChar(500)
+  competitorFacebookPageId   String?  @db.VarChar(200)
+  competitorGoogleAdvertiserId String? @db.VarChar(200)
+  keywords                   Json     @default("[]")
+  platforms                  Json     @default("[]")
+  isActive                   Boolean  @default(true)
+  lastScannedAt              DateTime?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+  ads                        CompetitorAd[]
+  insights                   CompetitorInsight[]
+}
+
+model CompetitorAd {
+  id                String          @id @default(cuid())
+  watchId           String
+  watch             CompetitorWatch @relation(fields: [watchId], references: [id], onDelete: Cascade)
+  platform          String          @db.VarChar(50)
+  adLibraryId       String          @db.VarChar(200)
+  adType            String?         @db.VarChar(50)
+  headline          String?         @db.Text
+  bodyText          String?         @db.Text
+  ctaText           String?         @db.VarChar(100)
+  destinationUrl    String?         @db.VarChar(500)
+  mediaUrl          String?         @db.VarChar(500)
+  firstSeenAt       DateTime        @default(now())
+  lastSeenAt        DateTime        @default(now())
+  estimatedRunDays  Int             @default(0)
+  rawData           Json?
+  createdAt         DateTime        @default(now())
+
+  @@unique([watchId, platform, adLibraryId])
+}
+
+model CompetitorInsight {
+  id                     String          @id @default(cuid())
+  watchId                String
+  watch                  CompetitorWatch @relation(fields: [watchId], references: [id], onDelete: Cascade)
+  generatedAt            DateTime        @default(now())
+  summary                String @db.Text
+  topThemes              Json            @default("[]")
+  suggestedCounterAngles Json            @default("[]")
+  strongestAds           Json            @default("[]")
+  rawPromptUsed          String?         @db.Text
 }
 
 model AgencyClient {
@@ -79,6 +359,7 @@ model Experiment {
   /** AI optimization: off | suggestions | auto (auto applies Meta ad-set budget only when API recommends). */
   aiOptimizationMode  String   @default("off")
   variants           Variant[]
+  landingPages       LandingPage[]
 }
 
 model Variant {

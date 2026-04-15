@@ -21,6 +21,7 @@ import {
   refreshAndStoreLinkedInAccessToken,
   linkedInApiErrorMessage,
 } from "./linkedinMarketing";
+import { attachBrandingHost, createExpansionRouter, EXPANSION_UPLOADS_ROOT } from "./expansionApi";
 
 // Only load .env file when NOT in production (so Render always uses its own env vars)
 if (process.env.NODE_ENV !== "production") {
@@ -64,6 +65,9 @@ app.use(
 );
 // Creative uploads send base64 JSON; default 100kb limit breaks "nothing happens" on the client.
 app.use(express.json({ limit: "25mb" }));
+app.use(attachBrandingHost);
+app.use("/uploads", express.static(EXPANSION_UPLOADS_ROOT));
+app.use("/api", createExpansionRouter());
 
 const PORT = process.env.PORT || 4000;
 const OPTIMIZER_URL = process.env.OPTIMIZER_URL || "http://localhost:5001";

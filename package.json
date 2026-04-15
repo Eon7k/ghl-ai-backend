@@ -19,16 +19,18 @@
     "dotenv": "^16.4.0",
     "express": "^4.19.0",
     "jsonwebtoken": "^9.0.2",
+    "multer": "^2.1.1",
     "openai": "^6.29.0",
     "typescript": "^5.6.0"
   },
   "devDependencies": {
-    "prisma": "^6.0.0",
     "@types/bcryptjs": "^2.4.6",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/jsonwebtoken": "^9.0.7",
+    "@types/multer": "^2.1.0",
     "@types/node": "^22.0.0",
+    "prisma": "^6.0.0",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0"
   },
