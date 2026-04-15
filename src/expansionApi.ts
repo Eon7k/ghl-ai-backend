@@ -486,7 +486,7 @@ export function createExpansionRouter(): Router {
           where: { agencyUserId: u.id, clientUserId: eff },
         });
         if (!link) {
-          apiErr(res, 403, "FORBIDDEN", "Not allowed to manage this client's landing pages");
+          apiErr(res, 403, "FORBIDDEN", "Not allowed to manage this client's data");
           return null;
         }
       }
@@ -750,6 +750,432 @@ export function createExpansionRouter(): Router {
     }
   });
 
+  function parseStringArray(val: unknown, maxItemLen: number): string[] {
+    if (!Array.isArray(val)) return [];
+    const out: string[] = [];
+    for (const x of val) {
+      if (typeof x !== "string") continue;
+      const t = x.trim();
+      if (t) out.push(t.slice(0, maxItemLen));
+    }
+    return out;
+  }
+
+  // ----- Module 4: Report configs & history -----
+  r.get("/agency/reports/configs", expansionRequireAuth, expansionRequireProduct("reports"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const configs = await prisma.reportConfig.findMany({
+        where: { agencyId: scope.agencyId, clientId: scope.clientId },
+        orderBy: { updatedAt: "desc" },
+        include: { _count: { select: { generatedReports: true } } },
+      });
+      return res.json({ configs });
+    } catch (e) {
+      console.error("[GET report configs]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not list report configs");
+    }
+  });
+
+  r.post("/agency/reports/configs", expansionRequireAuth, expansionRequireProduct("reports"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const b = req.body || {};
+      const reportName =
+        typeof b.reportName === "string" && b.reportName.trim() ? b.reportName.trim().slice(0, 200) : "";
+      if (!reportName) return apiErr(res, 400, "VALIDATION", "reportName is required");
+      const frequency =
+        typeof b.frequency === "string" && ["weekly", "biweekly", "monthly", "on_demand"].includes(b.frequency)
+          ? b.frequency
+          : "monthly";
+      const sendDay =
+        typeof b.sendDay === "number" && Number.isInteger(b.sendDay) && b.sendDay >= 0 && b.sendDay <= 6
+          ? b.sendDay
+          : null;
+      const sendTime =
+        typeof b.sendTime === "string" && /^\d{2}:\d{2}$/.test(b.sendTime.trim()) ? b.sendTime.trim() : null;
+      const emailRecipients = parseStringArray(b.emailRecipients, 320) as Prisma.InputJsonValue;
+      let includeSections: Prisma.InputJsonValue = {};
+      if (b.includeSections !== undefined && b.includeSections !== null && typeof b.includeSections === "object") {
+        includeSections = b.includeSections as Prisma.InputJsonValue;
+      }
+      const reportFormat =
+        typeof b.reportFormat === "string" && ["pdf", "html", "both"].includes(b.reportFormat)
+          ? b.reportFormat
+          : "pdf";
+      const isActive = typeof b.isActive === "boolean" ? b.isActive : true;
+
+      const row = await prisma.reportConfig.create({
+        data: {
+          agencyId: scope.agencyId,
+          clientId: scope.clientId,
+          reportName,
+          frequency,
+          sendDay,
+          sendTime,
+          emailRecipients,
+          includeSections,
+          reportFormat,
+          isActive,
+        },
+        include: { _count: { select: { generatedReports: true } } },
+      });
+      return res.status(201).json({ config: row });
+    } catch (e) {
+      console.error("[POST report config]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not create report config");
+    }
+  });
+
+  r.get("/agency/reports/configs/:id", expansionRequireAuth, expansionRequireProduct("reports"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const row = await prisma.reportConfig.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+        include: { _count: { select: { generatedReports: true } } },
+      });
+      if (!row) return apiErr(res, 404, "NOT_FOUND", "Report config not found");
+      return res.json({ config: row });
+    } catch (e) {
+      console.error("[GET report config]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not load report config");
+    }
+  });
+
+  r.patch("/agency/reports/configs/:id", expansionRequireAuth, expansionRequireProduct("reports"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const existing = await prisma.reportConfig.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (!existing) return apiErr(res, 404, "NOT_FOUND", "Report config not found");
+      const b = req.body || {};
+      const data: Prisma.ReportConfigUncheckedUpdateInput = {};
+      if (typeof b.reportName === "string" && b.reportName.trim()) data.reportName = b.reportName.trim().slice(0, 200);
+      if (typeof b.frequency === "string" && ["weekly", "biweekly", "monthly", "on_demand"].includes(b.frequency)) {
+        data.frequency = b.frequency;
+      }
+      if (b.sendDay !== undefined) {
+        data.sendDay =
+          b.sendDay === null
+            ? null
+            : typeof b.sendDay === "number" && Number.isInteger(b.sendDay) && b.sendDay >= 0 && b.sendDay <= 6
+              ? b.sendDay
+              : undefined;
+      }
+      if (b.sendTime !== undefined) {
+        data.sendTime =
+          b.sendTime === null || b.sendTime === ""
+            ? null
+            : typeof b.sendTime === "string" && /^\d{2}:\d{2}$/.test(String(b.sendTime).trim())
+              ? String(b.sendTime).trim()
+              : undefined;
+      }
+      if (b.emailRecipients !== undefined) {
+        data.emailRecipients = parseStringArray(b.emailRecipients, 320) as Prisma.InputJsonValue;
+      }
+      if (b.includeSections !== undefined) {
+        if (b.includeSections === null) data.includeSections = {};
+        else if (typeof b.includeSections === "object") {
+          data.includeSections = b.includeSections as Prisma.InputJsonValue;
+        }
+      }
+      if (typeof b.reportFormat === "string" && ["pdf", "html", "both"].includes(b.reportFormat)) {
+        data.reportFormat = b.reportFormat;
+      }
+      if (typeof b.isActive === "boolean") data.isActive = b.isActive;
+
+      const row = await prisma.reportConfig.update({
+        where: { id: existing.id },
+        data,
+        include: { _count: { select: { generatedReports: true } } },
+      });
+      return res.json({ config: row });
+    } catch (e) {
+      console.error("[PATCH report config]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not update report config");
+    }
+  });
+
+  r.delete("/agency/reports/configs/:id", expansionRequireAuth, expansionRequireProduct("reports"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const result = await prisma.reportConfig.deleteMany({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (result.count === 0) return apiErr(res, 404, "NOT_FOUND", "Report config not found");
+      return res.json({ ok: true });
+    } catch (e) {
+      console.error("[DELETE report config]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not delete report config");
+    }
+  });
+
+  r.get("/agency/reports/configs/:id/generated", expansionRequireAuth, expansionRequireProduct("reports"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const config = await prisma.reportConfig.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (!config) return apiErr(res, 404, "NOT_FOUND", "Report config not found");
+      const generated = await prisma.generatedReport.findMany({
+        where: { configId: config.id },
+        orderBy: { createdAt: "desc" },
+        take: 50,
+      });
+      return res.json({ generated });
+    } catch (e) {
+      console.error("[GET generated reports]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not list generated reports");
+    }
+  });
+
+  /** Record a completed run (PDF/HTML delivery still optional — files added when pipeline exists). */
+  r.post("/agency/reports/configs/:id/record-run", expansionRequireAuth, expansionRequireProduct("reports"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const config = await prisma.reportConfig.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (!config) return apiErr(res, 404, "NOT_FOUND", "Report config not found");
+      const b = req.body || {};
+      const now = new Date();
+      const periodEnd = new Date(now);
+      const periodStart = new Date(now);
+      periodStart.setDate(periodStart.getDate() - 30);
+      let start = periodStart;
+      let end = periodEnd;
+      if (typeof b.reportPeriodStart === "string" && b.reportPeriodStart.trim()) {
+        const d = new Date(b.reportPeriodStart);
+        if (!Number.isNaN(d.getTime())) start = d;
+      }
+      if (typeof b.reportPeriodEnd === "string" && b.reportPeriodEnd.trim()) {
+        const d = new Date(b.reportPeriodEnd);
+        if (!Number.isNaN(d.getTime())) end = d;
+      }
+      const row = await prisma.generatedReport.create({
+        data: {
+          configId: config.id,
+          agencyId: scope.agencyId,
+          clientId: scope.clientId,
+          reportPeriodStart: start,
+          reportPeriodEnd: end,
+          status: "ready",
+          fileUrlPdf: typeof b.fileUrlPdf === "string" ? b.fileUrlPdf.trim().slice(0, 500) : null,
+          fileUrlHtml: typeof b.fileUrlHtml === "string" ? b.fileUrlHtml.trim().slice(0, 500) : null,
+        },
+      });
+      await prisma.reportConfig.update({
+        where: { id: config.id },
+        data: { lastSentAt: now },
+      });
+      return res.status(201).json({ generated: row });
+    } catch (e) {
+      console.error("[record-run]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not record report run");
+    }
+  });
+
+  // ----- Module 6: Competitor watches -----
+  r.get("/agency/competitor/watches", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const watches = await prisma.competitorWatch.findMany({
+        where: { agencyId: scope.agencyId, clientId: scope.clientId },
+        orderBy: { updatedAt: "desc" },
+        include: {
+          _count: { select: { ads: true, insights: true } },
+        },
+      });
+      return res.json({ watches });
+    } catch (e) {
+      console.error("[GET competitor watches]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not list competitor watches");
+    }
+  });
+
+  r.post("/agency/competitor/watches", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const b = req.body || {};
+      const competitorName =
+        typeof b.competitorName === "string" && b.competitorName.trim()
+          ? b.competitorName.trim().slice(0, 200)
+          : "";
+      if (!competitorName) return apiErr(res, 400, "VALIDATION", "competitorName is required");
+      const competitorWebsite =
+        typeof b.competitorWebsite === "string" && b.competitorWebsite.trim()
+          ? b.competitorWebsite.trim().slice(0, 500)
+          : null;
+      const competitorFacebookPageId =
+        typeof b.competitorFacebookPageId === "string" && b.competitorFacebookPageId.trim()
+          ? b.competitorFacebookPageId.trim().slice(0, 200)
+          : null;
+      const competitorGoogleAdvertiserId =
+        typeof b.competitorGoogleAdvertiserId === "string" && b.competitorGoogleAdvertiserId.trim()
+          ? b.competitorGoogleAdvertiserId.trim().slice(0, 200)
+          : null;
+      const keywords = parseStringArray(b.keywords, 200) as Prisma.InputJsonValue;
+      let platforms = parseStringArray(b.platforms, 50);
+      if (platforms.length === 0) platforms = ["meta"];
+      const isActive = typeof b.isActive === "boolean" ? b.isActive : true;
+
+      const row = await prisma.competitorWatch.create({
+        data: {
+          agencyId: scope.agencyId,
+          clientId: scope.clientId,
+          competitorName,
+          competitorWebsite,
+          competitorFacebookPageId,
+          competitorGoogleAdvertiserId,
+          keywords,
+          platforms: platforms as Prisma.InputJsonValue,
+          isActive,
+        },
+        include: { _count: { select: { ads: true, insights: true } } },
+      });
+      return res.status(201).json({ watch: row });
+    } catch (e) {
+      console.error("[POST competitor watch]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not create competitor watch");
+    }
+  });
+
+  r.get("/agency/competitor/watches/:id", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const row = await prisma.competitorWatch.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+        include: {
+          insights: { orderBy: { generatedAt: "desc" }, take: 20 },
+          ads: { orderBy: { lastSeenAt: "desc" }, take: 30 },
+          _count: { select: { ads: true, insights: true } },
+        },
+      });
+      if (!row) return apiErr(res, 404, "NOT_FOUND", "Watch not found");
+      return res.json({ watch: row });
+    } catch (e) {
+      console.error("[GET competitor watch]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not load competitor watch");
+    }
+  });
+
+  r.patch("/agency/competitor/watches/:id", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const existing = await prisma.competitorWatch.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (!existing) return apiErr(res, 404, "NOT_FOUND", "Watch not found");
+      const b = req.body || {};
+      const data: Prisma.CompetitorWatchUncheckedUpdateInput = {};
+      if (typeof b.competitorName === "string" && b.competitorName.trim()) {
+        data.competitorName = b.competitorName.trim().slice(0, 200);
+      }
+      if (b.competitorWebsite !== undefined) {
+        data.competitorWebsite =
+          b.competitorWebsite === null || b.competitorWebsite === ""
+            ? null
+            : String(b.competitorWebsite).trim().slice(0, 500);
+      }
+      if (b.competitorFacebookPageId !== undefined) {
+        data.competitorFacebookPageId =
+          b.competitorFacebookPageId === null || b.competitorFacebookPageId === ""
+            ? null
+            : String(b.competitorFacebookPageId).trim().slice(0, 200);
+      }
+      if (b.competitorGoogleAdvertiserId !== undefined) {
+        data.competitorGoogleAdvertiserId =
+          b.competitorGoogleAdvertiserId === null || b.competitorGoogleAdvertiserId === ""
+            ? null
+            : String(b.competitorGoogleAdvertiserId).trim().slice(0, 200);
+      }
+      if (b.keywords !== undefined) data.keywords = parseStringArray(b.keywords, 200) as Prisma.InputJsonValue;
+      if (b.platforms !== undefined) {
+        const pl = parseStringArray(b.platforms, 50);
+        data.platforms = (pl.length ? pl : ["meta"]) as Prisma.InputJsonValue;
+      }
+      if (typeof b.isActive === "boolean") data.isActive = b.isActive;
+
+      const row = await prisma.competitorWatch.update({
+        where: { id: existing.id },
+        data,
+        include: { _count: { select: { ads: true, insights: true } } },
+      });
+      return res.json({ watch: row });
+    } catch (e) {
+      console.error("[PATCH competitor watch]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not update competitor watch");
+    }
+  });
+
+  r.delete("/agency/competitor/watches/:id", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const result = await prisma.competitorWatch.deleteMany({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (result.count === 0) return apiErr(res, 404, "NOT_FOUND", "Watch not found");
+      return res.json({ ok: true });
+    } catch (e) {
+      console.error("[DELETE competitor watch]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not delete competitor watch");
+    }
+  });
+
+  /** Demo scan: timestamps refresh + placeholder insight (real Ad Library integration later). */
+  r.post("/agency/competitor/watches/:id/scan", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const watch = await prisma.competitorWatch.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (!watch) return apiErr(res, 404, "NOT_FOUND", "Watch not found");
+      const now = new Date();
+      await prisma.competitorWatch.update({
+        where: { id: watch.id },
+        data: { lastScannedAt: now },
+      });
+      const summary =
+        typeof req.body?.summary === "string" && req.body.summary.trim()
+          ? req.body.summary.trim().slice(0, 8000)
+          : `Snapshot for ${watch.competitorName}: no live ad library pull yet. Add Meta/Google API tokens and page or advertiser IDs to enable automated creative pulls. Keywords tracked: ${JSON.stringify(watch.keywords)}.`;
+      const insight = await prisma.competitorInsight.create({
+        data: {
+          watchId: watch.id,
+          summary,
+          topThemes: [] as Prisma.InputJsonValue,
+          suggestedCounterAngles: [] as Prisma.InputJsonValue,
+          strongestAds: [] as Prisma.InputJsonValue,
+        },
+      });
+      const row = await prisma.competitorWatch.findFirst({
+        where: { id: watch.id },
+        include: {
+          insights: { orderBy: { generatedAt: "desc" }, take: 10 },
+          _count: { select: { ads: true, insights: true } },
+        },
+      });
+      return res.json({ watch: row, insight });
+    } catch (e) {
+      console.error("[scan competitor]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Scan failed");
+    }
+  });
+
   const notImpl =
     (name: string) =>
     (_req: Request, res: Response): Response =>
@@ -760,11 +1186,7 @@ export function createExpansionRouter(): Router {
         `${name} is not implemented yet — database schema and Module 1–2 routes are live.`
       );
 
-  r.use("/reports", expansionRequireAuth, expansionRequireProduct("reports"), (_req, res) => notImpl("Reports API")(_req, res));
   r.use("/dfy", expansionRequireAuth, expansionRequireProduct("dfy"), (_req, res) => notImpl("DFY API")(_req, res));
-  r.use("/competitor", expansionRequireAuth, expansionRequireProduct("competitors"), (_req, res) =>
-    notImpl("Competitor spy API")(_req, res)
-  );
   r.use("/client", expansionRequireAuth, expansionRequireProduct("kits"), (_req, res) => notImpl("Client kit assets API")(_req, res));
 
   return r;
