@@ -5,7 +5,7 @@ import fs from "fs";
 import crypto from "crypto";
 import dns from "dns/promises";
 import jwt from "jsonwebtoken";
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
 
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
@@ -425,6 +425,248 @@ export function createExpansionRouter(): Router {
     }
   });
 
+  function landingSlugify(raw: string): string {
+    const s = raw
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 200);
+    return s || "page";
+  }
+
+  async function resolveLandingScope(
+    req: ExpansionAuthRequest,
+    res: Response
+  ): Promise<{ agencyId: string; clientId: string } | null> {
+    const u = req.user!;
+    const eff = req.effectiveUserId!;
+    if (u.accountType === "agency") {
+      if (eff !== u.id) {
+        const link = await prisma.agencyClient.findFirst({
+          where: { agencyUserId: u.id, clientUserId: eff },
+        });
+        if (!link) {
+          apiErr(res, 403, "FORBIDDEN", "Not allowed to manage this client's landing pages");
+          return null;
+        }
+      }
+      return { agencyId: u.id, clientId: eff };
+    }
+    if (eff !== u.id) {
+      apiErr(res, 403, "FORBIDDEN", "Invalid context");
+      return null;
+    }
+    return { agencyId: u.id, clientId: u.id };
+  }
+
+  async function assertCampaignForClient(campaignId: string | null | undefined, clientId: string): Promise<boolean> {
+    if (campaignId == null || campaignId === "") return true;
+    const exp = await prisma.experiment.findFirst({ where: { id: campaignId, userId: clientId } });
+    return !!exp;
+  }
+
+  const landingPageInclude = {
+    experiment: { select: { id: true, name: true, platform: true, status: true } },
+  } as const;
+
+  r.get("/agency/landing-pages", expansionRequireAuth, async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const pages = await prisma.landingPage.findMany({
+        where: { agencyId: scope.agencyId, clientId: scope.clientId },
+        orderBy: { updatedAt: "desc" },
+        include: landingPageInclude,
+      });
+      return res.json({ pages });
+    } catch (e) {
+      console.error("[GET landing-pages]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not list landing pages");
+    }
+  });
+
+  r.post("/agency/landing-pages", expansionRequireAuth, async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const b = req.body || {};
+      const title =
+        typeof b.title === "string" && b.title.trim() ? b.title.trim().slice(0, 200) : "";
+      if (!title) return apiErr(res, 400, "VALIDATION", "title is required");
+      const slug =
+        typeof b.slug === "string" && b.slug.trim()
+          ? landingSlugify(b.slug)
+          : landingSlugify(title);
+      const campaignId =
+        typeof b.campaignId === "string" && b.campaignId.trim() ? b.campaignId.trim() : null;
+      if (!(await assertCampaignForClient(campaignId, scope.clientId))) {
+        return apiErr(res, 400, "VALIDATION", "campaignId must be an experiment owned by this client");
+      }
+      let pageData: Prisma.InputJsonValue = {};
+      if (b.pageData !== undefined && b.pageData !== null && typeof b.pageData === "object") {
+        pageData = b.pageData as Prisma.InputJsonValue;
+      }
+      const statusStr =
+        typeof b.status === "string" && ["draft", "published", "archived"].includes(b.status)
+          ? b.status
+          : "draft";
+      const hostingType =
+        typeof b.hostingType === "string" && ["platform", "export"].includes(b.hostingType)
+          ? b.hostingType
+          : "platform";
+      const subdomain =
+        typeof b.subdomain === "string" && b.subdomain.trim()
+          ? b.subdomain.trim().toLowerCase().slice(0, 100)
+          : null;
+      const aiGenerationPrompt =
+        typeof b.aiGenerationPrompt === "string" ? b.aiGenerationPrompt.slice(0, 50000) : null;
+      const conversionGoal =
+        typeof b.conversionGoal === "string" ? b.conversionGoal.trim().slice(0, 200) : null;
+      const conversionTrackingPixel =
+        typeof b.conversionTrackingPixel === "string"
+          ? b.conversionTrackingPixel.slice(0, 50000)
+          : null;
+
+      const publishedAt = statusStr === "published" ? new Date() : null;
+
+      const page = await prisma.landingPage.create({
+        data: {
+          agencyId: scope.agencyId,
+          clientId: scope.clientId,
+          campaignId,
+          title,
+          slug,
+          status: statusStr,
+          hostingType,
+          subdomain,
+          pageData,
+          aiGenerationPrompt,
+          conversionGoal,
+          conversionTrackingPixel,
+          publishedAt,
+        },
+        include: landingPageInclude,
+      });
+      return res.status(201).json({ page });
+    } catch (e: unknown) {
+      if (e && typeof e === "object" && "code" in e && (e as { code: string }).code === "P2002") {
+        return apiErr(res, 400, "DUPLICATE", "slug already exists for this client");
+      }
+      console.error("[POST landing-pages]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not create landing page");
+    }
+  });
+
+  r.get("/agency/landing-pages/:id", expansionRequireAuth, async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const page = await prisma.landingPage.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+        include: landingPageInclude,
+      });
+      if (!page) return apiErr(res, 404, "NOT_FOUND", "Landing page not found");
+      return res.json({ page });
+    } catch (e) {
+      console.error("[GET landing-page]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not load landing page");
+    }
+  });
+
+  r.patch("/agency/landing-pages/:id", expansionRequireAuth, async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const existing = await prisma.landingPage.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (!existing) return apiErr(res, 404, "NOT_FOUND", "Landing page not found");
+
+      const b = req.body || {};
+      const data: Prisma.LandingPageUncheckedUpdateInput = {};
+
+      if (typeof b.title === "string" && b.title.trim()) data.title = b.title.trim().slice(0, 200);
+      if (typeof b.slug === "string" && b.slug.trim()) data.slug = landingSlugify(b.slug);
+      if (typeof b.status === "string" && ["draft", "published", "archived"].includes(b.status)) {
+        data.status = b.status;
+        if (b.status === "published" && !existing.publishedAt) {
+          data.publishedAt = new Date();
+        }
+      }
+      if (typeof b.hostingType === "string" && ["platform", "export"].includes(b.hostingType)) {
+        data.hostingType = b.hostingType;
+      }
+      if (b.subdomain !== undefined) {
+        data.subdomain =
+          b.subdomain === null || b.subdomain === ""
+            ? null
+            : String(b.subdomain).trim().toLowerCase().slice(0, 100);
+      }
+      if (b.pageData !== undefined) {
+        if (b.pageData === null || (typeof b.pageData === "object" && Object.keys(b.pageData).length === 0)) {
+          data.pageData = {};
+        } else if (typeof b.pageData === "object") {
+          data.pageData = b.pageData as Prisma.InputJsonValue;
+        }
+      }
+      if (b.aiGenerationPrompt !== undefined) {
+        data.aiGenerationPrompt =
+          typeof b.aiGenerationPrompt === "string" ? b.aiGenerationPrompt.slice(0, 50000) : null;
+      }
+      if (b.conversionGoal !== undefined) {
+        data.conversionGoal =
+          typeof b.conversionGoal === "string" ? b.conversionGoal.trim().slice(0, 200) : null;
+      }
+      if (b.conversionTrackingPixel !== undefined) {
+        data.conversionTrackingPixel =
+          typeof b.conversionTrackingPixel === "string"
+            ? b.conversionTrackingPixel.slice(0, 50000)
+            : null;
+      }
+      if (b.campaignId !== undefined) {
+        const cid =
+          b.campaignId === null || b.campaignId === ""
+            ? null
+            : typeof b.campaignId === "string"
+              ? b.campaignId.trim()
+              : null;
+        if (cid && !(await assertCampaignForClient(cid, scope.clientId))) {
+          return apiErr(res, 400, "VALIDATION", "campaignId must be an experiment owned by this client");
+        }
+        data.campaignId = cid;
+      }
+
+      const page = await prisma.landingPage.update({
+        where: { id: existing.id },
+        data,
+        include: landingPageInclude,
+      });
+      return res.json({ page });
+    } catch (e: unknown) {
+      if (e && typeof e === "object" && "code" in e && (e as { code: string }).code === "P2002") {
+        return apiErr(res, 400, "DUPLICATE", "slug already exists for this client");
+      }
+      console.error("[PATCH landing-page]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not update landing page");
+    }
+  });
+
+  r.delete("/agency/landing-pages/:id", expansionRequireAuth, async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const result = await prisma.landingPage.deleteMany({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (result.count === 0) return apiErr(res, 404, "NOT_FOUND", "Landing page not found");
+      return res.json({ ok: true });
+    } catch (e) {
+      console.error("[DELETE landing-page]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not delete landing page");
+    }
+  });
+
   r.post("/agency/kits/:kitId/install", expansionRequireAuth, requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const { kitId } = req.params;
@@ -479,7 +721,6 @@ export function createExpansionRouter(): Router {
         `${name} is not implemented yet — database schema and Module 1–2 routes are live.`
       );
 
-  r.use("/landing-pages", notImpl("Landing pages API"));
   r.use("/reports", notImpl("Reports API"));
   r.use("/dfy", notImpl("DFY API"));
   r.use("/competitor", notImpl("Competitor spy API"));
