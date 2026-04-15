@@ -217,6 +217,12 @@ async function variantIdsWithImageData(variantIds: string[]): Promise<Set<string
 // ----- Integrations: connected ad accounts (Meta, TikTok, Google) -----
 const META_APP_ID = (process.env.META_APP_ID || "").trim();
 const META_APP_SECRET = (process.env.META_APP_SECRET || "").trim();
+/** Graph API version for OAuth, Marketing API, debug_token, and admin permission tests. Override with META_GRAPH_API_VERSION if Meta shows a different default in your app. */
+const META_GRAPH_API_VERSION = (() => {
+  const raw = (process.env.META_GRAPH_API_VERSION || "v25.0").trim();
+  if (!raw) return "v25.0";
+  return raw.startsWith("v") ? raw : `v${raw}`;
+})();
 const TIKTOK_APP_ID = (process.env.TIKTOK_APP_ID || process.env.TIKTOK_CLIENT_KEY || "").trim();
 const TIKTOK_APP_SECRET = (process.env.TIKTOK_APP_SECRET || process.env.TIKTOK_CLIENT_SECRET || "").trim();
 const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || "").trim();
@@ -531,7 +537,7 @@ app.get("/integrations/meta/connect", async (req: Request, res: Response) => {
   const scope =
     "public_profile,email,ads_management,ads_read,business_management,pages_show_list,pages_read_engagement,pages_manage_ads,leads_retrieval";
   const state = userId;
-  const metaAuthUrl = `https://www.facebook.com/v21.0/dialog/oauth?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${encodeURIComponent(state)}`;
+  const metaAuthUrl = `https://www.facebook.com/${META_GRAPH_API_VERSION}/dialog/oauth?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${encodeURIComponent(state)}`;
   res.redirect(302, metaAuthUrl);
 });
 
@@ -556,7 +562,7 @@ app.get("/integrations/meta/callback", async (req: Request, res: Response) => {
   }
   const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
   const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/meta/callback`;
-  const tokenUrl = `https://graph.facebook.com/v21.0/oauth/access_token?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${encodeURIComponent(META_APP_SECRET)}&code=${encodeURIComponent(code)}`;
+  const tokenUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/oauth/access_token?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${encodeURIComponent(META_APP_SECRET)}&code=${encodeURIComponent(code)}`;
   try {
     const tokenRes = await axios.get<{ access_token: string; token_type?: string }>(tokenUrl);
     const accessToken = tokenRes.data?.access_token;
@@ -1158,7 +1164,7 @@ app.get("/integrations/meta/ad-accounts", requireAuth, async (req: AuthRequest, 
     return res.status(404).json({ error: "Meta not connected. Connect Meta in Integrations first." });
   }
   try {
-    const url = `https://graph.facebook.com/v21.0/me/adaccounts?fields=id,name,account_id,account_status&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+    const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/adaccounts?fields=id,name,account_id,account_status&access_token=${encodeURIComponent(metaConn.accessToken)}`;
     const apiRes = await axios.get<{ data?: Array<{ id: string; name: string; account_id: string; account_status?: number }> }>(url);
     const list = apiRes.data?.data || [];
     res.json({ adAccounts: list.map((a) => ({ id: a.id, name: a.name, accountId: a.account_id, accountStatus: a.account_status })) });
@@ -1181,7 +1187,7 @@ app.get("/integrations/meta/test", requireAuth, async (req: AuthRequest, res: Re
     return res.status(400).json({ ok: false, error: "Meta not connected. Connect Meta in Integrations first." });
   }
   try {
-    const url = `https://graph.facebook.com/v21.0/me/adaccounts?fields=id&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+    const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/adaccounts?fields=id&access_token=${encodeURIComponent(metaConn.accessToken)}`;
     const apiRes = await axios.get<{ data?: unknown[] }>(url);
     const count = Array.isArray(apiRes.data?.data) ? apiRes.data.data.length : 0;
     res.json({ ok: true, adAccountCount: count });
@@ -1522,7 +1528,7 @@ async function metaDebugUserTokenScopesSummary(userToken: string): Promise<strin
   try {
     const appToken = `${META_APP_ID}|${META_APP_SECRET}`;
     const q = new URLSearchParams({ input_token: userToken, access_token: appToken });
-    const r = await axios.get<{ data?: { scopes?: string[] } }>(`https://graph.facebook.com/v21.0/debug_token?${q}`);
+    const r = await axios.get<{ data?: { scopes?: string[] } }>(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/debug_token?${q}`);
     const scopes = r.data?.data?.scopes;
     if (Array.isArray(scopes) && scopes.length) {
       const has = scopes.includes("pages_read_engagement");
@@ -1533,6 +1539,44 @@ async function metaDebugUserTokenScopesSummary(userToken: string): Promise<strin
     /* ignore */
   }
   return "";
+}
+
+type MetaPageAccount = { id: string; access_token?: string; tasks?: string[] };
+
+function metaPageTaskScore(tasks: string[] | undefined): number {
+  const t = (tasks ?? []).map((x) => String(x).toUpperCase());
+  let s = 0;
+  if (t.some((x) => x.includes("ADVERTISE"))) s += 100;
+  if (t.some((x) => x.includes("MANAGE"))) s += 50;
+  if (t.some((x) => x.includes("CREATE_CONTENT"))) s += 25;
+  return s;
+}
+
+function pickMetaPageForTests(pages: MetaPageAccount[], preferredPageId: string): MetaPageAccount | null {
+  const want = preferredPageId.trim();
+  if (want) {
+    const hit = pages.find((p) => p.id === want);
+    return hit ?? null;
+  }
+  if (!pages.length) return null;
+  const sorted = [...pages].sort((a, b) => metaPageTaskScore(b.tasks) - metaPageTaskScore(a.tasks));
+  return sorted[0] ?? null;
+}
+
+async function fetchMetaUserPages(graphBase: string, userToken: string): Promise<MetaPageAccount[]> {
+  const acc: MetaPageAccount[] = [];
+  let nextUrl: string | null = `${graphBase}/me/accounts?${new URLSearchParams({
+    fields: "id,name,access_token,tasks",
+    limit: "100",
+    access_token: userToken,
+  })}`;
+  for (let page = 0; page < 15 && nextUrl; page++) {
+    const url: string = nextUrl;
+    const res = await axios.get<{ data?: MetaPageAccount[]; paging?: { next?: string } }>(url);
+    acc.push(...(res.data?.data ?? []));
+    nextUrl = res.data?.paging?.next ?? null;
+  }
+  return acc;
 }
 
 type AiMetaTargetingShape = {
@@ -2189,7 +2233,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
       let pageId: string | null = null;
       try {
         const pageRes = await axios.get<{ data?: Array<{ id: string }> }>(
-          `https://graph.facebook.com/v21.0/me/accounts?fields=id&limit=1&access_token=${encodeURIComponent(token)}`
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/accounts?fields=id&limit=1&access_token=${encodeURIComponent(token)}`
         );
         pageId = pageRes.data?.data?.[0]?.id ?? null;
       } catch {
@@ -2208,7 +2252,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
 
       // 1. Create Campaign (ad set has daily_budget, so not CBO — Meta requires explicit is_adset_budget_sharing_enabled)
       const campaignRes = await axios.post<{ id: string }>(
-        `https://graph.facebook.com/v21.0/${adAccountId}/campaigns`,
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adAccountId}/campaigns`,
         null,
         {
           params: {
@@ -2244,7 +2288,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
         access_token: token,
       });
       const adSetRes = await axios.post<{ id: string }>(
-        `https://graph.facebook.com/v21.0/${adAccountId}/adsets`,
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adAccountId}/adsets`,
         adSetForm.toString(),
         { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
       );
@@ -2272,7 +2316,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
         const imageBase64 = (v.imageData || "").replace(/^data:image\/[a-z]+;base64,/, "");
         if (!imageBase64) continue;
         const imageRes = await axios.post<{ images?: Record<string, { hash: string }> }>(
-          `https://graph.facebook.com/v21.0/${adAccountId}/adimages`,
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adAccountId}/adimages`,
           new URLSearchParams({ bytes: imageBase64, access_token: token }).toString(),
           {
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -2294,7 +2338,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
         });
 
         const creativeRes = await axios.post<{ id: string }>(
-          `https://graph.facebook.com/v21.0/${adAccountId}/adcreatives`,
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adAccountId}/adcreatives`,
           null,
           {
             params: {
@@ -2307,7 +2351,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
         const creativeId = creativeRes.data?.id;
         if (!creativeId) continue;
 
-        await axios.post(`https://graph.facebook.com/v21.0/${adAccountId}/ads`, null, {
+        await axios.post(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adAccountId}/ads`, null, {
           params: {
             name: `${exp.name} - Ad ${i + 1}`.slice(0, 200),
             adset_id: adSetId,
@@ -2321,12 +2365,12 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
       // If we created at least one ad and this is not a dry run, set campaign and ad set to ACTIVE so it goes live
       if (variantsWithImage.length > 0 && !dryRun) {
         await axios.post(
-          `https://graph.facebook.com/v21.0/${campaignId}`,
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${campaignId}`,
           null,
           { params: { status: "ACTIVE", access_token: token } }
         );
         await axios.post(
-          `https://graph.facebook.com/v21.0/${adSetId}`,
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adSetId}`,
           null,
           { params: { status: "ACTIVE", access_token: token } }
         );
@@ -2529,7 +2573,7 @@ async function fetchMetaMetrics(
 ): Promise<Omit<CampaignMetricsResponse, "source" | "datePreset"> | null> {
   try {
     const fields = "spend,impressions,reach,frequency,cpm,clicks,ctr,cpc,inline_link_clicks,actions";
-    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(metaCampaignId)}/insights?fields=${fields}&date_preset=last_7d&access_token=${encodeURIComponent(accessToken)}`;
+    const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(metaCampaignId)}/insights?fields=${fields}&date_preset=last_7d&access_token=${encodeURIComponent(accessToken)}`;
     const apiRes = await axios.get<{ data?: Array<Record<string, unknown>> }>(url);
     const insights = apiRes.data?.data;
     const row = Array.isArray(insights) && insights.length > 0 ? insights[0] : null;
@@ -2681,7 +2725,7 @@ app.post("/experiments/:id/ai-performance-insights", requireAuth, async (req: Au
         } else {
           try {
             const budgetCents = Math.round(next * 100);
-            const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(exp.metaAdSetId)}?daily_budget=${budgetCents}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+            const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(exp.metaAdSetId)}?daily_budget=${budgetCents}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
             await axios.post(url);
             await prisma.experiment.update({
               where: { id: exp.id },
@@ -2745,7 +2789,7 @@ app.patch("/experiments/:id/campaign-status", requireAuth, async (req: AuthReque
     return res.status(400).json({ error: "Meta not connected. Connect Meta in Integrations." });
   }
   try {
-    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(exp.metaCampaignId)}?status=${status}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+    const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(exp.metaCampaignId)}?status=${status}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
     await axios.post(url);
     return res.json({ ok: true, status });
   } catch (err: unknown) {
@@ -2776,7 +2820,7 @@ app.patch("/experiments/:id/campaign-budget", requireAuth, async (req: AuthReque
   }
   try {
     const budgetCents = Math.round(dailyBudget * 100);
-    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(exp.metaAdSetId)}?daily_budget=${budgetCents}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
+    const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(exp.metaAdSetId)}?daily_budget=${budgetCents}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
     await axios.post(url);
     return res.json({ ok: true, dailyBudget });
   } catch (err: unknown) {
@@ -2979,9 +3023,10 @@ app.get("/admin/ai-performance", requireAuth, requireAdmin, async (_req: AuthReq
 
 /** Meta App Dashboard: exercise Marketing API permissions (Graph calls) using the admin user's stored Meta token. */
 app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
-  const META_V = "v21.0";
+  const META_V = META_GRAPH_API_VERSION;
   const graphBase = `https://graph.facebook.com/${META_V}`;
   const uid = req.user!.id;
+  const bodyPageId = typeof req.body?.metaPageId === "string" ? req.body.metaPageId.trim() : "";
   const metaConn = await prisma.connectedAccount.findFirst({
     where: { userId: uid, platform: "meta" },
   });
@@ -3041,32 +3086,70 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
   });
 
   await push(
-    "pages_show_list",
-    "pages_show_list",
+    "me_permissions",
+    "me/permissions (granted scopes)",
     ["captureLeads", "measurePerformance"],
-    `GET ${META_V}/me/accounts?fields=id,name,access_token,tasks`,
+    `GET ${META_V}/me/permissions`,
+    async () => {
+      try {
+        const q = new URLSearchParams({ access_token: userToken });
+        await axios.get(`${graphBase}/me/permissions?${q}`);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+      }
+    }
+  );
+
+  await push(
+    "business_management",
+    "business_management",
+    ["captureLeads", "measurePerformance"],
+    `GET ${META_V}/me/businesses?fields=id,name`,
     async () => {
       try {
         const q = new URLSearchParams({
-          fields: "id,name,access_token,tasks",
+          fields: "id,name",
           limit: "10",
           access_token: userToken,
         });
-        const r = await axios.get<{
-          data?: { id: string; access_token?: string; tasks?: string[] }[];
-        }>(`${graphBase}/me/accounts?${q}`);
-        const first = r.data?.data?.[0];
-        if (!first?.id) {
+        await axios.get(`${graphBase}/me/businesses?${q}`);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+      }
+    }
+  );
+
+  await push(
+    "pages_show_list",
+    "pages_show_list",
+    ["captureLeads", "measurePerformance"],
+    `GET ${META_V}/me/accounts (prefer Page with ADVERTISE task; optional metaPageId)`,
+    async () => {
+      try {
+        const pages = await fetchMetaUserPages(graphBase, userToken);
+        if (!pages.length) {
           return {
             ok: false,
             detail:
               "No Pages returned for this user. Create a Facebook Page and grant access, then reconnect Meta.",
           };
         }
-        pageId = first.id;
-        pageToken = first.access_token || userToken;
-        pageTasks = Array.isArray(first.tasks) ? first.tasks : [];
-        return { ok: true };
+        const chosen = pickMetaPageForTests(pages, bodyPageId);
+        if (!chosen?.id) {
+          return {
+            ok: false,
+            detail: bodyPageId
+              ? `metaPageId ${bodyPageId} is not in your connected Pages (me/accounts). Use a Page id you manage, or clear the field to auto-pick.`
+              : "Could not pick a Page.",
+          };
+        }
+        pageId = chosen.id;
+        pageToken = chosen.access_token || userToken;
+        pageTasks = Array.isArray(chosen.tasks) ? chosen.tasks : [];
+        const autoNote = bodyPageId ? `Using requested Page ${bodyPageId}.` : `Using Page ${chosen.id} (best task match among ${pages.length} Page(s)).`;
+        return { ok: true, detail: autoNote };
       } catch (e) {
         return { ok: false, detail: metaMarketingApiErrorDetail(e) };
       }
@@ -3152,35 +3235,34 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
     "leads_retrieval",
     "leads_retrieval",
     ["captureLeads"],
-    `GET leadgen_forms then GET {{formId}}/leads`,
+    `GET …/leadgen_forms then GET {{formId}}/leads (both must succeed if forms exist)`,
     async () => {
       if (!pid) return { ok: false, detail: "Skipped — no page id (fix pages_show_list first)." };
-      let formsBody: { data?: { id: string }[] } | null = null;
       let lastDetail = "";
       for (const token of [pt, userToken]) {
         try {
           const q = new URLSearchParams({ fields: "id", limit: "25", access_token: token });
           const r = await axios.get<{ data?: { id: string }[] }>(`${graphBase}/${pid}/leadgen_forms?${q}`);
-          formsBody = r.data;
-          if (Array.isArray(formsBody?.data)) {
-            const formId = formsBody!.data![0]?.id;
-            if (formId) {
-              try {
-                const ql = new URLSearchParams({
-                  fields: "id,created_time",
-                  limit: "1",
-                  access_token: token,
-                });
-                await axios.get(`${graphBase}/${formId}/leads?${ql}`);
-              } catch (le) {
-                lastDetail = `Forms OK; leads edge: ${metaMarketingApiErrorDetail(le)}`;
-                /* listing forms succeeded — still count as partial success for debugging */
-              }
-            } else {
-              lastDetail =
-                "leadgen_forms returned 0 forms. Create at least one Instant Form on this Page (Meta Ads / Page Publishing Tools) so /leads can be tested.";
-            }
-            return { ok: true, detail: lastDetail || undefined };
+          const forms = r.data?.data;
+          if (!Array.isArray(forms)) continue;
+          if (forms.length === 0) {
+            return {
+              ok: false,
+              detail:
+                "leadgen_forms returned 0 forms. Create at least one Instant Form on this Page (Ads / Publishing tools) so Meta can verify leads_retrieval.",
+            };
+          }
+          const formId = forms[0]!.id;
+          try {
+            const ql = new URLSearchParams({
+              fields: "id,created_time",
+              limit: "5",
+              access_token: token,
+            });
+            await axios.get(`${graphBase}/${formId}/leads?${ql}`);
+            return { ok: true, detail: `Read leads for form ${formId} (${forms.length} form(s) on Page).` };
+          } catch (le) {
+            lastDetail = `Listed ${forms.length} form(s); GET /${formId}/leads failed: ${metaMarketingApiErrorDetail(le)}`;
           }
         } catch (e) {
           lastDetail = metaMarketingApiErrorDetail(e);
@@ -3188,7 +3270,7 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
       }
       return {
         ok: false,
-        detail: `${lastDetail} — Fix pages_manage_ads + Page ADVERTISE task first; then create a lead form on the Page.`,
+        detail: `${lastDetail} — Fix pages_manage_ads + Page ADVERTISE task; ensure the form has leads or test permissions.`,
       };
     }
   );
@@ -3278,6 +3360,23 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
     }
   );
 
+  await push(
+    "ads_read_list_ads",
+    "ads_read (list ads under ad account)",
+    ["measurePerformance"],
+    `GET ${META_V}/act_*/ads?fields=id`,
+    async () => {
+      if (!adAct) return { ok: false, detail: "Skipped — no ad account id." };
+      try {
+        const q = new URLSearchParams({ fields: "id", limit: "5", access_token: userToken });
+        await axios.get(`${graphBase}/${adAct}/ads?${q}`);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, detail: metaMarketingApiErrorDetail(e) };
+      }
+    }
+  );
+
   const suggestions: string[] = [];
   if (!results.find((r) => r.id === "pages_read_engagement")?.ok) {
     suggestions.push(
@@ -3306,6 +3405,8 @@ app.post("/admin/meta-permission-tests", requireAuth, requireAdmin, async (req: 
 
   res.json({
     summary: {
+      graphApiVersion: META_V,
+      requestedPageId: bodyPageId || null,
       adAccountId: adAct,
       pageId: pid,
       pageTasks,
