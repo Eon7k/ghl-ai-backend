@@ -7,6 +7,7 @@ import dns from "dns/promises";
 import jwt from "jsonwebtoken";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
+import { enabledProductKeysFromDb, userHasProduct } from "./productEntitlements";
 
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
 export const EXPANSION_UPLOADS_ROOT = path.resolve(
@@ -88,6 +89,42 @@ function requireSuperAdmin(req: ExpansionAuthRequest, res: Response, next: NextF
     return;
   }
   next();
+}
+
+/** Gate expansion modules by User.enabledProductKeys (admin emails bypass). */
+function expansionRequireProduct(productKey: string) {
+  return async (req: ExpansionAuthRequest, res: Response, next: NextFunction): Promise<void> => {
+    if (!req.user) {
+      apiErr(res, 401, "UNAUTHORIZED", "Authentication required");
+      return;
+    }
+    const email = req.user.email?.toLowerCase().trim();
+    if (email && ADMIN_EMAILS.has(email)) {
+      next();
+      return;
+    }
+    try {
+      const row = await prisma.user.findUnique({
+        where: { id: req.user.id },
+        select: { enabledProductKeys: true },
+      });
+      const keys = enabledProductKeysFromDb(row?.enabledProductKeys);
+      if (!userHasProduct(keys, productKey)) {
+        apiErr(
+          res,
+          403,
+          "PRODUCT_DISABLED",
+          "This feature is not enabled for your account. Ask your administrator to enable it in Admin."
+        );
+        return;
+      }
+    } catch (e) {
+      console.error("[expansionRequireProduct]", e);
+      apiErr(res, 500, "SERVER_ERROR", "Could not verify product access");
+      return;
+    }
+    next();
+  };
 }
 
 function brandingUploader(prefix: string) {
@@ -189,7 +226,7 @@ export function createExpansionRouter(): Router {
     }
   });
 
-  r.get("/agency/branding", expansionRequireAuth, requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
+  r.get("/agency/branding", expansionRequireAuth, expansionRequireProduct("white_label"), requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const row = await prisma.agencyBranding.findUnique({ where: { userId: req.user!.id } });
       return res.json({ branding: row });
@@ -199,7 +236,7 @@ export function createExpansionRouter(): Router {
     }
   });
 
-  r.put("/agency/branding", expansionRequireAuth, requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
+  r.put("/agency/branding", expansionRequireAuth, expansionRequireProduct("white_label"), requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const b = req.body || {};
       const brandName =
@@ -275,6 +312,7 @@ export function createExpansionRouter(): Router {
   r.post(
     "/agency/branding/logo",
     expansionRequireAuth,
+    expansionRequireProduct("white_label"),
     requireAgency,
     uploadLogo.single("file"),
     async (req: ExpansionAuthRequest, res: Response) => {
@@ -292,6 +330,7 @@ export function createExpansionRouter(): Router {
   r.post(
     "/agency/branding/favicon",
     expansionRequireAuth,
+    expansionRequireProduct("white_label"),
     requireAgency,
     uploadFavicon.single("file"),
     async (req: ExpansionAuthRequest, res: Response) => {
@@ -306,7 +345,7 @@ export function createExpansionRouter(): Router {
     }
   );
 
-  r.post("/agency/branding/domain/verify-init", expansionRequireAuth, requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
+  r.post("/agency/branding/domain/verify-init", expansionRequireAuth, expansionRequireProduct("white_label"), requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const domain =
         typeof req.body?.domain === "string" ? sanitizeDomain(req.body.domain) : "";
@@ -340,7 +379,7 @@ export function createExpansionRouter(): Router {
     }
   });
 
-  r.post("/agency/branding/domain/verify-check", expansionRequireAuth, requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
+  r.post("/agency/branding/domain/verify-check", expansionRequireAuth, expansionRequireProduct("white_label"), requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const row = await prisma.agencyBranding.findUnique({ where: { userId: req.user!.id } });
       if (!row?.customDomain || !row.customDomainVerificationToken) {
@@ -412,7 +451,7 @@ export function createExpansionRouter(): Router {
     }
   });
 
-  r.get("/agency/kits", expansionRequireAuth, requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
+  r.get("/agency/kits", expansionRequireAuth, expansionRequireProduct("kits"), requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const kits = await prisma.agencyKit.findMany({
         where: { agencyId: req.user!.id, isActive: true },
@@ -470,7 +509,7 @@ export function createExpansionRouter(): Router {
     experiment: { select: { id: true, name: true, platform: true, status: true } },
   } as const;
 
-  r.get("/agency/landing-pages", expansionRequireAuth, async (req: ExpansionAuthRequest, res: Response) => {
+  r.get("/agency/landing-pages", expansionRequireAuth, expansionRequireProduct("landing_pages"), async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const scope = await resolveLandingScope(req, res);
       if (!scope) return;
@@ -486,7 +525,7 @@ export function createExpansionRouter(): Router {
     }
   });
 
-  r.post("/agency/landing-pages", expansionRequireAuth, async (req: ExpansionAuthRequest, res: Response) => {
+  r.post("/agency/landing-pages", expansionRequireAuth, expansionRequireProduct("landing_pages"), async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const scope = await resolveLandingScope(req, res);
       if (!scope) return;
@@ -558,7 +597,7 @@ export function createExpansionRouter(): Router {
     }
   });
 
-  r.get("/agency/landing-pages/:id", expansionRequireAuth, async (req: ExpansionAuthRequest, res: Response) => {
+  r.get("/agency/landing-pages/:id", expansionRequireAuth, expansionRequireProduct("landing_pages"), async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const scope = await resolveLandingScope(req, res);
       if (!scope) return;
@@ -574,7 +613,7 @@ export function createExpansionRouter(): Router {
     }
   });
 
-  r.patch("/agency/landing-pages/:id", expansionRequireAuth, async (req: ExpansionAuthRequest, res: Response) => {
+  r.patch("/agency/landing-pages/:id", expansionRequireAuth, expansionRequireProduct("landing_pages"), async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const scope = await resolveLandingScope(req, res);
       if (!scope) return;
@@ -652,7 +691,7 @@ export function createExpansionRouter(): Router {
     }
   });
 
-  r.delete("/agency/landing-pages/:id", expansionRequireAuth, async (req: ExpansionAuthRequest, res: Response) => {
+  r.delete("/agency/landing-pages/:id", expansionRequireAuth, expansionRequireProduct("landing_pages"), async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const scope = await resolveLandingScope(req, res);
       if (!scope) return;
@@ -667,7 +706,7 @@ export function createExpansionRouter(): Router {
     }
   });
 
-  r.post("/agency/kits/:kitId/install", expansionRequireAuth, requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
+  r.post("/agency/kits/:kitId/install", expansionRequireAuth, expansionRequireProduct("kits"), requireAgency, async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const { kitId } = req.params;
       const kit = await prisma.verticalKit.findFirst({ where: { id: kitId, isActive: true } });
@@ -721,10 +760,12 @@ export function createExpansionRouter(): Router {
         `${name} is not implemented yet — database schema and Module 1–2 routes are live.`
       );
 
-  r.use("/reports", notImpl("Reports API"));
-  r.use("/dfy", notImpl("DFY API"));
-  r.use("/competitor", notImpl("Competitor spy API"));
-  r.use("/client", notImpl("Client kit assets API"));
+  r.use("/reports", expansionRequireAuth, expansionRequireProduct("reports"), (_req, res) => notImpl("Reports API")(_req, res));
+  r.use("/dfy", expansionRequireAuth, expansionRequireProduct("dfy"), (_req, res) => notImpl("DFY API")(_req, res));
+  r.use("/competitor", expansionRequireAuth, expansionRequireProduct("competitors"), (_req, res) =>
+    notImpl("Competitor spy API")(_req, res)
+  );
+  r.use("/client", expansionRequireAuth, expansionRequireProduct("kits"), (_req, res) => notImpl("Client kit assets API")(_req, res));
 
   return r;
 }

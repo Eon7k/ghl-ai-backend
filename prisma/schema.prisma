@@ -17,6 +17,11 @@ model User {
   role         String    @default("user")
   /** If true, this user cannot log in (used for agency-managed clients without portal access). */
   loginDisabled Boolean  @default(false)
+  /**
+   * Expansion modules this user may use (JSON: string[] | null). DB null = all modules (legacy).
+   * JSON [] = none. Non-empty array = allowlist (keys: white_label, kits, landing_pages, reports, dfy, competitors).
+   */
+  enabledProductKeys Json?
   createdAt    DateTime  @default(now())
   experiments  Experiment[]
   creatives    Creative[]

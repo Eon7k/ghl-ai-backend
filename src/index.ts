@@ -21,7 +21,9 @@ import {
   refreshAndStoreLinkedInAccessToken,
   linkedInApiErrorMessage,
 } from "./linkedinMarketing";
+import { Prisma } from "@prisma/client";
 import { attachBrandingHost, createExpansionRouter, EXPANSION_UPLOADS_ROOT } from "./expansionApi";
+import { enabledProductKeysFromDb, normalizeAdminProductKeys } from "./productEntitlements";
 
 // Only load .env file when NOT in production (so Render always uses its own env vars)
 if (process.env.NODE_ENV !== "production") {
@@ -307,7 +309,13 @@ app.post("/auth/register", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "An account with this email already exists" });
     }
     const passwordHash = await bcrypt.hash(passwordTrimmed, 10);
-    const user = await prisma.user.create({ data: { email: emailNorm, passwordHash } });
+    const user = await prisma.user.create({
+      data: {
+        email: emailNorm,
+        passwordHash,
+        enabledProductKeys: [] as Prisma.InputJsonValue,
+      },
+    });
     const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
     return res.status(201).json({ token, user: { id: user.id, email: user.email } });
   } catch (err: unknown) {
@@ -455,11 +463,15 @@ app.get("/auth/me", async (req: AuthRequest, res: Response) => {
             email: ac.clientUser.email,
           })) ?? []
         : undefined;
+    const enabledProductKeys = enabledProductKeysFromDb(
+      (user as { enabledProductKeys?: unknown }).enabledProductKeys
+    );
     res.json({
       user: { id: user.id, email: user.email },
       isAdmin: isAdmin(user.email),
       accountType,
       clients,
+      enabledProductKeys,
     });
   } catch {
     res.status(401).json({ error: "Invalid or expired token" });
@@ -2779,7 +2791,7 @@ app.patch("/experiments/:id/campaign-budget", requireAuth, async (req: AuthReque
 // ----- Admin: user list, account type, agency clients (only for ADMIN_EMAILS) -----
 app.get("/admin/users", requireAuth, requireAdmin, async (_req: AuthRequest, res: Response) => {
   const users = await prisma.user.findMany({
-    select: { id: true, email: true, accountType: true, createdAt: true },
+    select: { id: true, email: true, accountType: true, createdAt: true, enabledProductKeys: true },
     orderBy: { createdAt: "desc" },
   });
   res.json({
@@ -2788,22 +2800,53 @@ app.get("/admin/users", requireAuth, requireAdmin, async (_req: AuthRequest, res
       email: u.email,
       accountType: (u as { accountType?: string }).accountType ?? "single",
       createdAt: u.createdAt.toISOString(),
+      enabledProductKeys: enabledProductKeysFromDb((u as { enabledProductKeys?: unknown }).enabledProductKeys),
     })),
   });
 });
 
 app.patch("/admin/users/:id", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
-  const accountType = req.body?.accountType;
-  if (accountType !== "single" && accountType !== "agency") {
-    return res.status(400).json({ error: "Body must include accountType: 'single' or 'agency'" });
+  const accountType = req.body?.accountType as string | undefined;
+  const hasAccountType = accountType === "single" || accountType === "agency";
+  const hasProducts = Object.prototype.hasOwnProperty.call(req.body ?? {}, "enabledProductKeys");
+  if (!hasAccountType && !hasProducts) {
+    return res.status(400).json({
+      error: "Body must include accountType ('single' | 'agency') and/or enabledProductKeys (array or null)",
+    });
+  }
+  if (accountType !== undefined && accountType !== "single" && accountType !== "agency") {
+    return res.status(400).json({ error: "accountType must be 'single' or 'agency'" });
   }
   const user = await prisma.user.findUnique({ where: { id: req.params.id } });
   if (!user) return res.status(404).json({ error: "User not found" });
+
+  let normalizedProducts: string[] | null | undefined;
+  if (hasProducts) {
+    const parsed = normalizeAdminProductKeys(req.body?.enabledProductKeys);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: parsed.message });
+    }
+    normalizedProducts = parsed.value;
+  }
+
+  const data: Prisma.UserUpdateInput = {};
+  if (hasAccountType) data.accountType = accountType;
+  if (hasProducts) {
+    data.enabledProductKeys =
+      normalizedProducts === null
+        ? Prisma.DbNull
+        : (normalizedProducts as Prisma.InputJsonValue);
+  }
+
   await prisma.user.update({
     where: { id: req.params.id },
-    data: { accountType },
+    data,
   });
-  res.json({ ok: true, accountType });
+  res.json({
+    ok: true,
+    ...(hasAccountType ? { accountType } : {}),
+    ...(hasProducts ? { enabledProductKeys: normalizedProducts } : {}),
+  });
 });
 
 app.get("/admin/agencies/:userId/clients", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
