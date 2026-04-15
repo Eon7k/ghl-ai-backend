@@ -1149,10 +1149,27 @@ export function createExpansionRouter(): Router {
         where: { id: watch.id },
         data: { lastScannedAt: now },
       });
+      const kwPretty = (() => {
+        const k = watch.keywords;
+        if (Array.isArray(k)) {
+          const parts = k
+            .filter((x): x is string => typeof x === "string")
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0);
+          return parts.length ? parts.join(", ") : "none listed";
+        }
+        return "none listed";
+      })();
+      const defaultSummary = [
+        `Checkpoint saved for “${watch.competitorName}”.`,
+        `This run does not call Meta or Google yet—it timestamps the watch and stores a note so your history isn’t empty.`,
+        `Keywords you’re watching: ${kwPretty}.`,
+        `To pull real ads later: add this competitor’s Meta Page ID and/or Google Ads advertiser ID on the watch, then connect server-side Ad Library APIs (tokens on the backend).`,
+      ].join(" ");
       const summary =
         typeof req.body?.summary === "string" && req.body.summary.trim()
           ? req.body.summary.trim().slice(0, 8000)
-          : `Snapshot for ${watch.competitorName}: no live ad library pull yet. Add Meta/Google API tokens and page or advertiser IDs to enable automated creative pulls. Keywords tracked: ${JSON.stringify(watch.keywords)}.`;
+          : defaultSummary;
       const insight = await prisma.competitorInsight.create({
         data: {
           watchId: watch.id,
