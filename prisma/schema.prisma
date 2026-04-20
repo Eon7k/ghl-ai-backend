@@ -360,6 +360,10 @@ model Experiment {
   googleCampaignId   String?
   /** Google Ads ad group resource id (numeric string) after launch. */
   googleAdGroupId    String?
+  /** LinkedIn sponsored campaign group numeric id after Marketing API launch. */
+  linkedinCampaignGroupId String?
+  /** LinkedIn sponsored campaign numeric id after Marketing API launch. */
+  linkedinCampaignId      String?
   attachedCreativeIds String[] @default([]) // PostgreSQL array of creative ids
   /** AI optimization: off | suggestions | auto (auto applies Meta ad-set budget only when API recommends). */
   aiOptimizationMode  String   @default("off")

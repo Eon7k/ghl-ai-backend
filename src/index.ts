@@ -20,6 +20,7 @@ import {
   listLinkedInAdAccounts,
   refreshAndStoreLinkedInAccessToken,
   linkedInApiErrorMessage,
+  launchLinkedInCampaign,
 } from "./linkedinMarketing";
 import { Prisma } from "@prisma/client";
 import { attachBrandingHost, createExpansionRouter, EXPANSION_UPLOADS_ROOT } from "./expansionApi";
@@ -158,6 +159,8 @@ interface ExperimentRecord {
   tiktokAdGroupId?: string;
   googleCampaignId?: string;
   googleAdGroupId?: string;
+  linkedinCampaignGroupId?: string;
+  linkedinCampaignId?: string;
   aiOptimizationMode?: string;
 }
 
@@ -1232,6 +1235,8 @@ app.get("/experiments", requireAuth, async (req: AuthRequest, res: Response) => 
     tiktokAdGroupId: e.tiktokAdGroupId ?? undefined,
     googleCampaignId: e.googleCampaignId ?? undefined,
     googleAdGroupId: e.googleAdGroupId ?? undefined,
+    linkedinCampaignGroupId: e.linkedinCampaignGroupId ?? undefined,
+    linkedinCampaignId: e.linkedinCampaignId ?? undefined,
     aiOptimizationMode: e.aiOptimizationMode ?? undefined,
     attachedCreativeIds: e.attachedCreativeIds ?? undefined,
     variants: e.variants.map((v) => variantToJson(v, withCreative.has(v.id))),
@@ -1269,6 +1274,8 @@ app.get("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response)
     tiktokAdGroupId: exp.tiktokAdGroupId ?? undefined,
     googleCampaignId: exp.googleCampaignId ?? undefined,
     googleAdGroupId: exp.googleAdGroupId ?? undefined,
+    linkedinCampaignGroupId: exp.linkedinCampaignGroupId ?? undefined,
+    linkedinCampaignId: exp.linkedinCampaignId ?? undefined,
     aiOptimizationMode: exp.aiOptimizationMode ?? undefined,
     attachedCreativeIds: exp.attachedCreativeIds ?? undefined,
     variants: exp.variants.map((v) => variantToJson(v, withCreativeOne.has(v.id))),
@@ -1332,6 +1339,8 @@ app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Respons
     tiktokAdGroupId: updated.tiktokAdGroupId ?? undefined,
     googleCampaignId: updated.googleCampaignId ?? undefined,
     googleAdGroupId: updated.googleAdGroupId ?? undefined,
+    linkedinCampaignGroupId: updated.linkedinCampaignGroupId ?? undefined,
+    linkedinCampaignId: updated.linkedinCampaignId ?? undefined,
     aiOptimizationMode: updated.aiOptimizationMode ?? undefined,
     attachedCreativeIds: updated.attachedCreativeIds ?? undefined,
   });
@@ -1579,6 +1588,47 @@ async function fetchMetaUserPages(graphBase: string, userToken: string): Promise
   return acc;
 }
 
+/** Split total daily budget (USD) into integer cents per part; sum matches Math.round(totalUsd×100). */
+function splitDailyBudgetUsdToCents(totalUsd: number, parts: number): number[] {
+  const n = Math.max(1, Math.floor(parts));
+  const cents = Math.round(Number(totalUsd) * 100);
+  const q = Math.floor(cents / n);
+  let r = cents - q * n;
+  const out: number[] = [];
+  for (let i = 0; i < n; i++) {
+    out.push(q + (r > 0 ? 1 : 0));
+    if (r > 0) r -= 1;
+  }
+  return out;
+}
+
+function parseMetaAdSetIdsList(raw: string | null | undefined): string[] {
+  if (!raw?.trim()) return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => /^\d+$/.test(s));
+}
+
+/** Apply evenly split daily budgets to one or more Meta ad sets (total = totalDailyBudgetUsd). */
+async function applyMetaAdSetDailyBudgetsFromTotal(
+  adSetIds: string[],
+  totalDailyBudgetUsd: number,
+  accessToken: string
+): Promise<void> {
+  if (adSetIds.length === 0) throw new Error("No Meta ad sets to update");
+  const splits = splitDailyBudgetUsdToCents(totalDailyBudgetUsd, adSetIds.length);
+  if (splits.some((c) => c < 100)) {
+    throw new Error(
+      `Meta needs at least $1/day per ad set. With ${adSetIds.length} ad sets, set total daily budget to at least $${adSetIds.length} or reduce the number of variants.`
+    );
+  }
+  for (let i = 0; i < adSetIds.length; i++) {
+    const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(adSetIds[i])}?daily_budget=${splits[i]}&access_token=${encodeURIComponent(accessToken)}`;
+    await axios.post(url);
+  }
+}
+
 type AiMetaTargetingShape = {
   countries?: string[];
   age_min?: number;
@@ -1809,6 +1859,25 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
     }
 
     const count = Math.min(20, Math.max(1, Number(variantCount) || 3));
+    /** Split user's total across platforms so sum equals their number (each platform gets one experiment / one ad set budget). */
+    const platformBudgetsUsd = (() => {
+      const n = platformsList.length;
+      const cents = Math.round(Number(totalDailyBudget) * 100);
+      if (n <= 0 || cents < 0) return [];
+      const q = Math.floor(cents / n);
+      let r = cents - q * n;
+      const out: number[] = [];
+      for (let i = 0; i < n; i++) {
+        out.push((q + (r > 0 ? 1 : 0)) / 100);
+        if (r > 0) r -= 1;
+      }
+      return out;
+    })();
+    if (platformBudgetsUsd.some((b) => b < 1)) {
+      return res.status(400).json({
+        error: `Daily budget must be at least $${platformsList.length}/day total when using ${platformsList.length} platform(s) ($1/day minimum per platform after splitting).`,
+      });
+    }
     const source = creativesSource === "own" ? "own" : creativesSource === "mix" ? "mix" : "ai";
     const promptText =
       typeof prompt === "string" && prompt.trim()
@@ -1850,7 +1919,8 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       platformsList.length > 1 ? `cg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}` : undefined;
 
     const uid = req.effectiveUserId ?? req.user!.id;
-    for (const platform of platformsList) {
+    for (let pi = 0; pi < platformsList.length; pi++) {
+      const platform = platformsList[pi];
       const exp = await prisma.experiment.create({
         data: {
           userId: uid,
@@ -1858,7 +1928,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
           platform,
           status: "draft",
           phase: "setup",
-          totalDailyBudget: Number(totalDailyBudget),
+          totalDailyBudget: platformBudgetsUsd[pi] ?? Number(totalDailyBudget),
           prompt: promptText,
           variantCount: count,
           creativesSource: source,
@@ -1922,6 +1992,8 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       tiktokAdGroupId: firstExp.tiktokAdGroupId ?? undefined,
       googleCampaignId: firstExp.googleCampaignId ?? undefined,
       googleAdGroupId: firstExp.googleAdGroupId ?? undefined,
+      linkedinCampaignGroupId: firstExp.linkedinCampaignGroupId ?? undefined,
+      linkedinCampaignId: firstExp.linkedinCampaignId ?? undefined,
       aiOptimizationMode: firstExp.aiOptimizationMode ?? undefined,
       attachedCreativeIds: firstExp.attachedCreativeIds ?? undefined,
       variants: firstExp.variants.map((v) => variantToJson(v, firstExpCreativeIds.has(v.id))),
@@ -2150,12 +2222,6 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     include: { variants: true },
   });
   if (!exp) return res.status(404).json({ error: "Experiment not found" });
-  if (exp.platform === "linkedin") {
-    return res.status(400).json({
-      error:
-        "LinkedIn Ads campaign launch is not implemented in this version. Connect LinkedIn to list ad accounts and build drafts here; publish from LinkedIn Campaign Manager for now.",
-    });
-  }
   const aiCreativeCount = req.body?.aiCreativeCount;
   const metaAdAccountId = typeof req.body?.metaAdAccountId === "string" ? req.body.metaAdAccountId.trim() : undefined;
   const googleAdsCustomerIdBody =
@@ -2167,6 +2233,10 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     typeof req.body?.tiktokIdentityId === "string" ? req.body.tiktokIdentityId.trim() : undefined;
   const tiktokIdentityType =
     typeof req.body?.tiktokIdentityType === "string" ? req.body.tiktokIdentityType.trim() : undefined;
+  const linkedInSponsoredAccountId =
+    typeof req.body?.linkedInSponsoredAccountId === "string" ? req.body.linkedInSponsoredAccountId.trim() : undefined;
+  const linkedInOrganizationUrn =
+    typeof req.body?.linkedInOrganizationUrn === "string" ? req.body.linkedInOrganizationUrn.trim() : undefined;
   const landingPageUrl = typeof req.body?.landingPageUrl === "string" && req.body.landingPageUrl.trim()
     ? req.body.landingPageUrl.trim()
     : "https://example.com";
@@ -2194,6 +2264,8 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     tiktokAdGroupId?: string;
     googleCampaignId?: string;
     googleAdGroupId?: string;
+    linkedinCampaignGroupId?: string;
+    linkedinCampaignId?: string;
   } = {
     status: "launched",
     phase: "running",
@@ -2271,34 +2343,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
       }
       data.metaCampaignId = campaignId;
 
-      // 2. Create Ad Set (daily_budget in cents). Meta expects bid fields in POST body; query-only `params` often drops
-      //    bid_strategy (subcode 2490487). Empty bid_constraints pairs with LOWEST_COST_WITHOUT_CAP per bidding docs.
-      const budgetCents = Math.round(exp.totalDailyBudget * 100);
-      const adSetForm = new URLSearchParams({
-        name: `${exp.name} - Ad Set`.slice(0, 200),
-        campaign_id: campaignId,
-        daily_budget: String(budgetCents),
-        billing_event: "IMPRESSIONS",
-        bid_strategy: "LOWEST_COST_WITHOUT_CAP",
-        bid_constraints: "{}",
-        optimization_goal: "LINK_CLICKS",
-        destination_type: "WEBSITE",
-        targeting: JSON.stringify(metaTargeting),
-        status: "PAUSED",
-        access_token: token,
-      });
-      const adSetRes = await axios.post<{ id: string }>(
-        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adAccountId}/adsets`,
-        adSetForm.toString(),
-        { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-      );
-      const adSetId = adSetRes.data?.id;
-      if (!adSetId) {
-        throw new Error("Meta did not return ad set id");
-      }
-      data.metaAdSetId = adSetId;
-
-      // 3. Upload images and create creatives + ads for each variant that has image (and is in variantIds if provided)
+      // 2–3. One ad set per variant so Meta shows split budgets (~$30/10 → $3/day per row). Total spend still caps at totalDailyBudget.
       const variantIdSet = variantIds ? new Set(variantIds) : null;
       const variantsWithImage = exp.variants.filter(
         (v) => v.imageData && (!variantIdSet || variantIdSet.has(v.id))
@@ -2310,11 +2355,48 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
             : "No variants have creatives yet. Generate creatives for at least one variant before launching.",
         });
       }
+      const budgetSplitsCents = splitDailyBudgetUsdToCents(exp.totalDailyBudget, variantsWithImage.length);
+      if (budgetSplitsCents.some((c) => c < 100)) {
+        return res.status(400).json({
+          error: `Meta needs at least $1/day per ad set. With ${variantsWithImage.length} variants, set daily budget to at least $${variantsWithImage.length} total, or launch fewer variants.`,
+        });
+      }
       data.aiCreativeCount = variantsWithImage.length;
+      const adSetIds: string[] = [];
+
       for (let i = 0; i < variantsWithImage.length; i++) {
         const v = variantsWithImage[i];
         const imageBase64 = (v.imageData || "").replace(/^data:image\/[a-z]+;base64,/, "");
-        if (!imageBase64) continue;
+        if (!imageBase64) {
+          return res.status(400).json({
+            error: `Variant ${i + 1} is missing image data. Generate creatives before launch.`,
+          });
+        }
+
+        const adSetForm = new URLSearchParams({
+          name: `${exp.name} - Ad set ${i + 1}`.slice(0, 200),
+          campaign_id: campaignId,
+          daily_budget: String(budgetSplitsCents[i]),
+          billing_event: "IMPRESSIONS",
+          bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+          bid_constraints: "{}",
+          optimization_goal: "LINK_CLICKS",
+          destination_type: "WEBSITE",
+          targeting: JSON.stringify(metaTargeting),
+          status: "PAUSED",
+          access_token: token,
+        });
+        const adSetRes = await axios.post<{ id: string }>(
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adAccountId}/adsets`,
+          adSetForm.toString(),
+          { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+        );
+        const adSetId = adSetRes.data?.id;
+        if (!adSetId) {
+          throw new Error("Meta did not return ad set id");
+        }
+        adSetIds.push(adSetId);
+
         const imageRes = await axios.post<{ images?: Record<string, { hash: string }> }>(
           `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adAccountId}/adimages`,
           new URLSearchParams({ bytes: imageBase64, access_token: token }).toString(),
@@ -2323,7 +2405,9 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
           }
         );
         const hash = imageRes.data?.images && Object.values(imageRes.data.images)[0]?.hash;
-        if (!hash) continue;
+        if (!hash) {
+          return res.status(502).json({ error: `Meta did not return an image hash for variant ${i + 1}.` });
+        }
 
         const objectStorySpec = JSON.stringify({
           page_id: pageId,
@@ -2332,7 +2416,6 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
             link: landingPageUrl,
             message: (v.copy || "").slice(0, 1250),
             name: (exp.name + ` - Variant ${i + 1}`).slice(0, 40),
-            // Meta rejects many link ads without value.link on the CTA ("Invalid parameter").
             call_to_action: { type: "LEARN_MORE", value: { link: landingPageUrl } },
           },
         });
@@ -2349,7 +2432,9 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
           }
         );
         const creativeId = creativeRes.data?.id;
-        if (!creativeId) continue;
+        if (!creativeId) {
+          return res.status(502).json({ error: `Meta did not return a creative id for variant ${i + 1}.` });
+        }
 
         await axios.post(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adAccountId}/ads`, null, {
           params: {
@@ -2362,18 +2447,21 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
         });
       }
 
-      // If we created at least one ad and this is not a dry run, set campaign and ad set to ACTIVE so it goes live
+      data.metaAdSetId = adSetIds.join(",");
+
       if (variantsWithImage.length > 0 && !dryRun) {
         await axios.post(
           `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${campaignId}`,
           null,
           { params: { status: "ACTIVE", access_token: token } }
         );
-        await axios.post(
-          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${adSetId}`,
-          null,
-          { params: { status: "ACTIVE", access_token: token } }
-        );
+        for (const id of adSetIds) {
+          await axios.post(
+            `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}`,
+            null,
+            { params: { status: "ACTIVE", access_token: token } }
+          );
+        }
       }
     } catch (err: unknown) {
       const msg = metaMarketingApiErrorDetail(err);
@@ -2502,11 +2590,82 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     }
   }
 
+  if (exp.platform === "linkedin") {
+    if (!linkedInSponsoredAccountId || !linkedInOrganizationUrn) {
+      return res.status(400).json({
+        error:
+          "LinkedIn launch requires linkedInSponsoredAccountId (ad account) and linkedInOrganizationUrn (Company Page: numeric id or urn:li:organization:…).",
+      });
+    }
+    if (!landingPageUrl || landingPageUrl === "https://example.com") {
+      return res.status(400).json({
+        error: "Enter a real https landing page URL for LinkedIn website visit ads.",
+      });
+    }
+    try {
+      new URL(landingPageUrl);
+    } catch {
+      return res.status(400).json({ error: "Landing page URL must be a valid URL." });
+    }
+    if (!/^https:\/\//i.test(landingPageUrl)) {
+      return res.status(400).json({ error: "Use an https:// URL for the landing page." });
+    }
+    const liConn = await prisma.connectedAccount.findFirst({
+      where: { userId: uid, platform: "linkedin" },
+    });
+    if (!liConn) {
+      return res.status(400).json({ error: "LinkedIn not connected. Connect LinkedIn in Integrations first." });
+    }
+    const variantIdSetLi = variantIds ? new Set(variantIds) : null;
+    const variantsWithImageLi = exp.variants.filter(
+      (v) => v.imageData && (!variantIdSetLi || variantIdSetLi.has(v.id))
+    );
+    if (variantsWithImageLi.length === 0) {
+      return res.status(400).json({
+        error: variantIds
+          ? "No selected variants have creatives. Generate or attach images for at least one selected variant."
+          : "No variants have creatives yet. Add creatives before launching.",
+      });
+    }
+    data.aiCreativeCount = variantsWithImageLi.length;
+    try {
+      let accessToken = liConn.accessToken;
+      if (liConn.refreshToken && LINKEDIN_CLIENT_ID && LINKEDIN_CLIENT_SECRET) {
+        accessToken = await refreshAndStoreLinkedInAccessToken(
+          prisma,
+          liConn,
+          LINKEDIN_CLIENT_ID,
+          LINKEDIN_CLIENT_SECRET
+        );
+      }
+      const liResult = await launchLinkedInCampaign({
+        accessToken,
+        sponsoredAccountId: linkedInSponsoredAccountId.replace(/\D/g, ""),
+        organizationUrn: linkedInOrganizationUrn,
+        campaignName: exp.name,
+        dailyBudgetUsd: exp.totalDailyBudget,
+        landingPageUrl,
+        dryRun,
+        variants: variantsWithImageLi.map((v) => ({
+          copy: (v.copy || "").trim(),
+          imageBase64: (v.imageData || "").replace(/^data:image\/[a-z]+;base64,/, ""),
+        })),
+      });
+      data.linkedinCampaignGroupId = liResult.campaignGroupId;
+      data.linkedinCampaignId = liResult.campaignId;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "LinkedIn API error";
+      console.error("[LinkedIn launch]", msg);
+      return res.status(502).json({ error: msg });
+    }
+  }
+
   const updated = await prisma.experiment.update({ where: { id: exp.id }, data });
   const payload: Record<string, unknown> = { ...updated, aiProvider: updated.aiProvider ?? undefined, creativePrompt: updated.creativePrompt ?? undefined, campaignGroupId: updated.campaignGroupId ?? undefined, attachedCreativeIds: updated.attachedCreativeIds ?? undefined };
   if (exp.platform === "meta" && metaAdAccountId && dryRun) payload.dryRun = true;
   if (exp.platform === "tiktok" && tiktokAdvertiserId && dryRun) payload.dryRun = true;
   if (exp.platform === "google" && googleAdsCustomerDigits.length >= 6 && dryRun) payload.dryRun = true;
+  if (exp.platform === "linkedin" && dryRun) payload.dryRun = true;
   res.json(payload);
 });
 
@@ -2724,16 +2883,19 @@ app.post("/experiments/:id/ai-performance-insights", requireAuth, async (req: Au
           budgetNote = "Meta is not connected; budget was not changed.";
         } else {
           try {
-            const budgetCents = Math.round(next * 100);
-            const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(exp.metaAdSetId)}?daily_budget=${budgetCents}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
-            await axios.post(url);
+            const adSetIds = parseMetaAdSetIdsList(exp.metaAdSetId);
+            await applyMetaAdSetDailyBudgetsFromTotal(adSetIds, next, metaConn.accessToken);
             await prisma.experiment.update({
               where: { id: exp.id },
               data: { totalDailyBudget: next },
             });
             budgetAutoApplied = true;
             newTotalDailyBudget = next;
-            budgetNote = `Meta ad set daily budget updated to $${next}/day (clamped between $${low} and $${high} from prior $${cur}/day).`;
+            const n = adSetIds.length;
+            budgetNote =
+              n > 1
+                ? `Meta: total daily budget updated to $${next}/day (~$${(Math.round((next / n) * 100) / 100).toFixed(2)}/day × ${n} ad sets; clamped $${low}–$${high} from prior $${cur}/day).`
+                : `Meta ad set daily budget updated to $${next}/day (clamped between $${low} and $${high} from prior $${cur}/day).`;
           } catch (err: unknown) {
             const msg =
               err && typeof err === "object" && "response" in err
@@ -2811,7 +2973,8 @@ app.patch("/experiments/:id/campaign-budget", requireAuth, async (req: AuthReque
   if (dailyBudget == null || dailyBudget < 1) {
     return res.status(400).json({ error: "Body must include dailyBudget (number, min 1)" });
   }
-  if (!exp.metaAdSetId) {
+  const adSetIds = parseMetaAdSetIdsList(exp.metaAdSetId);
+  if (adSetIds.length === 0) {
     return res.status(400).json({ error: "Campaign has no linked Meta ad set. Launch to Meta first." });
   }
   const metaConn = await prisma.connectedAccount.findFirst({ where: { userId: uid, platform: "meta" } });
@@ -2819,9 +2982,11 @@ app.patch("/experiments/:id/campaign-budget", requireAuth, async (req: AuthReque
     return res.status(400).json({ error: "Meta not connected. Connect Meta in Integrations." });
   }
   try {
-    const budgetCents = Math.round(dailyBudget * 100);
-    const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${encodeURIComponent(exp.metaAdSetId)}?daily_budget=${budgetCents}&access_token=${encodeURIComponent(metaConn.accessToken)}`;
-    await axios.post(url);
+    await applyMetaAdSetDailyBudgetsFromTotal(adSetIds, dailyBudget, metaConn.accessToken);
+    await prisma.experiment.update({
+      where: { id: exp.id },
+      data: { totalDailyBudget: dailyBudget },
+    });
     return res.json({ ok: true, dailyBudget });
   } catch (err: unknown) {
     const msg = err && typeof err === "object" && "response" in err
