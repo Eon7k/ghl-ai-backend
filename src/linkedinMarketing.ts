@@ -470,14 +470,13 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
   const schedule = liRunSchedule();
   /**
    * Campaign group + campaign: `DRAFT` (dry) / `ACTIVE` (live). LinkedIn requires `status` on create.
-   * adCreativesV2 `status` is the legacy serving enum (ACTIVE / PAUSED / CANCELED) — not `DRAFT`.
-   * Sending `DRAFT` there can be dropped by validation, yielding Rest.li "field /status is required but not found".
-   * For dry run, keep creatives PAUSED; parent DRAFT campaign still prevents real delivery.
+   * Creatives: `status` must be `ACTIVE` on create — `PAUSED` is rejected unless `review.reviewStatus` is APPROVED.
+   * Empty `variables.data.com.linkedin.ads.SponsoredUpdateCreativeVariables` is required for SPONSORED_STATUS_UPDATE.
+   * Dry run still uses DRAFT group/campaign so nothing spends; do not set creative to PAUSED on create.
    */
   const liveStatus = "ACTIVE";
   const draftStatus = "DRAFT";
   const entityStatus = dryRun ? draftStatus : liveStatus;
-  const creativeV2Status = dryRun ? "PAUSED" : "ACTIVE";
 
   const groupBody: Record<string, unknown> = {
     account: accountUrn,
@@ -686,7 +685,12 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
       campaign: campaignUrn,
       reference: postUrn,
       type: "SPONSORED_STATUS_UPDATE",
-      status: creativeV2Status,
+      status: "ACTIVE",
+      variables: {
+        data: {
+          "com.linkedin.ads.SponsoredUpdateCreativeVariables": {},
+        },
+      },
     };
 
     const crRes = await axios.post(`${LI_V2}/adCreativesV2`, crBody, {
