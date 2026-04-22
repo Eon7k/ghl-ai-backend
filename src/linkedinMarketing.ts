@@ -3,6 +3,11 @@ import type { PrismaClient } from "@prisma/client";
 
 const LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken";
 
+const LI_V2 = "https://api.linkedin.com/v2";
+const LI_REST = "https://api.linkedin.com/rest";
+/** Marketing API version header; must match approved product version. */
+const LINKEDIN_REST_VERSION = (process.env.LINKEDIN_API_VERSION || "202502").trim();
+
 export type LinkedInAdAccountRow = { id: string; name: string; accountId: string };
 
 function sponsoredAccountIdFromUrn(urn: string): string | null {
@@ -60,35 +65,82 @@ function localizedNameFromAdAccount(data: Record<string, unknown>): string | nul
   return null;
 }
 
-/** List sponsored ad accounts for the authenticated member (requires Marketing API / r_ads). */
+/** Required for Marketing API GETs; matches launch/creative calls. */
+function liMarketingGetHeaders(accessToken: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    "X-Restli-Protocol-Version": "2.0.0",
+    "Linkedin-Version": LINKEDIN_REST_VERSION,
+    Accept: "application/json",
+  };
+}
+
+function extractElements(data: unknown): unknown[] {
+  if (!data || typeof data !== "object") return [];
+  const d = data as Record<string, unknown>;
+  if (Array.isArray(d.elements)) return d.elements;
+  if (d.value && typeof d.value === "object" && Array.isArray((d.value as { elements?: unknown[] }).elements)) {
+    return (d.value as { elements: unknown[] }).elements;
+  }
+  return [];
+}
+
+/** Account URN may be `account` or `sponsoredAccount` depending on API version. */
+function accountUrnFromElement(el: unknown): string | null {
+  if (!el || typeof el !== "object") return null;
+  const o = el as Record<string, unknown>;
+  const raw = o.account ?? o.sponsoredAccount;
+  if (typeof raw === "string" && raw.includes("sponsoredAccount")) return raw;
+  return null;
+}
+
+/**
+ * List sponsored ad accounts for the authenticated member (requires r_ads).
+ * Tries legacy v2 then /rest (Microsoft Learn documents both patterns for `q=authenticatedUser`).
+ */
 export async function listLinkedInAdAccounts(accessToken: string): Promise<LinkedInAdAccountRow[]> {
-  const url = "https://api.linkedin.com/v2/adAccountUsersV2?q=authenticatedUser";
-  const res = await axios.get<{ elements?: Array<{ account?: string }> }>(url, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "X-Restli-Protocol-Version": "2.0.0",
-    },
-  });
-  const elements = res.data?.elements || [];
+  const endpoints = [
+    `${LI_V2}/adAccountUsersV2?q=authenticatedUser&count=100`,
+    `${LI_REST}/adAccountUsers?q=authenticatedUser&count=100`,
+  ];
+
+  const seenIds = new Set<string>();
+  const idOrder: string[] = [];
+
+  for (const url of endpoints) {
+    try {
+      const res = await axios.get(url, {
+        headers: liMarketingGetHeaders(accessToken),
+        validateStatus: (s) => s < 500,
+      });
+      if (res.status >= 400) continue;
+      const elements = extractElements(res.data);
+      for (const el of elements) {
+        const urn = accountUrnFromElement(el);
+        if (!urn) continue;
+        const id = sponsoredAccountIdFromUrn(urn);
+        if (!id || seenIds.has(id)) continue;
+        seenIds.add(id);
+        idOrder.push(id);
+      }
+      if (idOrder.length > 0) break;
+    } catch {
+      /* try next endpoint */
+    }
+  }
+
   const accounts: LinkedInAdAccountRow[] = [];
-  for (const el of elements) {
-    const urn = el.account;
-    if (typeof urn !== "string") continue;
-    const id = sponsoredAccountIdFromUrn(urn);
-    if (!id) continue;
+  for (const id of idOrder) {
     let name = `LinkedIn Ad Account ${id}`;
     try {
-      const accRes = await axios.get<Record<string, unknown>>(
-        `https://api.linkedin.com/v2/adAccountsV2/${encodeURIComponent(id)}`,
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "X-Restli-Protocol-Version": "2.0.0",
-          },
-        }
-      );
-      const n = localizedNameFromAdAccount(accRes.data || {});
-      if (n) name = n;
+      const accRes = await axios.get<Record<string, unknown>>(`${LI_V2}/adAccountsV2/${encodeURIComponent(id)}`, {
+        headers: liMarketingGetHeaders(accessToken),
+        validateStatus: (s) => s < 500,
+      });
+      if (accRes.status < 400) {
+        const n = localizedNameFromAdAccount(accRes.data || {});
+        if (n) name = n;
+      }
     } catch {
       /* keep default label */
     }
@@ -113,9 +165,6 @@ export function linkedInApiErrorMessage(err: unknown): string {
   }
   return err instanceof Error ? err.message : "LinkedIn API error";
 }
-
-const LI_V2 = "https://api.linkedin.com/v2";
-const LINKEDIN_REST_VERSION = (process.env.LINKEDIN_API_VERSION || "202502").trim();
 
 function liJsonHeaders(token: string): Record<string, string> {
   return {
