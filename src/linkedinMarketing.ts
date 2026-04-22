@@ -235,15 +235,49 @@ function liJsonHeaders(token: string): Record<string, string> {
   };
 }
 
+/**
+ * Rest.li often returns { message, errorDetails: [...] }. The generic "Multiple errors occurred during
+ * input validation" is useless without appending `errorDetails`.
+ */
+function formatLinkedInApiErrorResponse(data: unknown, fallback: string): string {
+  if (data == null) return fallback;
+  if (typeof data === "string") return data;
+  if (typeof data !== "object") return fallback;
+  const o = data as Record<string, unknown>;
+  const parts: string[] = [];
+  if (typeof o.message === "string" && o.message) parts.push(o.message);
+  const ed = o.errorDetails ?? o.error_details;
+  if (ed != null) {
+    try {
+      const s = typeof ed === "string" ? ed : JSON.stringify(ed);
+      parts.push(s.length > 2500 ? `errorDetails: ${s.slice(0, 2500)}…` : `errorDetails: ${s}`);
+    } catch {
+      parts.push(`errorDetails: ${String(ed)}`);
+    }
+  } else if (o.errors != null) {
+    try {
+      const s = JSON.stringify(o.errors);
+      parts.push(s.length > 2500 ? `errors: ${s.slice(0, 2500)}…` : `errors: ${s}`);
+    } catch {
+      parts.push(`errors: ${String(o.errors)}`);
+    }
+  }
+  if (o.serviceErrorCode != null) parts.push(`serviceErrorCode: ${String(o.serviceErrorCode)}`);
+  return parts.length > 0 ? parts.join(" | ") : fallback;
+}
+
 /** User-facing hint when LinkedIn returns permission errors on post creation. */
 function linkedInPostPermissionHint(detail: string): string {
-  if (!/ugcPosts|rest\/posts|NO_VERSION|Not enough permissions/i.test(detail)) return detail;
+  if (!/ugcPosts|rest\/posts|NO_VERSION|Not enough permissions|partnerApiPostsExternal/i.test(detail)) {
+    return detail;
+  }
   return (
     `${detail} ` +
-    "Fix: (1) LinkedIn Developer Portal → your app → Products: approve Marketing / Community access that includes the **Posts** API (legacy ugcPosts v2 is separate and often not granted). " +
-    "(2) Add OAuth scope w_organization_social (and r_ads, rw_ads), reconnect LinkedIn. " +
-    "(3) LINKEDIN_API_VERSION must match an API version your app is approved for. " +
-    "If this persists, open a ticket in the LinkedIn Developer Support Portal for Posts API access on your app."
+    "The Posts API uses permission **partnerApiPostsExternal** (separate from `rw_ads` alone). " +
+    "In LinkedIn Developer Portal → your app: (1) **Products** — add/approve a product that includes **Posts** / **Share on LinkedIn** / **Community Management** (not only “Marketing API / Ads”). " +
+    "(2) **Auth** — scopes `r_ads` `rw_ads` `w_organization_social`, then **reconnect** LinkedIn. " +
+    "(3) **LINKEDIN_API_VERSION** = a `YYYYMM` your app is approved for (e.g. `202501`); if the error ends with a date like `...CREATE.20260401`, the server is checking that contract—try the **oldest** approved version shown in the portal, or request access for the listed contract. " +
+    "(4) If Posts is not available on your app, use LinkedIn Developer **Support** to request that product."
   );
 }
 
@@ -457,8 +491,9 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
     validateStatus: () => true,
   });
   if (cgRes.status >= 400) {
-    const d = cgRes.data as { message?: string; errorDetails?: unknown };
-    throw new Error(d?.message || `LinkedIn campaign group failed (${cgRes.status})`);
+    throw new Error(
+      formatLinkedInApiErrorResponse(cgRes.data, `LinkedIn campaign group failed (HTTP ${cgRes.status})`)
+    );
   }
   const campaignGroupId = extractIdFromCreateResponse(cgRes, "sponsoredCampaignGroup");
   if (!campaignGroupId) {
@@ -506,8 +541,7 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
     validateStatus: () => true,
   });
   if (cRes.status >= 400) {
-    const d = cRes.data as { message?: string };
-    throw new Error(d?.message || `LinkedIn campaign failed (${cRes.status})`);
+    throw new Error(formatLinkedInApiErrorResponse(cRes.data, `LinkedIn campaign failed (HTTP ${cRes.status})`));
   }
   const campaignId = extractIdFromCreateResponse(cRes, "sponsoredCampaign");
   if (!campaignId) {
@@ -546,8 +580,12 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
       { headers: liJsonHeaders(accessToken), validateStatus: () => true }
     );
     if (regRes.status >= 400) {
-      const d = regRes.data as { message?: string };
-      throw new Error(d?.message || `LinkedIn image register (${i + 1}) HTTP ${regRes.status}`);
+      throw new Error(
+        formatLinkedInApiErrorResponse(
+          regRes.data,
+          `LinkedIn image register (variant ${i + 1}) HTTP ${regRes.status}`
+        )
+      );
     }
     const val = (regRes.data as { value?: Record<string, unknown> })?.value;
     const upload = val?.uploadMechanism as
@@ -624,9 +662,15 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
       validateStatus: () => true,
     });
     if (postsRes.status >= 400) {
-      const d = postsRes.data as { message?: string };
-      const raw = d?.message || `LinkedIn Posts API (${i + 1}) HTTP ${postsRes.status}`;
-      throw new Error(linkedInPostPermissionHint(raw));
+      const base = formatLinkedInApiErrorResponse(
+        postsRes.data,
+        `LinkedIn Posts API (variant ${i + 1}) HTTP ${postsRes.status}`
+      );
+      const finalMsg =
+        /Not enough permissions|partnerApiPostsExternal|NO_VERSION|ugcPosts\./i.test(base)
+          ? linkedInPostPermissionHint(base)
+          : base;
+      throw new Error(finalMsg);
     }
     const postUrn = extractPostUrnForReference(postsRes);
     if (!postUrn) {
@@ -650,8 +694,9 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
       validateStatus: () => true,
     });
     if (crRes.status >= 400) {
-      const d = crRes.data as { message?: string };
-      throw new Error(d?.message || `LinkedIn creative (${i + 1}) HTTP ${crRes.status}`);
+      throw new Error(
+        formatLinkedInApiErrorResponse(crRes.data, `LinkedIn creative (variant ${i + 1}) HTTP ${crRes.status}`)
+      );
     }
     const crId = extractIdFromCreateResponse(crRes, "sponsoredCreative") ?? extractLiId(crRes.data);
     if (crId) creativeIds.push(crId);
