@@ -87,21 +87,51 @@ function extractElements(data: unknown): unknown[] {
 
 /** Account URN may be `account` or `sponsoredAccount` depending on API version. */
 function accountUrnFromElement(el: unknown): string | null {
-  if (!el || typeof el !== "object") return null;
-  const o = el as Record<string, unknown>;
-  const raw = o.account ?? o.sponsoredAccount;
-  if (typeof raw === "string" && raw.includes("sponsoredAccount")) return raw;
+  if (el == null) return null;
+  if (typeof el === "string" && /urn:li:sponsoredAccount:\d+/i.test(el)) return el;
+  if (typeof el === "object") {
+    const o = el as Record<string, unknown>;
+    const direct = o.account ?? o.sponsoredAccount;
+    if (typeof direct === "string" && direct.includes("sponsoredAccount")) return direct;
+    if (typeof direct === "string" && /urn:li:sponsoredAccount:\d+/i.test(direct)) return direct;
+    if (typeof direct === "object" && direct && "sponsored" in (direct as object)) {
+      const s = (direct as { sponsored?: string }).sponsored;
+      if (typeof s === "string" && s.includes("sponsoredAccount")) return s;
+    }
+  }
+  try {
+    const json = JSON.stringify(el);
+    const m = /urn:li:sponsoredAccount:\d+/i.exec(json);
+    if (m) return m[0];
+  } catch {
+    /* ignore */
+  }
   return null;
 }
 
+export type LinkedInAdAccountAttempt = {
+  url: string;
+  status: number;
+  elementCount: number;
+  topLevelKeys: string[];
+  message?: string;
+  sampleElementKeys?: string[];
+};
+
 /**
  * List sponsored ad accounts for the authenticated member (requires r_ads).
- * Tries legacy v2 then /rest (Microsoft Learn documents both patterns for `q=authenticatedUser`).
+ * Calls all known `q=authenticatedUser` entry points and **merges** account ids (one endpoint may be empty
+ * while another returns data depending on contract version and headers).
  */
-export async function listLinkedInAdAccounts(accessToken: string): Promise<LinkedInAdAccountRow[]> {
+export async function listLinkedInAdAccountsWithDiagnostics(
+  accessToken: string
+): Promise<{ accounts: LinkedInAdAccountRow[]; attempts: LinkedInAdAccountAttempt[] }> {
+  const attempts: LinkedInAdAccountAttempt[] = [];
   const endpoints = [
     `${LI_V2}/adAccountUsersV2?q=authenticatedUser&count=100`,
+    `${LI_V2}/adAccountUsersV2?q=authenticatedUser`,
     `${LI_REST}/adAccountUsers?q=authenticatedUser&count=100`,
+    `${LI_REST}/adAccountUsers?q=authenticatedUser`,
   ];
 
   const seenIds = new Set<string>();
@@ -111,10 +141,30 @@ export async function listLinkedInAdAccounts(accessToken: string): Promise<Linke
     try {
       const res = await axios.get(url, {
         headers: liMarketingGetHeaders(accessToken),
-        validateStatus: (s) => s < 500,
+        validateStatus: () => true,
+      });
+      const data = res.data;
+      const topLevelKeys =
+        data && typeof data === "object" ? Object.keys(data as object).slice(0, 20) : [];
+      const elements = extractElements(data);
+      let msg: string | undefined;
+      if (res.status >= 400) {
+        const d = data as { message?: string; error?: string; status?: number };
+        msg = d?.message || d?.error || `HTTP ${res.status}`;
+      }
+      let sampleKeys: string[] | undefined;
+      if (elements.length > 0 && elements[0] && typeof elements[0] === "object") {
+        sampleKeys = Object.keys(elements[0] as object).slice(0, 12);
+      }
+      attempts.push({
+        url: url.split("?")[0],
+        status: res.status,
+        elementCount: elements.length,
+        topLevelKeys,
+        message: msg,
+        sampleElementKeys: sampleKeys,
       });
       if (res.status >= 400) continue;
-      const elements = extractElements(res.data);
       for (const el of elements) {
         const urn = accountUrnFromElement(el);
         if (!urn) continue;
@@ -123,9 +173,14 @@ export async function listLinkedInAdAccounts(accessToken: string): Promise<Linke
         seenIds.add(id);
         idOrder.push(id);
       }
-      if (idOrder.length > 0) break;
-    } catch {
-      /* try next endpoint */
+    } catch (e) {
+      attempts.push({
+        url: url.split("?")[0],
+        status: 0,
+        elementCount: 0,
+        topLevelKeys: [],
+        message: e instanceof Error ? e.message : "request failed",
+      });
     }
   }
 
@@ -146,6 +201,11 @@ export async function listLinkedInAdAccounts(accessToken: string): Promise<Linke
     }
     accounts.push({ id, name, accountId: id });
   }
+  return { accounts, attempts };
+}
+
+export async function listLinkedInAdAccounts(accessToken: string): Promise<LinkedInAdAccountRow[]> {
+  const { accounts } = await listLinkedInAdAccountsWithDiagnostics(accessToken);
   return accounts;
 }
 

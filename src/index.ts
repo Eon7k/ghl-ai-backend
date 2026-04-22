@@ -18,6 +18,7 @@ import {
 } from "./googleMarketing";
 import {
   listLinkedInAdAccounts,
+  listLinkedInAdAccountsWithDiagnostics,
   refreshAndStoreLinkedInAccessToken,
   linkedInApiErrorMessage,
   launchLinkedInCampaign,
@@ -903,23 +904,30 @@ app.get("/integrations/linkedin/ad-accounts", requireAuth, async (req: AuthReque
   }
   let accessToken = liConn.accessToken;
   try {
-    try {
-      const adAccounts = await listLinkedInAdAccounts(accessToken);
-      return res.json({ adAccounts });
-    } catch (first: unknown) {
-      const status = axios.isAxiosError(first) ? first.response?.status : undefined;
-      if (status === 401 && liConn.refreshToken && LINKEDIN_CLIENT_ID && LINKEDIN_CLIENT_SECRET) {
-        accessToken = await refreshAndStoreLinkedInAccessToken(
-          prisma,
-          liConn,
-          LINKEDIN_CLIENT_ID,
-          LINKEDIN_CLIENT_SECRET
-        );
-        const adAccounts = await listLinkedInAdAccounts(accessToken);
-        return res.json({ adAccounts });
-      }
-      throw first;
+    let { accounts, attempts } = await listLinkedInAdAccountsWithDiagnostics(accessToken);
+    if (
+      accounts.length === 0 &&
+      attempts.some((a) => a.status === 401) &&
+      liConn.refreshToken &&
+      LINKEDIN_CLIENT_ID &&
+      LINKEDIN_CLIENT_SECRET
+    ) {
+      accessToken = await refreshAndStoreLinkedInAccessToken(
+        prisma,
+        liConn,
+        LINKEDIN_CLIENT_ID,
+        LINKEDIN_CLIENT_SECRET
+      );
+      ({ accounts, attempts } = await listLinkedInAdAccountsWithDiagnostics(accessToken));
     }
+    const payload: {
+      adAccounts: typeof accounts;
+      linkedInDiscovery?: { attempts: typeof attempts };
+    } = { adAccounts: accounts };
+    if (accounts.length === 0) {
+      payload.linkedInDiscovery = { attempts };
+    }
+    return res.json(payload);
   } catch (err: unknown) {
     const msg = linkedInApiErrorMessage(err);
     console.error("[LinkedIn ad-accounts]", msg);
@@ -935,27 +943,28 @@ app.get("/integrations/linkedin/test", requireAuth, async (req: AuthRequest, res
   if (!liConn) {
     return res.status(400).json({ ok: false, error: "LinkedIn not connected." });
   }
-  const linkedInConn = liConn;
-  async function countAccounts(): Promise<number> {
-    try {
-      return (await listLinkedInAdAccounts(linkedInConn.accessToken)).length;
-    } catch (first: unknown) {
-      const status = axios.isAxiosError(first) ? first.response?.status : undefined;
-      if (status === 401 && linkedInConn.refreshToken && LINKEDIN_CLIENT_ID && LINKEDIN_CLIENT_SECRET) {
-        const accessToken = await refreshAndStoreLinkedInAccessToken(
-          prisma,
-          linkedInConn,
-          LINKEDIN_CLIENT_ID,
-          LINKEDIN_CLIENT_SECRET
-        );
-        return (await listLinkedInAdAccounts(accessToken)).length;
-      }
-      throw first;
-    }
-  }
   try {
-    const adAccountCount = await countAccounts();
-    return res.json({ ok: true, adAccountCount });
+    let { accounts, attempts } = await listLinkedInAdAccountsWithDiagnostics(liConn.accessToken);
+    if (
+      accounts.length === 0 &&
+      attempts.some((a) => a.status === 401) &&
+      liConn.refreshToken &&
+      LINKEDIN_CLIENT_ID &&
+      LINKEDIN_CLIENT_SECRET
+    ) {
+      const newToken = await refreshAndStoreLinkedInAccessToken(
+        prisma,
+        liConn,
+        LINKEDIN_CLIENT_ID,
+        LINKEDIN_CLIENT_SECRET
+      );
+      ({ accounts, attempts } = await listLinkedInAdAccountsWithDiagnostics(newToken));
+    }
+    return res.json({
+      ok: true,
+      adAccountCount: accounts.length,
+      linkedInDiscovery: { attempts },
+    });
   } catch (e: unknown) {
     return res.status(502).json({ ok: false, error: linkedInApiErrorMessage(e) });
   }
