@@ -311,14 +311,21 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
 
   const accountUrn = sponsoredAccountUrn(sponsoredAccountId);
   const schedule = liRunSchedule();
-  const groupAndCampaignStatus = dryRun ? "PAUSED" : "ACTIVE";
+  /**
+   * LinkedIn rejects POST body `status: PAUSED` on new entities ("cannot be changed from null to PAUSED").
+   * Dry run: omit `status` so LinkedIn uses its default (typically DRAFT / not yet active — no spend until you activate in CM).
+   * Live: `ACTIVE` on create.
+   */
+  const liveStatus = "ACTIVE";
 
-  const groupBody = {
+  const groupBody: Record<string, unknown> = {
     account: accountUrn,
     name: `${campaignName} — group`.slice(0, 256),
-    status: groupAndCampaignStatus,
     runSchedule: { start: schedule.start, end: schedule.end },
   };
+  if (!dryRun) {
+    groupBody.status = liveStatus;
+  }
 
   const cgRes = await axios.post(`${LI_V2}/adCampaignGroupsV2`, groupBody, {
     headers: liJsonHeaders(accessToken),
@@ -359,8 +366,10 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
       },
     },
     politicalIntent: "NOT_POLITICAL",
-    status: groupAndCampaignStatus,
   };
+  if (!dryRun) {
+    campaignBody.status = liveStatus;
+  }
 
   const cRes = await axios.post(`${LI_V2}/adCampaignsV2`, campaignBody, {
     headers: liJsonHeaders(accessToken),
@@ -458,12 +467,14 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
     if (!ugcId) throw new Error(`LinkedIn did not return ugcPost id for variant ${i + 1}.`);
     const ugcUrn = `urn:li:ugcPost:${ugcId}`;
 
-    const crBody = {
+    const crBody: Record<string, unknown> = {
       campaign: campaignUrn,
       reference: ugcUrn,
       type: "SPONSORED_STATUS_UPDATE",
-      status: groupAndCampaignStatus,
     };
+    if (!dryRun) {
+      crBody.status = liveStatus;
+    }
 
     const crRes = await axios.post(`${LI_V2}/adCreativesV2`, crBody, {
       headers: liJsonHeaders(accessToken),
