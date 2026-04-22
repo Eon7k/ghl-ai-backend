@@ -383,20 +383,22 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
   const accountUrn = sponsoredAccountUrn(sponsoredAccountId);
   const schedule = liRunSchedule();
   /**
-   * LinkedIn rejects POST body `status: PAUSED` on new entities ("cannot be changed from null to PAUSED").
-   * Dry run: omit `status` so LinkedIn uses its default (typically DRAFT / not yet active — no spend until you activate in CM).
-   * Live: `ACTIVE` on create.
+   * Campaign group + campaign: `DRAFT` (dry) / `ACTIVE` (live). LinkedIn requires `status` on create.
+   * adCreativesV2 `status` is the legacy serving enum (ACTIVE / PAUSED / CANCELED) — not `DRAFT`.
+   * Sending `DRAFT` there can be dropped by validation, yielding Rest.li "field /status is required but not found".
+   * For dry run, keep creatives PAUSED; parent DRAFT campaign still prevents real delivery.
    */
   const liveStatus = "ACTIVE";
+  const draftStatus = "DRAFT";
+  const entityStatus = dryRun ? draftStatus : liveStatus;
+  const creativeV2Status = dryRun ? "PAUSED" : "ACTIVE";
 
   const groupBody: Record<string, unknown> = {
     account: accountUrn,
     name: `${campaignName} — group`.slice(0, 256),
     runSchedule: { start: schedule.start, end: schedule.end },
+    status: entityStatus,
   };
-  if (!dryRun) {
-    groupBody.status = liveStatus;
-  }
 
   const cgRes = await axios.post(`${LI_V2}/adCampaignGroupsV2`, groupBody, {
     headers: liJsonHeaders(accessToken),
@@ -444,10 +446,8 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
         ],
       },
     },
+    status: entityStatus,
   };
-  if (!dryRun) {
-    campaignBody.status = liveStatus;
-  }
 
   const cRes = await axios.post(`${LI_V2}/adCampaignsV2`, campaignBody, {
     headers: liJsonHeaders(accessToken),
@@ -556,10 +556,8 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
       campaign: campaignUrn,
       reference: ugcUrn,
       type: "SPONSORED_STATUS_UPDATE",
+      status: creativeV2Status,
     };
-    if (!dryRun) {
-      crBody.status = liveStatus;
-    }
 
     const crRes = await axios.post(`${LI_V2}/adCreativesV2`, crBody, {
       headers: liJsonHeaders(accessToken),
