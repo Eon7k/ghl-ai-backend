@@ -1,4 +1,4 @@
-import axios from "axios";
+import axios, { type AxiosResponse } from "axios";
 import type { PrismaClient } from "@prisma/client";
 
 const LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken";
@@ -261,6 +261,77 @@ function extractLiId(body: unknown): string | null {
     const id = (body as { id: unknown }).id;
     if (typeof id === "number" || typeof id === "string") return String(id);
   }
+  if (body && typeof body === "object" && body !== null) {
+    const o = body as Record<string, unknown>;
+    for (const k of ["value", "entity"]) {
+      const inner = o[k];
+      if (inner && typeof inner === "object" && inner !== null && "id" in inner) {
+        const id = (inner as { id: unknown }).id;
+        if (typeof id === "number" || typeof id === "string") return String(id);
+      }
+    }
+  }
+  return null;
+}
+
+const URN_ID_PATTERNS: Record<"sponsoredCampaignGroup" | "sponsoredCampaign" | "ugcPost" | "sponsoredCreative", RegExp> = {
+  sponsoredCampaignGroup: /urn:li:sponsoredCampaignGroup:([0-9]+)/i,
+  sponsoredCampaign: /urn:li:sponsoredCampaign:([0-9]+)/i,
+  // UGC id is typically numeric; allow common variants in the URN string
+  ugcPost: /urn:li:ugcPost:([^\s)]+)/i,
+  sponsoredCreative: /urn:li:sponsoredCreative:([0-9]+)/i,
+};
+
+/**
+ * Rest.li create often returns the entity only in `X-RestLi-Id` (and sometimes `Location`), not in JSON `id`.
+ * Header value may look like: (urn:li:sponsoredCampaignGroup:12345)
+ */
+function extractIdFromCreateResponse(
+  res: Pick<AxiosResponse, "data" | "headers" | "status">,
+  entity: "sponsoredCampaignGroup" | "sponsoredCampaign" | "ugcPost" | "sponsoredCreative"
+): string | null {
+  const fromBody = extractLiId(res.data);
+  if (fromBody) return fromBody;
+
+  const pat = URN_ID_PATTERNS[entity];
+  const scan = (s: string): string | null => {
+    const cleaned = s.replace(/^\(|\)$/g, "").trim();
+    const m = pat.exec(cleaned);
+    return m ? m[1] : null;
+  };
+
+  const rawHeaders = res.headers;
+  if (rawHeaders && typeof rawHeaders === "object") {
+    const h = rawHeaders as Record<string, string | string[] | undefined>;
+    for (const key of Object.keys(h)) {
+      if (key.toLowerCase() === "x-restli-id") {
+        const v = h[key];
+        const s = Array.isArray(v) ? v[0] : v;
+        if (typeof s === "string") {
+          const id = scan(s);
+          if (id) return id;
+        }
+      }
+    }
+    for (const locKey of ["location", "Location"]) {
+      const loc = h[locKey];
+      const s = Array.isArray(loc) ? loc[0] : loc;
+      if (typeof s === "string") {
+        const id = scan(s);
+        if (id) return id;
+        const tail = /\/([0-9]+)\s*$/i.exec(s);
+        if (tail) return tail[1];
+      }
+    }
+  }
+
+  try {
+    const s = JSON.stringify(res.data);
+    const m = pat.exec(s);
+    if (m) return m[1];
+  } catch {
+    /* ignore */
+  }
   return null;
 }
 
@@ -335,8 +406,16 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
     const d = cgRes.data as { message?: string; errorDetails?: unknown };
     throw new Error(d?.message || `LinkedIn campaign group failed (${cgRes.status})`);
   }
-  const campaignGroupId = extractLiId(cgRes.data);
-  if (!campaignGroupId) throw new Error("LinkedIn did not return a campaign group id.");
+  const campaignGroupId = extractIdFromCreateResponse(cgRes, "sponsoredCampaignGroup");
+  if (!campaignGroupId) {
+    const hint = cgRes.data != null ? JSON.stringify(cgRes.data).slice(0, 200) : "";
+    const hdr = cgRes.headers && (cgRes.headers as Record<string, unknown>)["x-restli-id"];
+    throw new Error(
+      `LinkedIn did not return a campaign group id (body or X-RestLi-Id). HTTP ${cgRes.status}. ${
+        hdr != null ? `X-RestLi-Id: ${String(hdr).slice(0, 120)}. ` : ""
+      }${hint ? `Body: ${hint}` : ""}`.trim()
+    );
+  }
 
   const dailyStr = Math.max(10, Math.round(Number(dailyBudgetUsd) * 100) / 100).toFixed(2);
   const campaignBody: Record<string, unknown> = {
@@ -379,8 +458,15 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
     const d = cRes.data as { message?: string };
     throw new Error(d?.message || `LinkedIn campaign failed (${cRes.status})`);
   }
-  const campaignId = extractLiId(cRes.data);
-  if (!campaignId) throw new Error("LinkedIn did not return a campaign id.");
+  const campaignId = extractIdFromCreateResponse(cRes, "sponsoredCampaign");
+  if (!campaignId) {
+    const hdr = cRes.headers && (cRes.headers as Record<string, unknown>)["x-restli-id"];
+    throw new Error(
+      `LinkedIn did not return a campaign id. HTTP ${cRes.status}. ${
+        hdr != null ? `X-RestLi-Id: ${String(hdr).slice(0, 120)}. ` : ""
+      }`.trim()
+    );
+  }
 
   const campaignUrn = `urn:li:sponsoredCampaign:${campaignId}`;
   const creativeIds: string[] = [];
@@ -463,7 +549,7 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
       const d = ugcRes.data as { message?: string };
       throw new Error(d?.message || `LinkedIn UGC post (${i + 1}) HTTP ${ugcRes.status}`);
     }
-    const ugcId = extractLiId(ugcRes.data);
+    const ugcId = extractIdFromCreateResponse(ugcRes, "ugcPost");
     if (!ugcId) throw new Error(`LinkedIn did not return ugcPost id for variant ${i + 1}.`);
     const ugcUrn = `urn:li:ugcPost:${ugcId}`;
 
@@ -484,7 +570,7 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
       const d = crRes.data as { message?: string };
       throw new Error(d?.message || `LinkedIn creative (${i + 1}) HTTP ${crRes.status}`);
     }
-    const crId = extractLiId(crRes.data);
+    const crId = extractIdFromCreateResponse(crRes, "sponsoredCreative") ?? extractLiId(crRes.data);
     if (crId) creativeIds.push(crId);
   }
 
