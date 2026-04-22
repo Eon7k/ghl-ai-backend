@@ -514,7 +514,25 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
         if (Array.isArray(arr) && arr[0]) uploadHeaders[k] = String(arr[0]);
       }
     }
-    await axios.put(uploadUrl, buf, { headers: uploadHeaders, maxBodyLength: Infinity, maxContentLength: Infinity });
+    const upRes = await axios.put(uploadUrl, buf, {
+      headers: uploadHeaders,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      validateStatus: () => true,
+    });
+    if (upRes.status >= 400) {
+      const raw =
+        typeof upRes.data === "string"
+          ? upRes.data
+          : upRes.data != null
+            ? JSON.stringify(upRes.data)
+            : "";
+      throw new Error(
+        `LinkedIn image upload (variant ${i + 1}) failed HTTP ${upRes.status}${
+          raw ? `: ${raw.slice(0, 500)}` : ""
+        }`
+      );
+    }
 
     const headline = (v.copy || campaignName).replace(/\n/g, " ").trim().slice(0, 200) || `Ad ${i + 1}`;
     const bodyText = (v.copy || headline).replace(/\n/g, " ").trim().slice(0, 3000);
