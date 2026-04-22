@@ -235,6 +235,58 @@ function liJsonHeaders(token: string): Record<string, string> {
   };
 }
 
+/** User-facing hint when LinkedIn returns permission errors on post creation. */
+function linkedInPostPermissionHint(detail: string): string {
+  if (!/ugcPosts|rest\/posts|NO_VERSION|Not enough permissions/i.test(detail)) return detail;
+  return (
+    `${detail} ` +
+    "Fix: (1) LinkedIn Developer Portal → your app → Products: approve Marketing / Community access that includes the **Posts** API (legacy ugcPosts v2 is separate and often not granted). " +
+    "(2) Add OAuth scope w_organization_social (and r_ads, rw_ads), reconnect LinkedIn. " +
+    "(3) LINKEDIN_API_VERSION must match an API version your app is approved for. " +
+    "If this persists, open a ticket in the LinkedIn Developer Support Portal for Posts API access on your app."
+  );
+}
+
+/** After vector upload, /rest/posts expects urn:li:image:{sameId} (see Assets vs Images URN mapping in LinkedIn docs). */
+function imageUrnFromDigitalMediaAssetUrn(digital: string): string {
+  const m = /^urn:li:digitalmediaAsset:(.+)$/i.exec(digital.trim());
+  if (m) return `urn:li:image:${m[1]}`;
+  return digital;
+}
+
+/** Posts API returns `id` in body or `x-restli-id` as urn:li:ugcPost:… or urn:li:share:… — ad creatives accept either as reference. */
+function extractPostUrnForReference(res: Pick<AxiosResponse, "data" | "headers" | "status">): string | null {
+  const data = res.data;
+  if (data && typeof data === "object" && "id" in data) {
+    const id = (data as { id: unknown }).id;
+    if (typeof id === "string" && /^urn:li:(ugcPost|share):/i.test(id)) return id;
+  }
+  const rawHeaders = res.headers;
+  if (rawHeaders && typeof rawHeaders === "object") {
+    const h = rawHeaders as Record<string, string | string[] | undefined>;
+    for (const key of Object.keys(h)) {
+      if (key.toLowerCase() === "x-restli-id") {
+        const v = h[key];
+        const s = Array.isArray(v) ? v[0] : v;
+        if (typeof s === "string") {
+          const cleaned = s.replace(/^\(|\)$/g, "").trim();
+          if (/^urn:li:(ugcPost|share):/i.test(cleaned)) return cleaned;
+        }
+      }
+    }
+  }
+  try {
+    const s = JSON.stringify(res.data);
+    const a = s.match(/urn:li:ugcPost:[^"\s,}]+/i);
+    if (a) return a[0];
+    const b = s.match(/urn:li:share:[0-9]+/i);
+    if (b) return b[0];
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 /** Accept numeric org id or full urn:li:organization:… */
 export function normalizeLinkedInOrganizationUrn(raw: string): string {
   const t = raw.trim();
@@ -355,9 +407,9 @@ export type LaunchLinkedInCampaignResult = {
 };
 
 /**
- * Website-traffic style launch: campaign group + campaign + image UGC posts + sponsored creatives.
- * Requires rw_ads, an ad account the user can manage, and a Company Page URN (organization) for image + post authoring.
- * Optional env: LINKEDIN_API_VERSION (default 202502) — set to match LinkedIn developer portal API version.
+ * Website-traffic style launch: campaign group + campaign + **Posts** API image post (`/rest/posts`) + sponsored creatives.
+ * (Legacy `/v2/ugcPosts` is not used; it often returns ugcPosts.CREATE.NO_VERSION on modern apps.) Requires rw_ads,
+ * w_organization_social, an ad account, and a Company Page URN. Optional: LINKEDIN_API_VERSION = portal version (YYYYMM).
  */
 export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput): Promise<LaunchLinkedInCampaignResult> {
   const {
@@ -542,42 +594,53 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
     const headline = (v.copy || campaignName).replace(/\n/g, " ").trim().slice(0, 200) || `Ad ${i + 1}`;
     const bodyText = (v.copy || headline).replace(/\n/g, " ").trim().slice(0, 3000);
 
-    const ugcBody = {
+    /**
+     * Create the organic/distribution post with the **Posts** API (`/rest/posts`), not legacy `/v2/ugcPosts`.
+     * `ugcPosts.CREATE.NO_VERSION` is tied to the deprecated UGC v2 line; the version header does not fix it.
+     * Map vector asset to `urn:li:image:{id}` for `content.media.id` (per LinkedIn Assets/Images URN notes).
+     */
+    const imageUrn = imageUrnFromDigitalMediaAssetUrn(assetUrn);
+    const restPostBody: Record<string, unknown> = {
       author: organizationUrn,
-      lifecycleState: "PUBLISHED",
-      specificContent: {
-        "com.linkedin.ugc.ShareContent": {
-          shareCommentary: { text: bodyText },
-          shareMediaCategory: "IMAGE",
-          media: [
-            {
-              status: "READY",
-              description: { text: headline },
-              media: assetUrn,
-              title: { text: headline },
-              originalUrl: landingPageUrl,
-            },
-          ],
+      commentary: bodyText,
+      visibility: "PUBLIC",
+      distribution: {
+        feedDistribution: "MAIN_FEED",
+        targetEntities: [],
+        thirdPartyDistributionChannels: [],
+      },
+      content: {
+        media: {
+          title: headline,
+          id: imageUrn,
         },
       },
-      visibility: { "com.linkedin.ugc.MemberNetworkVisibility": "CONTAINER" },
+      lifecycleState: "PUBLISHED",
+      isReshareDisabledByAuthor: false,
     };
 
-    const ugcRes = await axios.post(`${LI_V2}/ugcPosts`, ugcBody, {
+    const postsRes = await axios.post(`${LI_REST}/posts`, restPostBody, {
       headers: liJsonHeaders(accessToken),
       validateStatus: () => true,
     });
-    if (ugcRes.status >= 400) {
-      const d = ugcRes.data as { message?: string };
-      throw new Error(d?.message || `LinkedIn UGC post (${i + 1}) HTTP ${ugcRes.status}`);
+    if (postsRes.status >= 400) {
+      const d = postsRes.data as { message?: string };
+      const raw = d?.message || `LinkedIn Posts API (${i + 1}) HTTP ${postsRes.status}`;
+      throw new Error(linkedInPostPermissionHint(raw));
     }
-    const ugcId = extractIdFromCreateResponse(ugcRes, "ugcPost");
-    if (!ugcId) throw new Error(`LinkedIn did not return ugcPost id for variant ${i + 1}.`);
-    const ugcUrn = `urn:li:ugcPost:${ugcId}`;
+    const postUrn = extractPostUrnForReference(postsRes);
+    if (!postUrn) {
+      const hdr = postsRes.headers && (postsRes.headers as Record<string, unknown>)["x-restli-id"];
+      throw new Error(
+        `LinkedIn did not return a post URN for variant ${i + 1} (body id or x-restli-id). ${
+          hdr != null ? `X-RestLi-Id: ${String(hdr).slice(0, 160)}` : ""
+        }`
+      );
+    }
 
     const crBody: Record<string, unknown> = {
       campaign: campaignUrn,
-      reference: ugcUrn,
+      reference: postUrn,
       type: "SPONSORED_STATUS_UPDATE",
       status: creativeV2Status,
     };

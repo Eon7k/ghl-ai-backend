@@ -234,9 +234,9 @@ const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || "").trim();
 const GOOGLE_ADS_DEVELOPER_TOKEN = (process.env.GOOGLE_ADS_DEVELOPER_TOKEN || "").trim();
 const LINKEDIN_CLIENT_ID = (process.env.LINKEDIN_CLIENT_ID || "").trim();
 const LINKEDIN_CLIENT_SECRET = (process.env.LINKEDIN_CLIENT_SECRET || "").trim();
-/** Space-separated OAuth scopes; default requests Marketing API read/write for ad accounts. Override if your app uses different approved scopes. */
+/** Space-separated OAuth scopes. Launch posts UGC as a Company Page — w_organization_social is required; add to the app in Developer Portal and reconnect. */
 const LINKEDIN_OAUTH_SCOPES = (
-  process.env.LINKEDIN_OAUTH_SCOPES || "r_ads rw_ads"
+  process.env.LINKEDIN_OAUTH_SCOPES || "r_ads rw_ads w_organization_social"
 ).trim();
 // Must be a full URL (https://...) so redirect after OAuth goes to the frontend, not a path on the backend
 function normalizeFrontendUrl(url: string): string {
