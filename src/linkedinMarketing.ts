@@ -507,12 +507,17 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
     if (!uploadUrl || !assetUrn) {
       throw new Error(`LinkedIn did not return upload URL/asset for variant ${i + 1}.`);
     }
-    const uploadHeaders: Record<string, string> = {};
+    // LinkedIn requires Bearer on the PUT to dms-uploads (unlike some video-only flows). Omitting it returns 400 + HTML.
+    const uploadHeaders: Record<string, string> = { Authorization: `Bearer ${accessToken}` };
     const h = httpReq?.headers;
     if (h && typeof h === "object") {
       for (const [k, arr] of Object.entries(h)) {
         if (Array.isArray(arr) && arr[0]) uploadHeaders[k] = String(arr[0]);
       }
+    }
+    const hasContentType = Object.keys(uploadHeaders).some((k) => k.toLowerCase() === "content-type");
+    if (!hasContentType) {
+      uploadHeaders["Content-Type"] = "application/octet-stream";
     }
     const upRes = await axios.put(uploadUrl, buf, {
       headers: uploadHeaders,
