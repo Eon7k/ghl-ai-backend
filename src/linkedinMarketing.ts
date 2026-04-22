@@ -444,7 +444,6 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
         ],
       },
     },
-    politicalIntent: "NOT_POLITICAL",
   };
   if (!dryRun) {
     campaignBody.status = liveStatus;
