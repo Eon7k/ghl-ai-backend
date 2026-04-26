@@ -8,7 +8,7 @@ import jwt from "jsonwebtoken";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
 import { enabledProductKeysFromDb, userHasProduct } from "./productEntitlements";
-import { runCompetitorScanForWatch } from "./competitorIntel";
+import { runCompetitorScanForWatch, resolveCompetitorFacebookPageInput } from "./competitorIntel";
 
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
 export const EXPANSION_UPLOADS_ROOT = path.resolve(
@@ -1017,10 +1017,19 @@ export function createExpansionRouter(): Router {
         typeof b.competitorWebsite === "string" && b.competitorWebsite.trim()
           ? b.competitorWebsite.trim().slice(0, 500)
           : null;
-      const competitorFacebookPageId =
-        typeof b.competitorFacebookPageId === "string" && b.competitorFacebookPageId.trim()
-          ? b.competitorFacebookPageId.trim().slice(0, 200)
-          : null;
+      let competitorFacebookPageId: string | null = null;
+      if (typeof b.competitorFacebookPageId === "string" && b.competitorFacebookPageId.trim()) {
+        try {
+          competitorFacebookPageId = await resolveCompetitorFacebookPageInput(b.competitorFacebookPageId.trim().slice(0, 2000));
+        } catch (e) {
+          return apiErr(
+            res,
+            400,
+            "VALIDATION",
+            e instanceof Error ? e.message : "Could not use that Facebook Page link. Try a full page URL or numeric id."
+          );
+        }
+      }
       const competitorGoogleAdvertiserId =
         typeof b.competitorGoogleAdvertiserId === "string" && b.competitorGoogleAdvertiserId.trim()
           ? b.competitorGoogleAdvertiserId.trim().slice(0, 200)
@@ -1091,10 +1100,22 @@ export function createExpansionRouter(): Router {
             : String(b.competitorWebsite).trim().slice(0, 500);
       }
       if (b.competitorFacebookPageId !== undefined) {
-        data.competitorFacebookPageId =
-          b.competitorFacebookPageId === null || b.competitorFacebookPageId === ""
-            ? null
-            : String(b.competitorFacebookPageId).trim().slice(0, 200);
+        if (b.competitorFacebookPageId === null || b.competitorFacebookPageId === "") {
+          data.competitorFacebookPageId = null;
+        } else {
+          try {
+            const raw = String(b.competitorFacebookPageId).trim().slice(0, 2000);
+            const resolved = await resolveCompetitorFacebookPageInput(raw);
+            data.competitorFacebookPageId = resolved;
+          } catch (e) {
+            return apiErr(
+              res,
+              400,
+              "VALIDATION",
+              e instanceof Error ? e.message : "Could not use that Facebook Page link. Try a full page URL or numeric id."
+            );
+          }
+        }
       }
       if (b.competitorGoogleAdvertiserId !== undefined) {
         data.competitorGoogleAdvertiserId =

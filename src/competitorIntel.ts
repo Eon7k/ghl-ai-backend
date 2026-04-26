@@ -26,6 +26,132 @@ function metaAdLibraryToken(): string | null {
   return null;
 }
 
+const FB_PATH_RESERVED = new Set(
+  "share,sharer,watch,groups,events,marketplace,profile.php,pages,people,login,help,news,photo.php,story.php,reel,posts,videos,photos,permalink,live,notes".split(
+    ","
+  )
+);
+
+export type FacebookPageParse = { type: "numericId"; id: string } | { type: "graphHandle"; handle: string } | { type: "empty" };
+
+/**
+ * From a pasted Page id, @handle, or facebook.com/... URL, extract a numeric id or a Graph "username" to resolve.
+ */
+export function parseFacebookPageInput(raw: string): FacebookPageParse {
+  const t = raw.trim();
+  if (!t) return { type: "empty" };
+
+  if (/^\d{4,22}$/.test(t)) {
+    return { type: "numericId", id: t };
+  }
+
+  let toParse = t;
+  if (!/^https?:\/\//i.test(toParse) && /facebook\.com|fb\.com/i.test(toParse)) {
+    toParse = `https://${toParse}`;
+  }
+  if (/^https?:\/\//i.test(toParse)) {
+    let u: URL;
+    try {
+      u = new URL(toParse);
+    } catch {
+      return t.length < 1 || /\s/.test(t) ? { type: "empty" } : { type: "graphHandle", handle: t.replace(/^@/, "") };
+    }
+    const host = u.hostname.toLowerCase().replace(/^www\./, "");
+    if (host === "fb.com" || host === "facebook.com" || host === "m.facebook.com" || host === "web.facebook.com" || host === "business.facebook.com" || host === "mbasic.facebook.com") {
+      const idParam = u.searchParams.get("id") || u.searchParams.get("page_id");
+      if (idParam && /^\d{4,22}$/.test(idParam)) {
+        return { type: "numericId", id: idParam };
+      }
+      if (u.pathname.toLowerCase().includes("profile.php") && u.searchParams.get("id") && /^\d{4,22}$/.test(String(u.searchParams.get("id")))) {
+        return { type: "numericId", id: String(u.searchParams.get("id")) };
+      }
+      const parts = u.pathname.split("/").filter(Boolean);
+      if (parts[0] === "pages" && parts.length >= 2) {
+        const last = parts[parts.length - 1]!.split("?")[0]!.split("#")[0]!;
+        if (/^\d{4,22}$/.test(last)) {
+          return { type: "numericId", id: last };
+        }
+        if (last && !FB_PATH_RESERVED.has(last.toLowerCase())) {
+          return { type: "graphHandle", handle: last };
+        }
+      } else if (parts.length > 0) {
+        let i = 0;
+        if (parts[0] && /^[a-z]{2}(-[a-z]{2,})?$/i.test(parts[0]!) && parts.length > 1) {
+          i = 1;
+        }
+        const seg = (parts[i] || "").split("?")[0]!.split("#")[0]!;
+        if (seg) {
+          if (/^\d{4,22}$/.test(seg)) return { type: "numericId", id: seg };
+          if (seg.toLowerCase().endsWith(".php")) {
+            return { type: "empty" };
+          }
+          if (FB_PATH_RESERVED.has(seg.toLowerCase())) {
+            return { type: "empty" };
+          }
+          return { type: "graphHandle", handle: seg };
+        }
+      }
+    }
+  }
+
+  if (!/[\s/]/.test(t) && t.length <= 200) {
+    return { type: "graphHandle", handle: t.replace(/^@/, "").replace(/^fb\.com\//i, "") };
+  }
+  return { type: "empty" };
+}
+
+async function graphGetFacebookId(handleOrId: string): Promise<string> {
+  const token = metaAdLibraryToken();
+  if (!token) {
+    throw new Error("Set META_APP_ID and META_APP_SECRET (or META_AD_LIBRARY_TOKEN) to resolve Facebook links.");
+  }
+  const sp = new URLSearchParams();
+  sp.set("fields", "id");
+  sp.set("access_token", token);
+  const pathPart = `/${GRAPH_VERSION}/${encodeURIComponent(handleOrId)}`;
+  const url = `https://graph.facebook.com${pathPart}?${sp.toString()}`;
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 15_000);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: ac.signal });
+  } finally {
+    clearTimeout(to);
+  }
+  const data = (await res.json().catch(() => ({}))) as { id?: string; error?: { message?: string } };
+  if (!res.ok || data.error) {
+    const msg = data.error?.message || `Graph HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  if (typeof data.id !== "string" || !/^\d{4,22}$/.test(data.id)) {
+    throw new Error("Could not get a valid Facebook Page id from that link. Use the brand Page URL (not a personal profile).");
+  }
+  return data.id;
+}
+
+/**
+ * Turn user input (id, @handle, or full facebook.com/ URL) into a stored numeric Page id. Null if empty.
+ * Throws on invalid input (caller maps to 400).
+ */
+export async function resolveCompetitorFacebookPageInput(raw: string | null | undefined): Promise<string | null> {
+  if (raw == null) return null;
+  const t = String(raw).trim();
+  if (!t) return null;
+  const parsed = parseFacebookPageInput(t);
+  if (parsed.type === "empty") {
+    if (t.length > 0) {
+      throw new Error(
+        "Could not read a Facebook Page from that text. Paste the full Page URL from your browser, or a numeric id (Digits only, from Page info), or a single @PageUsername."
+      );
+    }
+    return null;
+  }
+  if (parsed.type === "numericId") {
+    return parsed.id;
+  }
+  return await graphGetFacebookId(parsed.handle);
+}
+
 export type PublicUrlResult =
   | { ok: true; href: string }
   | { ok: false; error: string };
@@ -457,15 +583,36 @@ export async function runCompetitorScanForWatch(
   }
 
   if (watch.competitorFacebookPageId?.trim()) {
-    const m = await fetchAndStoreMetaAdLibrary(watch.id, watch.competitorFacebookPageId.trim());
-    if (m.ok) {
-      if (m.error) scanNotes.push(m.error);
-      if (m.count) scanNotes.push(`Pulled ${m.count} Meta ad(s) from Ad Library.`);
-    } else {
-      scanNotes.push(`Meta ads: ${m.error}`);
+    const raw = watch.competitorFacebookPageId.trim();
+    let numericPageId = "";
+    try {
+      const r = await resolveCompetitorFacebookPageInput(raw);
+      if (r) numericPageId = r;
+    } catch (e) {
+      scanNotes.push(`Facebook Page: ${e instanceof Error ? e.message : "Could not resolve"}`);
+    }
+    if (numericPageId) {
+      if (raw !== numericPageId) {
+        try {
+          await prisma.competitorWatch.update({
+            where: { id: watch.id },
+            data: { competitorFacebookPageId: numericPageId },
+          });
+        } catch (e) {
+          console.error("[competitor scan] could not store resolved Page id", e);
+        }
+        scanNotes.push(`Saved resolved Page id ${numericPageId}.`);
+      }
+      const m = await fetchAndStoreMetaAdLibrary(watch.id, numericPageId);
+      if (m.ok) {
+        if (m.error) scanNotes.push(m.error);
+        if (m.count) scanNotes.push(`Pulled ${m.count} Meta ad(s) from Ad Library.`);
+      } else {
+        scanNotes.push(`Meta ads: ${m.error}`);
+      }
     }
   } else {
-    scanNotes.push("Meta: no Page ID — add a numeric Meta Page ID to pull public ads (requires app token in env).");
+    scanNotes.push("Meta: add a Facebook Page link or id to pull public ads (server needs META_APP_ID + META_APP_SECRET and Graph).");
   }
 
   const recentAds = await prisma.competitorAd.findMany({
