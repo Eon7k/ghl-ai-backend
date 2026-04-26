@@ -529,18 +529,43 @@ const ADS_ARCHIVE_FIELDS = [
 
 type AdsArchiveJson = { data?: MetaAdRow[]; error?: { message?: string; code?: number } };
 
-/** One Graph ads_archive GET; Meta expects ad_reached_countries as a JSON array, e.g. ["US","GB"] — not the bare "US" string. */
+/** Meta cURL uses `ad_reached_countries=['US']` (single-quoted). Node uses JSON `["US"]` first; this is a second encoding some stacks expect. */
+function adReachedCountriesToMetaCurlString(codes: string[], max = 20): string {
+  const c = codes.slice(0, max).filter((x) => /^[A-Z]{2}$/.test(x));
+  if (c.length === 0) return "['US']";
+  return "['" + c.join("','") + "']";
+}
+
+type AdLibRequestShape = {
+  label: string;
+  /** Graph doc: comma-separated; many examples use a JSON string array. */
+  pageIdFormat: "plain" | "jsonArray";
+  /** Double-quote JSON (standard) or Meta cURL single-quote style. */
+  countriesFormat: "json" | "metaCurl";
+  countries: string[];
+  adActiveStatus: "ACTIVE" | "ALL";
+};
+
+/** One Graph ads_archive GET. */
 async function getAdsArchiveOnce(
   searchPageId: string,
-  countries: string[],
-  adActiveStatus: "ACTIVE" | "ALL"
+  shape: Pick<AdLibRequestShape, "pageIdFormat" | "countriesFormat" | "countries" | "adActiveStatus">
 ): Promise<{ res: Response; data: AdsArchiveJson }> {
   const token = metaAdLibraryToken()!;
   const sp = new URLSearchParams();
   sp.set("access_token", token);
-  sp.set("search_page_ids", searchPageId);
-  sp.set("ad_reached_countries", JSON.stringify(countries));
-  sp.set("ad_active_status", adActiveStatus);
+  if (shape.pageIdFormat === "jsonArray") {
+    sp.set("search_page_ids", JSON.stringify([searchPageId]));
+  } else {
+    sp.set("search_page_ids", searchPageId);
+  }
+  if (shape.countriesFormat === "json") {
+    sp.set("ad_reached_countries", JSON.stringify(shape.countries));
+  } else {
+    sp.set("ad_reached_countries", adReachedCountriesToMetaCurlString(shape.countries, 32));
+  }
+  sp.set("ad_active_status", shape.adActiveStatus);
+  sp.set("ad_type", "ALL");
   sp.set("fields", ADS_ARCHIVE_FIELDS);
   sp.set("limit", "30");
   const url = `https://graph.facebook.com/${GRAPH_VERSION}/ads_archive?${sp.toString()}`;
@@ -570,21 +595,28 @@ export async function fetchAndStoreMetaAdLibrary(
   }
 
   const tiers = adReachedCountriesTiers();
-  /** Two calls max: (1) prefer active ads in the configured/default regions; (2) broad regions + include inactive, still common for “we see them in the web UI but API was empty” cases. */
-  const attempts: { label: string; countries: string[]; status: "ACTIVE" | "ALL" }[] = [
-    { label: "primary+active", countries: tiers.primary, status: "ACTIVE" },
-    { label: "wide+all", countries: tiers.wide, status: "ALL" },
+  /**
+   * Meta’s examples mix: `search_page_ids` as plain id vs `["id"]`, and `ad_reached_countries` as JSON vs `['US']`.
+   * App tokens sometimes return HTTP 200 + [] until the right shape + `ad_type=ALL` + correct countries.
+   */
+  const attempts: AdLibRequestShape[] = [
+    { label: "jsonPage+pri+ACTIVE+jsonC", pageIdFormat: "jsonArray", countriesFormat: "json", countries: tiers.primary, adActiveStatus: "ACTIVE" },
+    { label: "plainPage+pri+ACTIVE+jsonC", pageIdFormat: "plain", countriesFormat: "json", countries: tiers.primary, adActiveStatus: "ACTIVE" },
+    { label: "jsonPage+wide+ALL+jsonC", pageIdFormat: "jsonArray", countriesFormat: "json", countries: tiers.wide, adActiveStatus: "ALL" },
+    { label: "plainPage+wide+ALL+jsonC", pageIdFormat: "plain", countriesFormat: "json", countries: tiers.wide, adActiveStatus: "ALL" },
+    { label: "jsonPage+wide+ALL+metaCurlC", pageIdFormat: "jsonArray", countriesFormat: "metaCurl", countries: tiers.wide, adActiveStatus: "ALL" },
+    { label: "plainPage+pri+ACTIVE+metaCurlC", pageIdFormat: "plain", countriesFormat: "metaCurl", countries: tiers.primary.slice(0, 8), adActiveStatus: "ACTIVE" },
   ];
 
   let lastHttpError: string | null = null;
   const tried: string[] = [];
 
   for (const a of attempts) {
-    const key = `${a.label}:${a.status}:[${a.countries.slice(0, 5).join(",")}${a.countries.length > 5 ? "…" : ""}]`;
+    const key = `${a.label}`;
     tried.push(key);
     let one: { res: Response; data: AdsArchiveJson };
     try {
-      one = await getAdsArchiveOnce(numericId, a.countries, a.status);
+      one = await getAdsArchiveOnce(numericId, a);
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : "Ad Library request failed", debug: tried.join(" | ") };
     }
@@ -599,17 +631,33 @@ export async function fetchAndStoreMetaAdLibrary(
       if (code === 4 || /rate limit|too many|temporarily|limit/i.test(em)) {
         return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
       }
+      if (code === 10 || /permission|not authorized|does not have permission|2332002/i.test(em)) {
+        return {
+          ok: false,
+          error: `${lastHttpError} (Ad Library often needs a long-lived *user* token with the right product access, not only an app id|secret. Check Meta’s Ad Library API setup.)`,
+          debug: tried.join(" | "),
+        };
+      }
       continue;
     }
     const rows = data.data || [];
-    if (rows.length === 0) continue;
+    if (rows.length === 0) {
+      if (res.ok) {
+        console.warn(`[competitorIntel] ads_archive 200 empty: page=${numericId} attempt=${a.label}`);
+      }
+      continue;
+    }
 
     let count = 0;
     for (const ad of rows) {
       if (!ad.id) continue;
       const body = pickCreativeText(ad.ad_creative_bodies);
       const title = pickCreativeText(ad.ad_creative_link_titles);
-      const headline = title || (body ? body.replace(/\s+/g, " ").trim().slice(0, 300) : null);
+      let headline = title || (body ? body.replace(/\s+/g, " ").trim().slice(0, 300) : null);
+      if (!headline && !body) {
+        const pn = typeof ad.page_name === "string" && ad.page_name.trim() ? ad.page_name.trim() : null;
+        headline = pn ? `Ad from ${pn.slice(0, 120)}` : "Ad in Meta Ad Library (creative text not in this API row)";
+      }
       const mediaUrl = typeof ad.ad_snapshot_url === "string" && ad.ad_snapshot_url.startsWith("http") ? ad.ad_snapshot_url : null;
       try {
         await prisma.competitorAd.upsert({
@@ -644,12 +692,10 @@ export async function fetchAndStoreMetaAdLibrary(
       }
     }
     if (count > 0) {
-      if (a.label !== "primary+active" || a.status !== "ACTIVE") {
-        console.info(
-          `[competitorIntel] Ad Library: got ${count} ad(s) using ${a.label} (countries n=${a.countries.length}, status=${a.status})`
-        );
+      if (a.label !== "jsonPage+pri+ACTIVE+jsonC") {
+        console.info(`[competitorIntel] Ad Library: got ${count} ad(s) using ${a.label}`);
       }
-      return { ok: true, count, debug: `used:${a.label}/${a.status}` };
+      return { ok: true, count, debug: `used:${a.label}` };
     }
     if (rows.length > 0) {
       return {
@@ -661,7 +707,7 @@ export async function fetchAndStoreMetaAdLibrary(
   }
 
   const hint =
-    "0 ads in Ad Library for this Page with these filters. If you see ads in facebook.com/ads/library for this Page, set META_AD_LIBRARY_COUNTRIES to a comma list of regions they target (e.g. US,GB,DE) and re-run, or double-check the saved Page id.";
+    "0 ads returned from the Graph `ads_archive` call for this Page after all request shapes. If the public Ad Library (website) still shows their ads, Meta may require a **user access token** (not only app_id|app_secret) and/or Ad Library API access in your app — see developers.facebook.com → Ad Library API. You can also set META_AD_LIBRARY_COUNTRIES to the regions you see in the ad’s “reached” filter (e.g. US,GB,DE) and re-check the **numeric** Page id matches the one in the public library URL.";
   if (lastHttpError) {
     return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
   }
@@ -950,9 +996,11 @@ export async function runCompetitorScanForWatch(
       const m = await fetchAndStoreMetaAdLibrary(watch.id, numericPageId);
       if (m.ok) {
         if (m.error) scanNotes.push(m.error);
+        if (m.debug) scanNotes.push(`Meta Ad Library: ${m.debug}`);
         if (m.count) scanNotes.push(`Pulled ${m.count} Meta ad(s) from Ad Library.`);
       } else {
         scanNotes.push(`Meta ads: ${m.error}`);
+        if (m.debug) scanNotes.push(`Meta Ad Library: ${m.debug}`);
       }
     }
   } else {
@@ -984,8 +1032,16 @@ export async function runCompetitorScanForWatch(
     adDetails,
   });
 
+  const tech = scanNotes
+    .filter((s) => /Meta|Ad Library|Facebook Page:|Pulled .* Meta/i.test(s))
+    .slice(0, 14);
+  const summaryWithNotes =
+    tech.length > 0
+      ? `${syn.summary}\n\n**Scan (system):** ${tech.map((s) => s.replace(/\s+/g, " ").trim()).join(" \u00b7 ")}`
+      : syn.summary;
+
   return {
-    summary: syn.summary,
+    summary: summaryWithNotes,
     topThemes: syn.topThemes as unknown as Prisma.InputJsonValue,
     suggestedCounterAngles: syn.suggestedCounterAngles as unknown as Prisma.InputJsonValue,
     strongestAds: (syn.strongestAds.length
