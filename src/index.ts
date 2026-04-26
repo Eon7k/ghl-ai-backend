@@ -27,6 +27,7 @@ import {
   refreshAndStoreLinkedInAccessToken,
   linkedInApiErrorMessage,
   launchLinkedInCampaign,
+  postLinkedInOrganicMainFeed,
 } from "./linkedinMarketing";
 import { Prisma } from "@prisma/client";
 import { attachBrandingHost, createExpansionRouter, EXPANSION_UPLOADS_ROOT } from "./expansionApi";
@@ -656,9 +657,10 @@ app.get("/integrations/meta/connect", async (req: Request, res: Response) => {
   }
   const backendUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
   const redirectUri = `${backendUrl.replace(/\/$/, "")}/integrations/meta/callback`;
-  // Meta App Review / Testing: profile, email, Page tasks (read + manage ads), leads, Marketing API read.
+  // Meta: ads + leads + Page list/read; pages_manage_posts = organic Page posts; instagram_* = IG Content Publishing (Page-linked IG account).
+  // After changing scopes, users must Connect Meta again so the token includes the new permissions.
   const scope =
-    "public_profile,email,ads_management,ads_read,business_management,pages_show_list,pages_read_engagement,pages_manage_ads,leads_retrieval";
+    "public_profile,email,ads_management,ads_read,business_management,pages_show_list,pages_read_engagement,pages_manage_ads,pages_manage_posts,instagram_basic,instagram_content_publish,leads_retrieval";
   const state = userId;
   const metaAuthUrl = `https://www.facebook.com/${META_GRAPH_API_VERSION}/dialog/oauth?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${encodeURIComponent(state)}`;
   res.redirect(302, metaAuthUrl);
@@ -1086,6 +1088,55 @@ app.get("/integrations/linkedin/test", requireAuth, async (req: AuthRequest, res
     });
   } catch (e: unknown) {
     return res.status(502).json({ ok: false, error: linkedInApiErrorMessage(e) });
+  }
+});
+
+/** Publishes to the **Company Page main feed** (organic). Not used for dark/sponsored ad creatives — see `launch` for ads. */
+app.post("/integrations/linkedin/organic-post", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const body = req.body as { organizationUrn?: string; text?: string; imageBase64?: string | null };
+  const org = typeof body.organizationUrn === "string" ? body.organizationUrn.trim() : "";
+  const text = typeof body.text === "string" ? body.text : "";
+  const imageBase64 =
+    body.imageBase64 == null || body.imageBase64 === ""
+      ? null
+      : String(body.imageBase64);
+
+  if (!org) {
+    return res.status(400).json({ error: "organizationUrn is required (Company Page id or URN)." });
+  }
+
+  const liConn = await prisma.connectedAccount.findFirst({
+    where: { userId: uid, platform: "linkedin" },
+  });
+  if (!liConn) {
+    return res.status(400).json({ error: "LinkedIn not connected. Connect LinkedIn on Home first." });
+  }
+  if (!LINKEDIN_CLIENT_ID || !LINKEDIN_CLIENT_SECRET) {
+    return res.status(503).json({ error: "LinkedIn is not configured on the server." });
+  }
+
+  try {
+    let accessToken = liConn.accessToken;
+    if (liConn.refreshToken && LINKEDIN_CLIENT_ID && LINKEDIN_CLIENT_SECRET) {
+      accessToken = await refreshAndStoreLinkedInAccessToken(
+        prisma,
+        liConn,
+        LINKEDIN_CLIENT_ID,
+        LINKEDIN_CLIENT_SECRET
+      );
+    }
+    const { postUrn } = await postLinkedInOrganicMainFeed({
+      accessToken,
+      organizationUrn: org,
+      text,
+      imageBase64,
+    });
+    return res.json({ ok: true, postUrn, message: "Post published to your Company Page main feed." });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[LinkedIn organic post]", msg);
+    return res.status(400).json({ error: msg });
   }
 });
 
