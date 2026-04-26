@@ -8,6 +8,7 @@ import jwt from "jsonwebtoken";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
 import { enabledProductKeysFromDb, userHasProduct } from "./productEntitlements";
+import { runCompetitorScanForWatch } from "./competitorIntel";
 
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
 export const EXPANSION_UPLOADS_ROOT = path.resolve(
@@ -1057,8 +1058,8 @@ export function createExpansionRouter(): Router {
       const row = await prisma.competitorWatch.findFirst({
         where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
         include: {
-          insights: { orderBy: { generatedAt: "desc" }, take: 20 },
-          ads: { orderBy: { lastSeenAt: "desc" }, take: 30 },
+          insights: { orderBy: { generatedAt: "desc" }, take: 25 },
+          ads: { orderBy: { lastSeenAt: "desc" }, take: 40 },
           _count: { select: { ads: true, insights: true } },
         },
       });
@@ -1135,7 +1136,7 @@ export function createExpansionRouter(): Router {
     }
   });
 
-  /** Demo scan: timestamps refresh + placeholder insight (real Ad Library integration later). */
+  /** Full scan: website snapshot (SSRF-safe), optional Meta Ad Library, OpenAI-structured insight. */
   r.post("/agency/competitor/watches/:id/scan", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const scope = await resolveLandingScope(req, res);
@@ -1149,41 +1150,43 @@ export function createExpansionRouter(): Router {
         where: { id: watch.id },
         data: { lastScannedAt: now },
       });
-      const kwPretty = (() => {
-        const k = watch.keywords;
-        if (Array.isArray(k)) {
-          const parts = k
-            .filter((x): x is string => typeof x === "string")
-            .map((s) => s.trim())
-            .filter((s) => s.length > 0);
-          return parts.length ? parts.join(", ") : "none listed";
-        }
-        return "none listed";
-      })();
-      const defaultSummary = [
-        `Checkpoint saved for “${watch.competitorName}”.`,
-        `This run does not call Meta or Google yet—it timestamps the watch and stores a note so your history isn’t empty.`,
-        `Keywords you’re watching: ${kwPretty}.`,
-        `To pull real ads later: add this competitor’s Meta Page ID and/or Google Ads advertiser ID on the watch, then connect server-side Ad Library APIs (tokens on the backend).`,
-      ].join(" ");
-      const summary =
-        typeof req.body?.summary === "string" && req.body.summary.trim()
-          ? req.body.summary.trim().slice(0, 8000)
-          : defaultSummary;
+      const manualSummary =
+        typeof req.body?.summary === "string" && req.body.summary.trim() ? req.body.summary.trim().slice(0, 8000) : null;
+
+      let summary: string;
+      let topThemes: Prisma.InputJsonValue;
+      let suggestedCounterAngles: Prisma.InputJsonValue;
+      let strongestAds: Prisma.InputJsonValue;
+      let rawPromptUsed: string | null = null;
+      if (manualSummary) {
+        summary = manualSummary;
+        topThemes = [] as Prisma.InputJsonValue;
+        suggestedCounterAngles = [] as Prisma.InputJsonValue;
+        strongestAds = [] as Prisma.InputJsonValue;
+      } else {
+        const out = await runCompetitorScanForWatch(watch);
+        summary = out.summary;
+        topThemes = out.topThemes;
+        suggestedCounterAngles = out.suggestedCounterAngles;
+        strongestAds = out.strongestAds;
+        rawPromptUsed = out.rawPromptUsed;
+      }
+
       const insight = await prisma.competitorInsight.create({
         data: {
           watchId: watch.id,
           summary,
-          topThemes: [] as Prisma.InputJsonValue,
-          suggestedCounterAngles: [] as Prisma.InputJsonValue,
-          strongestAds: [] as Prisma.InputJsonValue,
+          topThemes,
+          suggestedCounterAngles,
+          strongestAds,
+          rawPromptUsed,
         },
       });
       const row = await prisma.competitorWatch.findFirst({
         where: { id: watch.id },
         include: {
-          insights: { orderBy: { generatedAt: "desc" }, take: 10 },
-          ads: { orderBy: { lastSeenAt: "desc" }, take: 30 },
+          insights: { orderBy: { generatedAt: "desc" }, take: 25 },
+          ads: { orderBy: { lastSeenAt: "desc" }, take: 40 },
           _count: { select: { ads: true, insights: true } },
         },
       });

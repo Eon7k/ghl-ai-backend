@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Verify Meta Ad Library (ads_archive) using the same token logic as competitor scans.
+# Usage (from ghl-ai-backend):
+#   chmod +x scripts/verify-competitor-meta.sh
+#   ./scripts/verify-competitor-meta.sh
+#   ./scripts/verify-competitor-meta.sh 123456789012
+#
+# Expects in .env (or the environment):
+#   META_APP_ID + META_APP_SECRET  → built as  APP_ID|APP_SECRET
+#   OR  META_AD_LIBRARY_TOKEN
+# Optional: META_GRAPH_API_VERSION (e.g. v25.0)
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
+PAGE_ID="${1:-20531316728}"
+if [ -n "${META_AD_LIBRARY_TOKEN:-}" ] && [ "${META_AD_LIBRARY_TOKEN}" != "" ]; then
+  TOKEN="${META_AD_LIBRARY_TOKEN}"
+  echo "Using META_AD_LIBRARY_TOKEN (length ${#TOKEN})."
+else
+  if [ -z "${META_APP_ID:-}" ] || [ -z "${META_APP_SECRET:-}" ]; then
+    echo "ERROR: Set META_APP_ID and META_APP_SECRET, or META_AD_LIBRARY_TOKEN, in .env"
+    echo "  Get them from: https://developers.facebook.com/apps/ → your app → Settings → Basic"
+    exit 1
+  fi
+  TOKEN="${META_APP_ID}|${META_APP_SECRET}"
+  echo "Using app access token from META_APP_ID + META_APP_SECRET (not printed)."
+fi
+
+VRAW="${META_GRAPH_API_VERSION:-v21.0}"
+V="v${VRAW#v}"
+
+echo "Graph version: $V  |  search_page_ids: $PAGE_ID  |  ad_reached_countries: US"
+echo "Calling Graph ads_archive (first id only)..."
+OUT="$(mktemp)"
+HTTP="$(curl -sS -o "$OUT" -w "%{http_code}" -G "https://graph.facebook.com/${V}/ads_archive" \
+  --data-urlencode "search_page_ids=$PAGE_ID" \
+  --data-urlencode "ad_reached_countries=US" \
+  --data-urlencode "fields=id" \
+  --data-urlencode "limit=2" \
+  --data-urlencode "access_token=$TOKEN")" || true
+
+echo "HTTP status: $HTTP"
+cat "$OUT"
+echo
+rm -f "$OUT"
+
+if [ "$HTTP" != "200" ]; then
+  echo
+  echo "If you see an OAuth or permission error, check Meta App Dashboard: Marketing API / permissions for your use case, and that the app is not restricted for ads_archive in your region."
+  exit 1
+fi
+echo "OK: token accepted; ads_archive responded. If data is empty, that Page may have no current ads in the US for this query—the scan will still work for website + OpenAI."
+exit 0
