@@ -26,6 +26,29 @@ function metaAdLibraryToken(): string | null {
   return null;
 }
 
+/** ISO-3166 alpha-2 codes for ads_archive. Meta requires a JSON array string, e.g. ["US"], not "US" alone. */
+const DEFAULT_AD_REACHED_COUNTRIES = ["US", "GB", "CA", "AU", "IE", "NZ"] as const;
+/** Broader second attempt if the first call returns 0 rows (competitor may only target other regions). */
+const FALLBACK_AD_REACHED_COUNTRIES: readonly string[] = [
+  "US", "GB", "CA", "AU", "IE", "NZ", "DE", "FR", "ES", "IT", "NL", "SE", "NO", "DK", "IN", "BR", "MX", "PL", "PH", "SG", "HK", "JP", "KR", "AR", "CL", "CO", "CZ", "AT", "CH", "BE", "PT",
+];
+
+function adReachedCountriesTiers(): { primary: string[]; wide: string[] } {
+  const raw = (process.env.META_AD_LIBRARY_COUNTRIES || "").trim();
+  if (raw) {
+    const codes = raw
+      .split(/[,\s]+/)
+      .map((s) => s.trim().toUpperCase())
+      .filter((s) => /^[A-Z]{2}$/.test(s));
+    if (codes.length) {
+      const unique = [...new Set(codes)];
+      const wide = [...new Set([...unique, ...FALLBACK_AD_REACHED_COUNTRIES])];
+      return { primary: unique, wide };
+    }
+  }
+  return { primary: [...DEFAULT_AD_REACHED_COUNTRIES], wide: [...FALLBACK_AD_REACHED_COUNTRIES] };
+}
+
 const FB_PATH_RESERVED = new Set(
   "share,sharer,watch,groups,events,marketplace,profile.php,pages,people,login,help,news,photo.php,story.php,reel,posts,videos,photos,permalink,live,notes".split(
     ","
@@ -495,82 +518,154 @@ function pickCreativeText(
   return null;
 }
 
+const ADS_ARCHIVE_FIELDS = [
+  "id",
+  "ad_creation_time",
+  "page_name",
+  "ad_snapshot_url",
+  "ad_creative_bodies",
+  "ad_creative_link_titles",
+].join(",");
+
+type AdsArchiveJson = { data?: MetaAdRow[]; error?: { message?: string; code?: number } };
+
+/** One Graph ads_archive GET; Meta expects ad_reached_countries as a JSON array, e.g. ["US","GB"] — not the bare "US" string. */
+async function getAdsArchiveOnce(
+  searchPageId: string,
+  countries: string[],
+  adActiveStatus: "ACTIVE" | "ALL"
+): Promise<{ res: Response; data: AdsArchiveJson }> {
+  const token = metaAdLibraryToken()!;
+  const sp = new URLSearchParams();
+  sp.set("access_token", token);
+  sp.set("search_page_ids", searchPageId);
+  sp.set("ad_reached_countries", JSON.stringify(countries));
+  sp.set("ad_active_status", adActiveStatus);
+  sp.set("fields", ADS_ARCHIVE_FIELDS);
+  sp.set("limit", "30");
+  const url = `https://graph.facebook.com/${GRAPH_VERSION}/ads_archive?${sp.toString()}`;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 25_000);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+  const data = (await res.json().catch(() => ({}))) as AdsArchiveJson;
+  return { res, data };
+}
+
 export async function fetchAndStoreMetaAdLibrary(
   watchId: string,
   pageId: string
-): Promise<{ ok: true; count: number; error?: string } | { ok: false; error: string }> {
+): Promise<{ ok: true; count: number; error?: string; debug?: string } | { ok: false; error: string; debug?: string }> {
   const token = metaAdLibraryToken();
   if (!token) {
     return { ok: true, count: 0, error: "Meta Ad Library: no META_AD_LIBRARY_TOKEN or META_APP_ID+META_APP_SECRET" };
   }
-  const q = new URLSearchParams({
-    access_token: token,
-    search_page_ids: pageId.replace(/\D/g, "") || pageId,
-    ad_reached_countries: "US",
-    fields: "id,ad_creation_time,ad_creative_bodies,ad_creative_link_titles",
-    limit: "12",
-  });
-  const url = `https://graph.facebook.com/${GRAPH_VERSION}/ads_archive?${q.toString()}`;
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 20_000);
-  let res: Response;
-  try {
-    res = await fetch(url, { signal: ac.signal });
-  } catch (e) {
-    clearTimeout(timer);
-    return { ok: false, error: e instanceof Error ? e.message : "Ad Library request failed" };
-  } finally {
-    clearTimeout(timer);
+  const numericId = pageId.replace(/\D/g, "");
+  if (!numericId || numericId.length < 3) {
+    return { ok: false, error: "Meta Ad Library: need a numeric Facebook Page id (digits from Page info or a resolved link)." };
   }
-  const data = (await res.json().catch(() => ({}))) as {
-    data?: MetaAdRow[];
-    error?: { message?: string };
-  };
-  if (!res.ok) {
-    const em = data.error?.message || `HTTP ${res.status}`;
-    return { ok: true, count: 0, error: `Meta Ad Library: ${em}` };
-  }
-  const rows = data.data || [];
-  let count = 0;
-  for (const ad of rows) {
-    if (!ad.id) continue;
-    const body = pickCreativeText(ad.ad_creative_bodies);
-    const title = pickCreativeText(ad.ad_creative_link_titles);
-    const headline = title || (body ? body.replace(/\s+/g, " ").trim().slice(0, 300) : null);
-    const mediaUrl = typeof ad.ad_snapshot_url === "string" && ad.ad_snapshot_url.startsWith("http") ? ad.ad_snapshot_url : null;
+
+  const tiers = adReachedCountriesTiers();
+  /** Two calls max: (1) prefer active ads in the configured/default regions; (2) broad regions + include inactive, still common for “we see them in the web UI but API was empty” cases. */
+  const attempts: { label: string; countries: string[]; status: "ACTIVE" | "ALL" }[] = [
+    { label: "primary+active", countries: tiers.primary, status: "ACTIVE" },
+    { label: "wide+all", countries: tiers.wide, status: "ALL" },
+  ];
+
+  let lastHttpError: string | null = null;
+  const tried: string[] = [];
+
+  for (const a of attempts) {
+    const key = `${a.label}:${a.status}:[${a.countries.slice(0, 5).join(",")}${a.countries.length > 5 ? "…" : ""}]`;
+    tried.push(key);
+    let one: { res: Response; data: AdsArchiveJson };
     try {
-      await prisma.competitorAd.upsert({
-        where: {
-          watchId_platform_adLibraryId: {
+      one = await getAdsArchiveOnce(numericId, a.countries, a.status);
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : "Ad Library request failed", debug: tried.join(" | ") };
+    }
+    const { res, data } = one;
+    if (!res.ok) {
+      const em = data.error?.message || `HTTP ${res.status}`;
+      const code = data.error?.code;
+      lastHttpError = `Meta Ad Library: ${em}`;
+      if (code === 190 || /invalid.*token|OAuthException|expired|session has been invalidated/i.test(em)) {
+        return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
+      }
+      if (code === 4 || /rate limit|too many|temporarily|limit/i.test(em)) {
+        return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
+      }
+      continue;
+    }
+    const rows = data.data || [];
+    if (rows.length === 0) continue;
+
+    let count = 0;
+    for (const ad of rows) {
+      if (!ad.id) continue;
+      const body = pickCreativeText(ad.ad_creative_bodies);
+      const title = pickCreativeText(ad.ad_creative_link_titles);
+      const headline = title || (body ? body.replace(/\s+/g, " ").trim().slice(0, 300) : null);
+      const mediaUrl = typeof ad.ad_snapshot_url === "string" && ad.ad_snapshot_url.startsWith("http") ? ad.ad_snapshot_url : null;
+      try {
+        await prisma.competitorAd.upsert({
+          where: {
+            watchId_platform_adLibraryId: {
+              watchId,
+              platform: "meta",
+              adLibraryId: ad.id,
+            },
+          },
+          create: {
             watchId,
             platform: "meta",
             adLibraryId: ad.id,
+            headline,
+            bodyText: body,
+            mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : null,
+            lastSeenAt: new Date(),
+            rawData: ad as unknown as Prisma.InputJsonValue,
           },
-        },
-        create: {
-          watchId,
-          platform: "meta",
-          adLibraryId: ad.id,
-          headline,
-          bodyText: body,
-          mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : null,
-          lastSeenAt: new Date(),
-          rawData: ad as unknown as Prisma.InputJsonValue,
-        },
-        update: {
-          headline: headline ?? undefined,
-          bodyText: body ?? undefined,
-          mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : undefined,
-          lastSeenAt: new Date(),
-          rawData: ad as unknown as Prisma.InputJsonValue,
-        },
-      });
-      count++;
-    } catch (e) {
-      console.error("[competitorIntel] upsert ad", e);
+          update: {
+            headline: headline ?? undefined,
+            bodyText: body ?? undefined,
+            mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : undefined,
+            lastSeenAt: new Date(),
+            rawData: ad as unknown as Prisma.InputJsonValue,
+          },
+        });
+        count++;
+      } catch (e) {
+        console.error("[competitorIntel] upsert ad", e);
+      }
+    }
+    if (count > 0) {
+      if (a.label !== "primary+active" || a.status !== "ACTIVE") {
+        console.info(
+          `[competitorIntel] Ad Library: got ${count} ad(s) using ${a.label} (countries n=${a.countries.length}, status=${a.status})`
+        );
+      }
+      return { ok: true, count, debug: `used:${a.label}/${a.status}` };
+    }
+    if (rows.length > 0) {
+      return {
+        ok: false,
+        error: "Meta Ad Library: Meta returned ads but saving them to the database failed. Check server logs for [competitorIntel] upsert ad.",
+        debug: tried.join(" | "),
+      };
     }
   }
-  return { ok: true, count };
+
+  const hint =
+    "0 ads in Ad Library for this Page with these filters. If you see ads in facebook.com/ads/library for this Page, set META_AD_LIBRARY_COUNTRIES to a comma list of regions they target (e.g. US,GB,DE) and re-run, or double-check the saved Page id.";
+  if (lastHttpError) {
+    return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
+  }
+  return { ok: true, count: 0, error: `Meta Ad Library: ${hint}`, debug: tried.join(" | ") };
 }
 
 export type YourCampaignIdea = {
@@ -867,7 +962,7 @@ export async function runCompetitorScanForWatch(
   const recentAds = await prisma.competitorAd.findMany({
     where: { watchId: watch.id, platform: "meta" },
     orderBy: { lastSeenAt: "desc" },
-    take: 20,
+    take: 30,
   });
   const adDetails = recentAds.map((a) => {
     const raw = a.rawData as { page_name?: string } | null;

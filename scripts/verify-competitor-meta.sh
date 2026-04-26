@@ -9,6 +9,7 @@
 #   META_APP_ID + META_APP_SECRET  → built as  APP_ID|APP_SECRET
 #   OR  META_AD_LIBRARY_TOKEN
 # Optional: META_GRAPH_API_VERSION (e.g. v25.0)
+# Note: ad_reached_countries must be a JSON array, e.g. ["US"] — the API rejects a bare "US" string.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -37,13 +38,19 @@ fi
 VRAW="${META_GRAPH_API_VERSION:-v21.0}"
 V="v${VRAW#v}"
 
-echo "Graph version: $V  |  search_page_ids: $PAGE_ID  |  ad_reached_countries: US"
+# Default JSON must match what the Node API uses (array of ISO codes).
+COUNTRIES_JSON='["US","GB","CA"]'
+if [ -n "${META_AD_REACHED_COUNTRIES_JSON:-}" ]; then
+  COUNTRIES_JSON="${META_AD_REACHED_COUNTRIES_JSON}"
+fi
+echo "Graph version: $V  |  search_page_ids: $PAGE_ID  |  ad_reached_countries: $COUNTRIES_JSON"
 echo "Calling Graph ads_archive (first id only)..."
 OUT="$(mktemp)"
 HTTP="$(curl -sS -o "$OUT" -w "%{http_code}" -G "https://graph.facebook.com/${V}/ads_archive" \
   --data-urlencode "search_page_ids=$PAGE_ID" \
-  --data-urlencode "ad_reached_countries=US" \
-  --data-urlencode "fields=id" \
+  --data-urlencode "ad_reached_countries=$COUNTRIES_JSON" \
+  --data-urlencode "ad_active_status=ALL" \
+  --data-urlencode "fields=id,page_name,ad_snapshot_url" \
   --data-urlencode "limit=2" \
   --data-urlencode "access_token=$TOKEN")" || true
 
