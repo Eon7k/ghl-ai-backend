@@ -721,3 +721,148 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
 
   return { campaignGroupId, campaignId, creativeIds };
 }
+
+export type PostLinkedInOrganicInput = {
+  accessToken: string;
+  /** Company Page: numeric id or `urn:li:organization:…` */
+  organizationUrn: string;
+  /** Post body (becomes `commentary`; max 3000). */
+  text: string;
+  /** Optional image (data URL or raw base64); omit for text-only. */
+  imageBase64?: string | null;
+};
+
+/**
+ * Publishes a **live** post to the Company Page **main feed** (not a dark/sponsored-only asset).
+ * Uses the same LinkedIn app + `w_organization_social` as ads, but **no** ad account, campaigns, or `adContext`.
+ * Dark ads use `feedDistribution: NONE` + `adContext` in {@link launchLinkedInCampaign} — that path is unchanged.
+ */
+export async function postLinkedInOrganicMainFeed(
+  input: PostLinkedInOrganicInput
+): Promise<{ postUrn: string }> {
+  const organizationUrn = normalizeLinkedInOrganizationUrn(input.organizationUrn);
+  if (!organizationUrn || !/^urn:li:organization:\d+$/i.test(organizationUrn)) {
+    throw new Error(
+      "Company Page id required: number or urn:li:organization:… (same as in campaign launch form)."
+    );
+  }
+  const bodyText = (input.text || "").replace(/\n/g, " ").trim().slice(0, 3000);
+  if (!bodyText) {
+    throw new Error("Post text is required.");
+  }
+  const headline = bodyText.slice(0, 200);
+
+  let restPostBody: Record<string, unknown>;
+
+  const rawB64 = input.imageBase64?.replace(/^data:image\/[a-z]+;base64,/, "").trim();
+  if (rawB64) {
+    const buf = Buffer.from(rawB64, "base64");
+    if (!buf.length) throw new Error("Invalid image data.");
+
+    const regRes = await axios.post(
+      `${LI_V2}/assets?action=registerUpload`,
+      {
+        registerUploadRequest: {
+          owner: organizationUrn,
+          recipes: ["urn:li:digitalmediaRecipe:feedshare-image"],
+          serviceRelationships: [
+            { relationshipType: "OWNER", identifier: "urn:li:userGeneratedContent" },
+          ],
+          supportedUploadMechanism: ["SYNCHRONOUS_UPLOAD"],
+        },
+      },
+      { headers: liJsonHeaders(input.accessToken), validateStatus: () => true }
+    );
+    if (regRes.status >= 400) {
+      throw new Error(
+        formatLinkedInApiErrorResponse(regRes.data, `LinkedIn image register (organic) HTTP ${regRes.status}`)
+      );
+    }
+    const val = (regRes.data as { value?: Record<string, unknown> })?.value;
+    const upload = val?.uploadMechanism as
+      | { "com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"?: { uploadUrl?: string; headers?: Record<string, string[]> } }
+      | undefined;
+    const httpReq = upload?.["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"];
+    const uploadUrl = httpReq?.uploadUrl;
+    const assetUrn = val?.asset as string | undefined;
+    if (!uploadUrl || !assetUrn) {
+      throw new Error("LinkedIn did not return upload URL/asset for the image.");
+    }
+    const uploadHeaders: Record<string, string> = { Authorization: `Bearer ${input.accessToken}` };
+    const h = httpReq?.headers;
+    if (h && typeof h === "object") {
+      for (const [k, arr] of Object.entries(h)) {
+        if (Array.isArray(arr) && arr[0]) uploadHeaders[k] = String(arr[0]);
+      }
+    }
+    if (!Object.keys(uploadHeaders).some((k) => k.toLowerCase() === "content-type")) {
+      uploadHeaders["Content-Type"] = "application/octet-stream";
+    }
+    const upRes = await axios.put(uploadUrl, buf, {
+      headers: uploadHeaders,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      validateStatus: () => true,
+    });
+    if (upRes.status >= 400) {
+      const raw = typeof upRes.data === "string" ? upRes.data : upRes.data != null ? JSON.stringify(upRes.data) : "";
+      throw new Error(`LinkedIn image upload (organic) failed HTTP ${upRes.status}: ${raw.slice(0, 500)}`);
+    }
+    const imageUrn = imageUrnFromDigitalMediaAssetUrn(assetUrn);
+
+    restPostBody = {
+      author: organizationUrn,
+      commentary: bodyText,
+      visibility: "PUBLIC",
+      distribution: {
+        feedDistribution: "MAIN_FEED",
+        targetEntities: [],
+        thirdPartyDistributionChannels: [],
+      },
+      content: {
+        media: {
+          title: headline,
+          id: imageUrn,
+        },
+      },
+      lifecycleState: "PUBLISHED",
+      isReshareDisabledByAuthor: false,
+    };
+  } else {
+    restPostBody = {
+      author: organizationUrn,
+      commentary: bodyText,
+      visibility: "PUBLIC",
+      distribution: {
+        feedDistribution: "MAIN_FEED",
+        targetEntities: [],
+        thirdPartyDistributionChannels: [],
+      },
+      lifecycleState: "PUBLISHED",
+      isReshareDisabledByAuthor: false,
+    };
+  }
+
+  const postsRes = await axios.post(`${LI_REST}/posts`, restPostBody, {
+    headers: liJsonHeaders(input.accessToken),
+    validateStatus: () => true,
+  });
+  if (postsRes.status >= 400) {
+    const base = formatLinkedInApiErrorResponse(
+      postsRes.data,
+      `LinkedIn organic post HTTP ${postsRes.status}`
+    );
+    const finalMsg = /Not enough permissions|NO_VERSION|ugcPosts\./i.test(base)
+      ? linkedInPostPermissionHint(base)
+      : base;
+    throw new Error(finalMsg);
+  }
+  const postUrn = extractPostUrnForReference(postsRes);
+  if (!postUrn) {
+    const hdr = postsRes.headers && (postsRes.headers as Record<string, unknown>)["x-restli-id"];
+    throw new Error(
+      `LinkedIn did not return a post URN. ${hdr != null ? `X-RestLi-Id: ${String(hdr).slice(0, 160)}` : ""}`
+    );
+  }
+  return { postUrn };
+}
