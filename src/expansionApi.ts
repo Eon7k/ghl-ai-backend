@@ -1180,6 +1180,7 @@ export function createExpansionRouter(): Router {
       let strongestAds: Prisma.InputJsonValue;
       let competitivePack: Prisma.InputJsonValue | null = null;
       let rawPromptUsed: string | null = null;
+      let scanDiagnostics: { scanNotes: string[] } | null = null;
       if (manualSummary) {
         summary = manualSummary;
         topThemes = [] as Prisma.InputJsonValue;
@@ -1193,6 +1194,7 @@ export function createExpansionRouter(): Router {
         strongestAds = out.strongestAds;
         competitivePack = out.competitivePack;
         rawPromptUsed = out.rawPromptUsed;
+        scanDiagnostics = { scanNotes: out.scanNotes };
       }
 
       const insight = await prisma.competitorInsight.create({
@@ -1214,7 +1216,7 @@ export function createExpansionRouter(): Router {
           _count: { select: { ads: true, insights: true } },
         },
       });
-      return res.json({ watch: row, insight });
+      return res.json({ watch: row, insight, diagnostics: scanDiagnostics });
     } catch (e) {
       console.error("[scan competitor]", e);
       const em = e instanceof Error ? e.message : String(e);
