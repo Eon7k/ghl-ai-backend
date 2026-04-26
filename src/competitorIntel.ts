@@ -950,6 +950,7 @@ export async function runCompetitorScanForWatch(
   strongestAds: Prisma.InputJsonValue;
   competitivePack: Prisma.InputJsonValue | null;
   rawPromptUsed: string | null;
+  /** Always returned; echoed in the scan API as `diagnostics` so the UI can show a visible “what happened” list. */
   scanNotes: string[];
 }> {
   const kw = Array.isArray(watch.keywords)
@@ -1032,13 +1033,14 @@ export async function runCompetitorScanForWatch(
     adDetails,
   });
 
-  const tech = scanNotes
-    .filter((s) => /Meta|Ad Library|Facebook Page:|Pulled .* Meta/i.test(s))
-    .slice(0, 14);
-  const summaryWithNotes =
-    tech.length > 0
-      ? `${syn.summary}\n\n**Scan (system):** ${tech.map((s) => s.replace(/\s+/g, " ").trim()).join(" \u00b7 ")}`
-      : syn.summary;
+  const logBody = scanNotes
+    .map((s) => `• ${s.replace(/\s+/g, " ").trim()}`)
+    .join("\n\n");
+  const logBlock =
+    scanNotes.length > 0
+      ? `\n\n**Scan (system log)**\n\n${logBody.length > 4_500 ? `${logBody.slice(0, 4_500)}…` : logBody}`
+      : "";
+  const summaryWithNotes = (syn.summary + logBlock).slice(0, 12_000);
 
   return {
     summary: summaryWithNotes,
