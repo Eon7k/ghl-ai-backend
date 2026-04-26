@@ -7,6 +7,11 @@ import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
+import {
+  generateContentStrategyPlan,
+  type ContentStrategyHorizon,
+  type ContentStrategyMode,
+} from "./contentStrategyClaude";
 import { buildSystemPrompt, buildUserPrompt, buildVariantsFromOnePrompt, AdPlatform } from "./aiPromptTemplates";
 import { prisma } from "./db";
 import { launchTikTokCampaign, tiktokListIdentities } from "./tiktokMarketing";
@@ -121,6 +126,21 @@ function requireAuth(req: AuthRequest, res: Response, next: NextFunction): void 
   requireAuthAsync(req, res, next).catch(next);
 }
 
+/** Agency + `X-Viewing-As` → client user id for profile/content scope. */
+async function resolveEffectiveUserId(
+  req: Request,
+  loggedInUserId: string,
+  accountType: string
+): Promise<string> {
+  if (accountType !== "agency") return loggedInUserId;
+  const viewingAs = (req.headers["x-viewing-as"] ?? req.headers["viewing-as"]) as string | undefined;
+  if (!viewingAs || typeof viewingAs !== "string" || !viewingAs.trim()) return loggedInUserId;
+  const allowed = await prisma.agencyClient.findFirst({
+    where: { agencyUserId: loggedInUserId, clientUserId: viewingAs.trim() },
+  });
+  return allowed ? viewingAs.trim() : loggedInUserId;
+}
+
 // Admin: only these emails can access /admin and see extra metrics
 const ADMIN_EMAILS = new Set(
   (process.env.ADMIN_EMAILS || "")
@@ -162,6 +182,7 @@ interface ExperimentRecord {
   googleAdGroupId?: string;
   linkedinCampaignGroupId?: string;
   linkedinCampaignId?: string;
+  linkedinSponsoredAccountId?: string;
   aiOptimizationMode?: string;
 }
 
@@ -324,6 +345,7 @@ app.post("/auth/register", async (req: Request, res: Response) => {
         email: emailNorm,
         passwordHash,
         enabledProductKeys: [] as Prisma.InputJsonValue,
+        businessOnboardingComplete: false,
       },
     });
     const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
@@ -385,16 +407,30 @@ function makeTempPassword(): string {
 app.get("/agency/clients", requireAuth, requireAgency, async (req: AuthRequest, res: Response) => {
   const list = await prisma.agencyClient.findMany({
     where: { agencyUserId: req.user!.id },
-    include: { clientUser: { select: { id: true, email: true, loginDisabled: true, createdAt: true } } },
+    include: {
+      clientUser: {
+        select: {
+          id: true,
+          email: true,
+          loginDisabled: true,
+          createdAt: true,
+          businessOnboardingComplete: true,
+        },
+      },
+    },
     orderBy: { createdAt: "desc" },
   });
   res.json({
-    clients: list.map((c) => ({
-      id: c.clientUser.id,
-      email: c.clientUser.email,
-      loginDisabled: c.clientUser.loginDisabled,
-      createdAt: c.clientUser.createdAt.toISOString(),
-    })),
+    clients: list.map((c) => {
+      const cu = c.clientUser as { businessOnboardingComplete?: boolean | null };
+      return {
+        id: c.clientUser.id,
+        email: c.clientUser.email,
+        loginDisabled: c.clientUser.loginDisabled,
+        createdAt: c.clientUser.createdAt.toISOString(),
+        businessOnboardingComplete: cu.businessOnboardingComplete ?? null,
+      };
+    }),
   });
 });
 
@@ -421,6 +457,7 @@ app.post("/agency/clients", requireAuth, requireAgency, async (req: AuthRequest,
         passwordHash,
         accountType: "single",
         loginDisabled: !allowLogin,
+        businessOnboardingComplete: false,
       },
     });
   } else {
@@ -437,8 +474,14 @@ app.post("/agency/clients", requireAuth, requireAgency, async (req: AuthRequest,
     update: {},
   });
 
+  const cRow = client as { loginDisabled?: boolean; businessOnboardingComplete?: boolean | null };
   res.status(201).json({
-    client: { id: client.id, email: client.email, loginDisabled: (client as { loginDisabled?: boolean }).loginDisabled ?? false },
+    client: {
+      id: client.id,
+      email: client.email,
+      loginDisabled: cRow.loginDisabled ?? false,
+      businessOnboardingComplete: cRow.businessOnboardingComplete ?? null,
+    },
     ...(tempPassword ? { tempPassword } : {}),
   });
 });
@@ -476,15 +519,91 @@ app.get("/auth/me", async (req: AuthRequest, res: Response) => {
     const enabledProductKeys = enabledProductKeysFromDb(
       (user as { enabledProductKeys?: unknown }).enabledProductKeys
     );
+    const effectiveId = await resolveEffectiveUserId(req, user.id, accountType);
+    const subject = await prisma.user.findUnique({
+      where: { id: effectiveId },
+      select: { email: true, businessModelProfile: true, businessOnboardingComplete: true },
+    });
     res.json({
       user: { id: user.id, email: user.email },
       isAdmin: isAdmin(user.email),
       accountType,
       clients,
       enabledProductKeys,
+      businessOnboardingComplete: subject?.businessOnboardingComplete ?? null,
+      businessModelProfile: subject?.businessModelProfile ?? null,
+      /** Whose business profile the above fields refer to (effective user: your agency, or a client when agency uses X-Viewing-As). */
+      businessProfileForEmail: subject?.email ?? user.email,
     });
   } catch {
     res.status(401).json({ error: "Invalid or expired token" });
+  }
+});
+
+app.patch("/auth/business-model", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const body = req.body as { profile?: unknown; markComplete?: boolean; skip?: boolean };
+  if (body.skip === true) {
+    await prisma.user.update({
+      where: { id: uid },
+      data: {
+        businessOnboardingComplete: true,
+        businessModelProfile: {
+          skipped: true,
+          skippedAt: new Date().toISOString(),
+        } as Prisma.InputJsonValue,
+      },
+    });
+  } else if (body.profile != null && typeof body.profile === "object") {
+    await prisma.user.update({
+      where: { id: uid },
+      data: {
+        businessModelProfile: body.profile as Prisma.InputJsonValue,
+        businessOnboardingComplete: body.markComplete === false ? false : true,
+      },
+    });
+  } else {
+    return res.status(400).json({ error: "Send `skip: true` or a `profile` object." });
+  }
+  const updated = await prisma.user.findUnique({
+    where: { id: uid },
+    select: { businessModelProfile: true, businessOnboardingComplete: true },
+  });
+  res.json({
+    ok: true,
+    businessModelProfile: updated?.businessModelProfile ?? null,
+    businessOnboardingComplete: updated?.businessOnboardingComplete ?? null,
+  });
+});
+
+app.post("/content-strategy/generate", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const body = req.body as {
+    userPrompt?: string;
+    mode?: string;
+    horizon?: string;
+  };
+  const mode: ContentStrategyMode =
+    body.mode === "text_plus_prompts" || body.mode === "ideas_only" || body.mode === "full" ? body.mode : "full";
+  const horizon: ContentStrategyHorizon =
+    body.horizon === "week" || body.horizon === "month" || body.horizon === "single" ? body.horizon : "week";
+  const userPrompt = typeof body.userPrompt === "string" ? body.userPrompt : "";
+  const row = await prisma.user.findUnique({
+    where: { id: uid },
+    select: { businessModelProfile: true },
+  });
+  try {
+    const markdown = await generateContentStrategyPlan({
+      businessModelProfile: row?.businessModelProfile ?? null,
+      userPrompt,
+      mode,
+      horizon,
+    });
+    res.json({ markdown });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Content strategy failed";
+    console.error("[content-strategy/generate]", msg);
+    return res.status(502).json({ error: msg });
   }
 });
 
@@ -1246,6 +1365,7 @@ app.get("/experiments", requireAuth, async (req: AuthRequest, res: Response) => 
     googleAdGroupId: e.googleAdGroupId ?? undefined,
     linkedinCampaignGroupId: e.linkedinCampaignGroupId ?? undefined,
     linkedinCampaignId: e.linkedinCampaignId ?? undefined,
+    linkedinSponsoredAccountId: e.linkedinSponsoredAccountId ?? undefined,
     aiOptimizationMode: e.aiOptimizationMode ?? undefined,
     attachedCreativeIds: e.attachedCreativeIds ?? undefined,
     variants: e.variants.map((v) => variantToJson(v, withCreative.has(v.id))),
@@ -1285,6 +1405,7 @@ app.get("/experiments/:id", requireAuth, async (req: AuthRequest, res: Response)
     googleAdGroupId: exp.googleAdGroupId ?? undefined,
     linkedinCampaignGroupId: exp.linkedinCampaignGroupId ?? undefined,
     linkedinCampaignId: exp.linkedinCampaignId ?? undefined,
+    linkedinSponsoredAccountId: exp.linkedinSponsoredAccountId ?? undefined,
     aiOptimizationMode: exp.aiOptimizationMode ?? undefined,
     attachedCreativeIds: exp.attachedCreativeIds ?? undefined,
     variants: exp.variants.map((v) => variantToJson(v, withCreativeOne.has(v.id))),
@@ -1350,6 +1471,7 @@ app.patch("/experiments/:id", requireAuth, async (req: AuthRequest, res: Respons
     googleAdGroupId: updated.googleAdGroupId ?? undefined,
     linkedinCampaignGroupId: updated.linkedinCampaignGroupId ?? undefined,
     linkedinCampaignId: updated.linkedinCampaignId ?? undefined,
+    linkedinSponsoredAccountId: updated.linkedinSponsoredAccountId ?? undefined,
     aiOptimizationMode: updated.aiOptimizationMode ?? undefined,
     attachedCreativeIds: updated.attachedCreativeIds ?? undefined,
   });
@@ -2003,6 +2125,7 @@ app.post("/experiments", requireAuth, async (req: AuthRequest, res: Response) =>
       googleAdGroupId: firstExp.googleAdGroupId ?? undefined,
       linkedinCampaignGroupId: firstExp.linkedinCampaignGroupId ?? undefined,
       linkedinCampaignId: firstExp.linkedinCampaignId ?? undefined,
+      linkedinSponsoredAccountId: firstExp.linkedinSponsoredAccountId ?? undefined,
       aiOptimizationMode: firstExp.aiOptimizationMode ?? undefined,
       attachedCreativeIds: firstExp.attachedCreativeIds ?? undefined,
       variants: firstExp.variants.map((v) => variantToJson(v, firstExpCreativeIds.has(v.id))),
@@ -2275,6 +2398,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
     googleAdGroupId?: string;
     linkedinCampaignGroupId?: string;
     linkedinCampaignId?: string;
+    linkedinSponsoredAccountId?: string;
   } = {
     status: "launched",
     phase: "running",
@@ -2662,6 +2786,7 @@ app.post("/experiments/:id/launch", requireAuth, async (req: AuthRequest, res: R
       });
       data.linkedinCampaignGroupId = liResult.campaignGroupId;
       data.linkedinCampaignId = liResult.campaignId;
+      data.linkedinSponsoredAccountId = linkedInSponsoredAccountId.replace(/\D/g, "");
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "LinkedIn API error";
       console.error("[LinkedIn launch]", msg);

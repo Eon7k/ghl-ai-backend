@@ -478,6 +478,10 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
   const draftStatus = "DRAFT";
   const entityStatus = dryRun ? draftStatus : liveStatus;
 
+  const adAccountInPath = sponsoredAccountId.replace(/\D/g, "");
+  if (!adAccountInPath) throw new Error("Invalid LinkedIn sponsored account id.");
+
+  /** Use REST `adAccounts/.../adCampaignGroups` (not legacy `v2/adCampaignGroupsV2`) so objects show in Campaign Manager. */
   const groupBody: Record<string, unknown> = {
     account: accountUrn,
     name: `${campaignName} — group`.slice(0, 256),
@@ -485,7 +489,7 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
     status: entityStatus,
   };
 
-  const cgRes = await axios.post(`${LI_V2}/adCampaignGroupsV2`, groupBody, {
+  const cgRes = await axios.post(`${LI_REST}/adAccounts/${encodeURIComponent(adAccountInPath)}/adCampaignGroups`, groupBody, {
     headers: liJsonHeaders(accessToken),
     validateStatus: () => true,
   });
@@ -509,12 +513,15 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
   const campaignBody: Record<string, unknown> = {
     account: accountUrn,
     campaignGroup: `urn:li:sponsoredCampaignGroup:${campaignGroupId}`,
+    /** Required for sponsored content / site visit campaigns in REST; helps CM show the right org context. */
+    associatedEntity: organizationUrn,
     name: campaignName.slice(0, 256),
     type: "SPONSORED_UPDATES",
     objectiveType: "WEBSITE_VISIT",
     format: "STANDARD_UPDATE",
     costType: "CPC",
     creativeSelection: "OPTIMIZED",
+    connectedTelevisionOnly: false,
     offsiteDeliveryEnabled: false,
     audienceExpansionEnabled: false,
     runSchedule: { start: schedule.start, end: schedule.end },
@@ -535,7 +542,7 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
     status: entityStatus,
   };
 
-  const cRes = await axios.post(`${LI_V2}/adCampaignsV2`, campaignBody, {
+  const cRes = await axios.post(`${LI_REST}/adAccounts/${encodeURIComponent(adAccountInPath)}/adCampaigns`, campaignBody, {
     headers: liJsonHeaders(accessToken),
     validateStatus: () => true,
   });
@@ -632,8 +639,8 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
     const bodyText = (v.copy || headline).replace(/\n/g, " ").trim().slice(0, 3000);
 
     /**
-     * Create the organic/distribution post with the **Posts** API (`/rest/posts`), not legacy `/v2/ugcPosts`.
-     * `ugcPosts.CREATE.NO_VERSION` is tied to the deprecated UGC v2 line; the version header does not fix it.
+     * **Direct sponsored (dark) post** via `/rest/posts`: do **not** use `MAIN_FEED` or the content publishes as a
+     * real Company Page post. Use `feedDistribution: NONE` + `adContext` (DSC) so the asset is only for ads.
      * Map vector asset to `urn:li:image:{id}` for `content.media.id` (per LinkedIn Assets/Images URN notes).
      */
     const imageUrn = imageUrnFromDigitalMediaAssetUrn(assetUrn);
@@ -642,7 +649,7 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
       commentary: bodyText,
       visibility: "PUBLIC",
       distribution: {
-        feedDistribution: "MAIN_FEED",
+        feedDistribution: "NONE",
         targetEntities: [],
         thirdPartyDistributionChannels: [],
       },
@@ -651,6 +658,12 @@ export async function launchLinkedInCampaign(input: LaunchLinkedInCampaignInput)
           title: headline,
           id: imageUrn,
         },
+      },
+      adContext: {
+        isDsc: true,
+        dscAdAccount: accountUrn,
+        dscAdType: "STANDARD",
+        dscStatus: "ACTIVE",
       },
       lifecycleState: "PUBLISHED",
       isReshareDisabledByAuthor: false,

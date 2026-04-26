@@ -22,6 +22,15 @@ model User {
    * JSON [] = none. Non-empty array = allowlist (keys: white_label, kits, landing_pages, reports, dfy, competitors).
    */
   enabledProductKeys Json?
+  /**
+   * Structured answers about business model, offer, and audience (JSON).
+   * Used to personalize ads, content strategy, and in-app copy.
+   */
+  businessModelProfile    Json?
+  /**
+   * false = new user should complete business onboarding. null = legacy user (treat as complete).
+   */
+  businessOnboardingComplete Boolean?
   createdAt    DateTime  @default(now())
   experiments  Experiment[]
   creatives    Creative[]
@@ -364,6 +373,8 @@ model Experiment {
   linkedinCampaignGroupId String?
   /** LinkedIn sponsored campaign numeric id after Marketing API launch. */
   linkedinCampaignId      String?
+  /** Ad account (numeric) selected at launch — for Campaign Manager deep links. */
+  linkedinSponsoredAccountId String?
   attachedCreativeIds String[] @default([]) // PostgreSQL array of creative ids
   /** AI optimization: off | suggestions | auto (auto applies Meta ad-set budget only when API recommends). */
   aiOptimizationMode  String   @default("off")
