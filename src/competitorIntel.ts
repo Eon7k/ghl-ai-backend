@@ -100,15 +100,36 @@ export function parseFacebookPageInput(raw: string): FacebookPageParse {
   return { type: "empty" };
 }
 
-async function graphGetFacebookId(handleOrId: string): Promise<string> {
-  const token = metaAdLibraryToken();
-  if (!token) {
-    throw new Error("Set META_APP_ID and META_APP_SECRET (or META_AD_LIBRARY_TOKEN) to resolve Facebook links.");
+const GRAPH_RESOLVE_USER_HINT =
+  "If this keeps failing: paste the numeric **Page ID** (only digits) from the Page’s About/Transparency, or set your **Meta app to Live** in developers.facebook.com — **Development** mode often can’t look up other brands’ pages with an app token. Use a real **Page** (not a personal profile or group).";
+
+/**
+ * Read numeric Page id from a Graph JSON blob (object node or "ids" style map).
+ */
+function pickNumericIdFromGraphPayload(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  const o = data as { id?: unknown; error?: unknown } & Record<string, unknown>;
+  if (o.error) return null;
+  if (typeof o.id === "string" && /^\d{4,22}$/.test(o.id)) return o.id;
+  for (const v of Object.values(o)) {
+    if (v && typeof v === "object" && "id" in (v as object)) {
+      const id = (v as { id?: string }).id;
+      if (typeof id === "string" && /^\d{4,22}$/.test(id)) return id;
+    }
   }
+  return null;
+}
+
+/**
+ * GET /vX/{node}?fields=id — works for many numeric ids; can fail for vanity URLs with an app token.
+ */
+async function tryGraphGetNode(node: string): Promise<string | null> {
+  const token = metaAdLibraryToken();
+  if (!token) return null;
   const sp = new URLSearchParams();
   sp.set("fields", "id");
   sp.set("access_token", token);
-  const pathPart = `/${GRAPH_VERSION}/${encodeURIComponent(handleOrId)}`;
+  const pathPart = `/${GRAPH_VERSION}/${encodeURIComponent(node)}`;
   const url = `https://graph.facebook.com${pathPart}?${sp.toString()}`;
   const ac = new AbortController();
   const to = setTimeout(() => ac.abort(), 15_000);
@@ -118,15 +139,147 @@ async function graphGetFacebookId(handleOrId: string): Promise<string> {
   } finally {
     clearTimeout(to);
   }
-  const data = (await res.json().catch(() => ({}))) as { id?: string; error?: { message?: string } };
-  if (!res.ok || data.error) {
-    const msg = data.error?.message || `Graph HTTP ${res.status}`;
-    throw new Error(msg);
+  const data = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+  if (!res.ok || data.error) return null;
+  return pickNumericIdFromGraphPayload(data);
+}
+
+/**
+ * GET /vX/?id={full page URL}&fields=id — different code path; often works when /{vanity} fails.
+ */
+async function tryGraphGetByFullPageUrl(pageUrl: string): Promise<string | null> {
+  const token = metaAdLibraryToken();
+  if (!token) return null;
+  const sp = new URLSearchParams();
+  sp.set("fields", "id");
+  sp.set("access_token", token);
+  sp.set("id", pageUrl);
+  const url = `https://graph.facebook.com/${GRAPH_VERSION}/?${sp.toString()}`;
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 15_000);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: ac.signal });
+  } finally {
+    clearTimeout(to);
   }
-  if (typeof data.id !== "string" || !/^\d{4,22}$/.test(data.id)) {
-    throw new Error("Could not get a valid Facebook Page id from that link. Use the brand Page URL (not a personal profile).");
+  const data = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+  if (!res.ok || data.error) return null;
+  return pickNumericIdFromGraphPayload(data);
+}
+
+/**
+ * Public Page HTML can embed pageID; used only for simple vanity handles (SSRF-safe).
+ */
+async function tryExtractPageIdFromPublicFacebookPageHtml(vanityHandle: string): Promise<string | null> {
+  if (!/^[A-Za-z0-9.]{1,200}$/.test(vanityHandle)) return null;
+  const pageUrl = `https://www.facebook.com/${vanityHandle}`;
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 14_000);
+  let res: Response;
+  try {
+    res = await fetch(pageUrl, {
+      signal: ac.signal,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+  } catch {
+    clearTimeout(to);
+    return null;
+  } finally {
+    clearTimeout(to);
   }
-  return data.id;
+  if (!res.ok) return null;
+  const buf = await res.arrayBuffer();
+  if (buf.byteLength > 2_000_000) return null;
+  const html = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+  const patterns: RegExp[] = [
+    /"pageID":"(\d{4,20})"/,
+    /"pageID":(\d{4,20})/,
+    /"page_id":(\d{4,20})/,
+    /"userID":(\d{4,20})/, // some Page contexts
+    /"profile_id":(\d{4,20})/,
+    /data-pageid="(\d{4,20})"/i,
+    /"pageid":"(\d{4,20})"/i,
+  ];
+  for (const re of patterns) {
+    const m = re.exec(html);
+    if (m && m[1] && /^\d{4,20}$/.test(m[1])) return m[1]!;
+  }
+  return null;
+}
+
+/**
+ * Pasted @handle, vanity segment, or full facebook.com URL → numeric Page id.
+ */
+async function graphResolvePageHandleToNumericId(raw: string, handle: string): Promise<string> {
+  const token = metaAdLibraryToken();
+  if (!token) {
+    throw new Error("Set META_APP_ID and META_APP_SECRET (or META_AD_LIBRARY_TOKEN) to resolve Facebook links.");
+  }
+
+  const clean = handle.replace(/^@/, "").trim();
+  if (!clean) {
+    throw new Error("Empty Facebook handle.");
+  }
+
+  const pageUrlCandidates: string[] = [];
+  const rawT = raw.trim();
+  if (/^https?:\/\//i.test(rawT)) {
+    let u: URL;
+    try {
+      u = new URL(rawT);
+    } catch {
+      u = new URL("https://invalid");
+    }
+    const h = u.hostname.toLowerCase().replace(/^www\./, "");
+    if (
+      h === "facebook.com" ||
+      h === "m.facebook.com" ||
+      h === "mbasic.facebook.com" ||
+      h === "web.facebook.com" ||
+      h === "fb.com" ||
+      h === "business.facebook.com"
+    ) {
+      u.hash = "";
+      pageUrlCandidates.push(u.toString());
+    }
+  }
+  pageUrlCandidates.push(`https://www.facebook.com/${encodeURIComponent(clean)}`);
+  pageUrlCandidates.push(`https://m.facebook.com/${encodeURIComponent(clean)}/`);
+
+  const seen = new Set<string>();
+  const uniqUrls = pageUrlCandidates.filter((u) => (seen.has(u) ? false : (seen.add(u), true)));
+
+  for (const u of uniqUrls) {
+    const id = await tryGraphGetByFullPageUrl(u);
+    if (id) return id;
+  }
+
+  const byNode = await tryGraphGetNode(clean);
+  if (byNode) return byNode;
+
+  const fromHtml = await tryExtractPageIdFromPublicFacebookPageHtml(clean);
+  if (fromHtml) return fromHtml;
+
+  const probe = await (async () => {
+    const sp = new URLSearchParams();
+    sp.set("fields", "id");
+    sp.set("access_token", token);
+    const pathPart = `/${GRAPH_VERSION}/${encodeURIComponent(clean)}`;
+    const r = await fetch(`https://graph.facebook.com${pathPart}?${sp.toString()}`);
+    const d = (await r.json().catch(() => ({}))) as { error?: { message?: string } };
+    return d.error?.message || null;
+  })();
+
+  const detail = probe ? ` Facebook said: ${probe}` : "";
+  throw new Error(
+    `Could not resolve that Facebook Page to a numeric id (${clean}).${detail} ${GRAPH_RESOLVE_USER_HINT}`
+  );
 }
 
 /**
@@ -149,7 +302,7 @@ export async function resolveCompetitorFacebookPageInput(raw: string | null | un
   if (parsed.type === "numericId") {
     return parsed.id;
   }
-  return await graphGetFacebookId(parsed.handle);
+  return await graphResolvePageHandleToNumericId(t, parsed.handle);
 }
 
 export type PublicUrlResult =
