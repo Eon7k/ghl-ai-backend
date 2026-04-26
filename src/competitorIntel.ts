@@ -326,6 +326,8 @@ export async function fetchWebsiteSnapshot(
 type MetaAdRow = {
   id: string;
   ad_creation_time?: string;
+  page_name?: string;
+  ad_snapshot_url?: string;
   ad_creative_bodies?: { text?: string }[] | string[];
   ad_creative_link_titles?: { text?: string }[] | string[];
 };
@@ -382,6 +384,7 @@ export async function fetchAndStoreMetaAdLibrary(
     const body = pickCreativeText(ad.ad_creative_bodies);
     const title = pickCreativeText(ad.ad_creative_link_titles);
     const headline = title || (body ? body.replace(/\s+/g, " ").trim().slice(0, 300) : null);
+    const mediaUrl = typeof ad.ad_snapshot_url === "string" && ad.ad_snapshot_url.startsWith("http") ? ad.ad_snapshot_url : null;
     try {
       await prisma.competitorAd.upsert({
         where: {
@@ -397,12 +400,14 @@ export async function fetchAndStoreMetaAdLibrary(
           adLibraryId: ad.id,
           headline,
           bodyText: body,
+          mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : null,
           lastSeenAt: new Date(),
           rawData: ad as unknown as Prisma.InputJsonValue,
         },
         update: {
           headline: headline ?? undefined,
           bodyText: body ?? undefined,
+          mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : undefined,
           lastSeenAt: new Date(),
           rawData: ad as unknown as Prisma.InputJsonValue,
         },
@@ -415,11 +420,27 @@ export async function fetchAndStoreMetaAdLibrary(
   return { ok: true, count };
 }
 
+export type YourCampaignIdea = {
+  title: string;
+  platform: string;
+  angle: string;
+  adCopy: string;
+  whyItWorks: string;
+};
+
+export type CompetitivePack = {
+  theirPlaybook: string;
+  howToWin: string[];
+  yourCampaigns: YourCampaignIdea[];
+  theirAdTactics: { headline: string; tactic: string }[];
+};
+
 export type SynthesisResult = {
   summary: string;
   topThemes: string[];
   suggestedCounterAngles: string[];
   strongestAds: { headline: string; note?: string }[];
+  competitivePack: CompetitivePack | null;
   rawPromptUsed?: string;
 };
 
@@ -455,10 +476,19 @@ function fallbackSynthesis(
     summary: lines.join("\n\n"),
     topThemes,
     suggestedCounterAngles: [
-      "Emphasize your unique guarantee or proof vs. this competitor’s generic claims.",
-      "Test a different hook (time savings, risk reversal, or social proof) on the same offer.",
+      "Emphasize a clearer guarantee and proof than this competitor’s generic claims.",
+      "Test a different primary hook: urgency, community, or risk-reversal for the same product.",
     ],
     strongestAds: [],
+    competitivePack: {
+      theirPlaybook: "Insufficient data: connect Meta Ad Library and set OPENAI_API_KEY for a full playbook.",
+      howToWin: [
+        "Differentiate on trust (reviews, credentials, or process transparency).",
+        "Own a narrower audience message than their broad “everyone” appeal.",
+      ],
+      yourCampaigns: [],
+      theirAdTactics: [],
+    },
   };
 }
 
@@ -467,7 +497,8 @@ export async function synthesizeWithOpenAI(input: {
   keywords: string[];
   site: WebsiteSnapshot | null;
   scanNotes: string[];
-  adHeadlines: string[];
+  /** Full lines for ad library context */
+  adDetails: { headline: string | null; body: string | null; pageName?: string | null }[];
 }): Promise<SynthesisResult> {
   const openai = openaiClient();
   const fb = fallbackSynthesis(input.competitorName, input.keywords, input.site, input.scanNotes);
@@ -478,42 +509,62 @@ export async function synthesizeWithOpenAI(input: {
     : "No website text captured.";
 
   const adsBlock =
-    input.adHeadlines.length > 0
-      ? `Recent Meta ad headlines/snippets:\n${input.adHeadlines.slice(0, 10).map((h, i) => `${i + 1}. ${h}`).join("\n")}`
-      : "No Meta ads pulled this run (add Page ID + Meta token, or no ads in library).";
+    input.adDetails.length > 0
+      ? `Public ads visible in Meta Ad Library for this Page (paraphrase from copy below — these are the competitor’s current angles, not full “campaigns” in Ads Manager, but the live ads they are running to the public):\n${input.adDetails
+          .slice(0, 15)
+          .map((a, i) => {
+            const h = a.headline || "—";
+            const b = (a.body || "—").replace(/\s+/g, " ").trim().slice(0, 400);
+            const pn = a.pageName ? ` [${a.pageName}]` : "";
+            return `${i + 1}.${pn} Headline: ${h}\n   Body: ${b}`;
+          })
+          .join("\n\n")}`
+      : "No Meta ads pulled (add a Facebook Page link + backend Meta token, or the Page has no current ads in the US for this query).";
 
-  const prompt = `You are a competitive marketing analyst. Given data about a competitor, output JSON only.
+  const prompt = `You are a senior performance marketer and competitive strategist. The user is running ads on Meta/Google/etc. and wants to **beat** this competitor. Be direct, non-generic, and action-oriented. Output a single JSON object (no markdown fences).
 
 ${siteBlock}
 
 ${adsBlock}
 
-Competitor name: ${input.competitorName}
-Watch keywords: ${input.keywords.length ? input.keywords.join(", ") : "(none)"}
-System notes: ${input.scanNotes.join(" | ") || "none"}
+Competitor: ${input.competitorName}
+Our tracked keywords: ${input.keywords.length ? input.keywords.join(", ") : "(none)"}
+System / scan notes: ${input.scanNotes.join(" | ") || "none"}
 
-Return a JSON object with:
-- "summary" (string, markdown allowed, 2-4 short paragraphs): executive read for a marketer
-- "topThemes" (string[], max 5): themes in their current messaging/landing/ads
-- "suggestedCounterAngles" (string[], max 5): concrete ways YOUR client could differentiate or counter-position
-- "strongestAds" (array of { "headline": string, "note": string }): up to 5 strongest or most relevant ad angles observed (use ads block; if empty, short hypotheses from site)
+Return JSON with these keys:
+- "summary" (string, markdown **bold** ok): 3-5 short paragraphs. Cover what they are doing in marketing, evidence from site/ads, and the biggest opportunity for our user to win.
+- "theirPlaybook" (string): 2-4 sentences on what this competitor’s go-to market looks like (channels, offer style, social proof, discounting, fear/aspiration, etc.).
+- "howToWin" (string array, 5-8 items): specific moves to beat them (not platitudes) — e.g. creative angles, offer structure, audience wedge, creative testing order.
+- "yourCampaigns" (array, 3-5 objects): each has "title" (short name), "platform" (e.g. meta, google, both), "angle" (one line positioning), "adCopy" (2-4 sentences of **ready-to-adapt** ad body copy the user can paste into a new campaign in this app as a starting point), "whyItWorks" (one sentence tied to the gap vs this competitor).
+- "theirAdTactics" (array, up to 8): { "headline": string, "tactic": string } for each important ad in the data — "tactic" = what this ad is doing psychologically and marketing-wise.
+- "topThemes" (string array, max 5): short labels for their messaging themes.
+- "suggestedCounterAngles" (string array, max 5): quick counter-angles (can overlap with howToWin but shorter).
+- "strongestAds" (array, max 5): { "headline": string, "note": string } for the strongest competitor ad themes and why they work.
 
-Output valid JSON only, no markdown fences.`;
+If ads data is empty, still use the website and be honest; reduce reliance on "theirAdTactics" and say what to do once Ad Library is connected.`;
 
   try {
     const completion = await openai.chat.completions.create({
       model: process.env.OPENAI_COMPETITOR_MODEL?.trim() || "gpt-4o-mini",
-      temperature: 0.35,
-      max_tokens: 1_800,
+      temperature: 0.4,
+      max_tokens: 4_200,
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: "You return only valid JSON. Be specific and non-generic when data exists." },
+        {
+          role: "system",
+          content:
+            "You return only valid JSON. Tactics and campaign ideas must be specific to the inputs; avoid empty platitudes. adCopy in yourCampaigns must be original text for the USER to run, not copied verbatim from the competitor.",
+        },
         { role: "user", content: prompt },
       ],
     });
     const raw = completion.choices[0]?.message?.content?.trim() || "";
     const parsed = JSON.parse(raw) as {
       summary?: string;
+      theirPlaybook?: string;
+      howToWin?: unknown;
+      yourCampaigns?: unknown;
+      theirAdTactics?: unknown;
       topThemes?: unknown;
       suggestedCounterAngles?: unknown;
       strongestAds?: unknown;
@@ -522,7 +573,7 @@ Output valid JSON only, no markdown fences.`;
       ? parsed.topThemes.filter((x): x is string => typeof x === "string").slice(0, 5)
       : fb.topThemes;
     const suggestedCounterAngles = Array.isArray(parsed.suggestedCounterAngles)
-      ? parsed.suggestedCounterAngles.filter((x): x is string => typeof x === "string").slice(0, 5)
+      ? parsed.suggestedCounterAngles.filter((x): x is string => typeof x === "string").slice(0, 8)
       : fb.suggestedCounterAngles;
     const strongestRaw = Array.isArray(parsed.strongestAds) ? parsed.strongestAds : [];
     const strongestAds: { headline: string; note?: string }[] = [];
@@ -533,12 +584,56 @@ Output valid JSON only, no markdown fences.`;
         strongestAds.push({ headline: (x as { headline: string }).headline, note });
       }
     }
+
+    const howToWin = Array.isArray(parsed.howToWin)
+      ? parsed.howToWin.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((s) => s.trim())
+      : fb.competitivePack!.howToWin;
+    const yourCampaigns: YourCampaignIdea[] = [];
+    if (Array.isArray(parsed.yourCampaigns)) {
+      for (const c of parsed.yourCampaigns) {
+        if (!c || typeof c !== "object") continue;
+        const o = c as Record<string, unknown>;
+        if (typeof o.title === "string" && typeof o.adCopy === "string") {
+          yourCampaigns.push({
+            title: o.title.slice(0, 120),
+            platform: typeof o.platform === "string" ? o.platform.slice(0, 40) : "meta",
+            angle: typeof o.angle === "string" ? o.angle.slice(0, 300) : "",
+            adCopy: o.adCopy.slice(0, 2_000),
+            whyItWorks: typeof o.whyItWorks === "string" ? o.whyItWorks.slice(0, 500) : "",
+          });
+        }
+      }
+    }
+    const theirAdTactics: { headline: string; tactic: string }[] = [];
+    if (Array.isArray(parsed.theirAdTactics)) {
+      for (const t of parsed.theirAdTactics) {
+        if (t && typeof t === "object" && typeof (t as { headline?: string }).headline === "string") {
+          theirAdTactics.push({
+            headline: (t as { headline: string }).headline.slice(0, 500),
+            tactic: typeof (t as { tactic?: string }).tactic === "string" ? (t as { tactic: string }).tactic.slice(0, 500) : "",
+          });
+        }
+      }
+    }
+    const theirPlaybook =
+      typeof parsed.theirPlaybook === "string" && parsed.theirPlaybook.trim()
+        ? parsed.theirPlaybook.trim()
+        : `**${input.competitorName}** — marketing focus inferred from the inputs above.`;
+
+    const competitivePack: CompetitivePack = {
+      theirPlaybook,
+      howToWin: howToWin.length ? howToWin : fb.competitivePack!.howToWin,
+      yourCampaigns: yourCampaigns.slice(0, 5),
+      theirAdTactics: theirAdTactics.slice(0, 8),
+    };
+
     return {
       summary: typeof parsed.summary === "string" && parsed.summary.trim() ? parsed.summary.trim() : fb.summary,
       topThemes: topThemes.length ? topThemes : fb.topThemes,
       suggestedCounterAngles: suggestedCounterAngles.length ? suggestedCounterAngles : fb.suggestedCounterAngles,
       strongestAds: strongestAds.length ? strongestAds : fb.strongestAds,
-      rawPromptUsed: "openai:competitor scan synthesis",
+      competitivePack,
+      rawPromptUsed: "openai:competitor scan synthesis v2",
     };
   } catch (e) {
     console.error("[competitorIntel] OpenAI synthesis", e);
@@ -559,6 +654,7 @@ export async function runCompetitorScanForWatch(
   topThemes: Prisma.InputJsonValue;
   suggestedCounterAngles: Prisma.InputJsonValue;
   strongestAds: Prisma.InputJsonValue;
+  competitivePack: Prisma.InputJsonValue | null;
   rawPromptUsed: string | null;
   scanNotes: string[];
 }> {
@@ -618,10 +714,18 @@ export async function runCompetitorScanForWatch(
   const recentAds = await prisma.competitorAd.findMany({
     where: { watchId: watch.id, platform: "meta" },
     orderBy: { lastSeenAt: "desc" },
-    take: 12,
+    take: 20,
   });
-  const adHeadlines = recentAds
-    .map((a) => a.headline || a.bodyText?.replace(/\s+/g, " ").trim().slice(0, 200) || "")
+  const adDetails = recentAds.map((a) => {
+    const raw = a.rawData as { page_name?: string } | null;
+    return {
+      headline: a.headline,
+      body: a.bodyText,
+      pageName: raw && typeof raw.page_name === "string" ? raw.page_name : null,
+    };
+  });
+  const adHeadlineFallbacks = adDetails
+    .map((a) => a.headline || a.body?.replace(/\s+/g, " ").trim().slice(0, 200) || "")
     .filter(Boolean) as string[];
 
   const syn = await synthesizeWithOpenAI({
@@ -629,14 +733,19 @@ export async function runCompetitorScanForWatch(
     keywords: kw,
     site,
     scanNotes,
-    adHeadlines,
+    adDetails,
   });
 
   return {
     summary: syn.summary,
     topThemes: syn.topThemes as unknown as Prisma.InputJsonValue,
     suggestedCounterAngles: syn.suggestedCounterAngles as unknown as Prisma.InputJsonValue,
-    strongestAds: (syn.strongestAds.length ? syn.strongestAds : adHeadlines.slice(0, 5).map((h) => ({ headline: h }))) as unknown as Prisma.InputJsonValue,
+    strongestAds: (syn.strongestAds.length
+      ? syn.strongestAds
+      : adHeadlineFallbacks.slice(0, 5).map((h) => ({ headline: h }))) as unknown as Prisma.InputJsonValue,
+    competitivePack: syn.competitivePack
+      ? (JSON.parse(JSON.stringify(syn.competitivePack)) as Prisma.InputJsonValue)
+      : null,
     rawPromptUsed: syn.rawPromptUsed || null,
     scanNotes,
   };

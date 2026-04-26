@@ -316,6 +316,8 @@ model CompetitorInsight {
   topThemes              Json            @default("[]")
   suggestedCounterAngles Json            @default("[]")
   strongestAds           Json            @default("[]")
+  /** AI: playbook, how to win, your campaign ideas, etc. (shape evolves; see competitorIntel) */
+  competitivePack        Json?
   rawPromptUsed          String?         @db.Text
 }
 

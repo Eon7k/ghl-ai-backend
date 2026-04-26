@@ -1178,6 +1178,7 @@ export function createExpansionRouter(): Router {
       let topThemes: Prisma.InputJsonValue;
       let suggestedCounterAngles: Prisma.InputJsonValue;
       let strongestAds: Prisma.InputJsonValue;
+      let competitivePack: Prisma.InputJsonValue | null = null;
       let rawPromptUsed: string | null = null;
       if (manualSummary) {
         summary = manualSummary;
@@ -1190,6 +1191,7 @@ export function createExpansionRouter(): Router {
         topThemes = out.topThemes;
         suggestedCounterAngles = out.suggestedCounterAngles;
         strongestAds = out.strongestAds;
+        competitivePack = out.competitivePack;
         rawPromptUsed = out.rawPromptUsed;
       }
 
@@ -1200,6 +1202,7 @@ export function createExpansionRouter(): Router {
           topThemes,
           suggestedCounterAngles,
           strongestAds,
+          competitivePack: competitivePack ?? undefined,
           rawPromptUsed,
         },
       });
