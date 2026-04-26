@@ -1217,7 +1217,33 @@ export function createExpansionRouter(): Router {
       return res.json({ watch: row, insight });
     } catch (e) {
       console.error("[scan competitor]", e);
-      return apiErr(res, 500, "SERVER_ERROR", "Scan failed");
+      const em = e instanceof Error ? e.message : String(e);
+      if (
+        /competitivePack|Unknown field|column .* does not exist|does not exist in the current database|Invalid.*invocation/i.test(
+          em
+        )
+      ) {
+        return apiErr(
+          res,
+          500,
+          "SERVER_ERROR",
+          "Scan could not be saved: the server database is missing a recent update. Your team should run: npx prisma db push (or deploy the latest migration), then try again."
+        );
+      }
+      if (e instanceof Prisma.PrismaClientKnownRequestError && (e.code === "P2002" || e.code === "P2011")) {
+        return apiErr(
+          res,
+          500,
+          "SERVER_ERROR",
+          "Scan failed due to a data conflict. Try again, or contact support if it keeps happening."
+        );
+      }
+      return apiErr(
+        res,
+        500,
+        "SERVER_ERROR",
+        "Scan failed. If this happens again, your team can check the server log for [scan competitor]."
+      );
     }
   });
 
