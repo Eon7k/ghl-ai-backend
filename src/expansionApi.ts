@@ -8,7 +8,12 @@ import jwt from "jsonwebtoken";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
 import { enabledProductKeysFromDb, userHasProduct } from "./productEntitlements";
-import { runCompetitorScanForWatch, resolveCompetitorFacebookPageInput } from "./competitorIntel";
+import {
+  runCompetitorScanForWatch,
+  resolveCompetitorFacebookPageInput,
+  resolveCompetitorFacebookPageInputEx,
+  discoverFacebookPageFromCompetitorWebsite,
+} from "./competitorIntel";
 
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
 export const EXPANSION_UPLOADS_ROOT = path.resolve(
@@ -985,6 +990,53 @@ export function createExpansionRouter(): Router {
   });
 
   // ----- Module 6: Competitor watches -----
+  /** Resolve Facebook Page to numeric id (Ad Library “View all” URL, link, @handle, or id). */
+  r.post("/agency/competitor/resolve-facebook-page", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const b = (req.body || {}) as { input?: unknown };
+      const input = typeof b.input === "string" ? b.input.trim() : "";
+      if (!input) return apiErr(res, 400, "VALIDATION", "input is required");
+      if (input.length > 2000) return apiErr(res, 400, "VALIDATION", "input is too long");
+      const result = await resolveCompetitorFacebookPageInputEx(input);
+      if (!result) {
+        return res.json({ pageId: null, source: null, message: "Could not read a Facebook Page from that text." });
+      }
+      return res.json({ pageId: result.pageId, source: result.source });
+    } catch (e) {
+      return apiErr(
+        res,
+        400,
+        "VALIDATION",
+        e instanceof Error ? e.message : "Could not resolve that Facebook Page. Try a full page URL, Ad Library “View all” link, or numeric id."
+      );
+    }
+  });
+
+  /** Scrape the competitor’s public website for facebook.com/… links, then resolve to Page id (no Ad Library). */
+  r.post(
+    "/agency/competitor/discover-facebook-page-from-website",
+    expansionRequireAuth,
+    expansionRequireProduct("competitors"),
+    async (req: ExpansionAuthRequest, res: Response) => {
+      try {
+        const b = (req.body || {}) as { website?: unknown };
+        const website = typeof b.website === "string" ? b.website.trim() : "";
+        if (!website) return apiErr(res, 400, "VALIDATION", "website is required");
+        if (website.length > 500) return apiErr(res, 400, "VALIDATION", "website is too long");
+        const r0 = await discoverFacebookPageFromCompetitorWebsite(website);
+        return res.json(r0);
+      } catch (e) {
+        console.error("[discover-facebook-page-from-website]", e);
+        return apiErr(
+          res,
+          500,
+          "SERVER_ERROR",
+          e instanceof Error ? e.message : "Could not scan the website for Facebook links."
+        );
+      }
+    }
+  );
+
   r.get("/agency/competitor/watches", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
     try {
       const scope = await resolveLandingScope(req, res);

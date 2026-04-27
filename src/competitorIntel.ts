@@ -7,7 +7,7 @@ import OpenAI from "openai";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
 
-const GRAPH_VERSION = (process.env.META_GRAPH_API_VERSION || "v21.0").replace(/^v?/, "v");
+const GRAPH_VERSION = (process.env.META_GRAPH_API_VERSION || "v25.0").replace(/^v?/, "v");
 const MAX_HTML_BYTES = 1_500_000;
 const FETCH_TIMEOUT_MS = 14_000;
 
@@ -55,10 +55,14 @@ const FB_PATH_RESERVED = new Set(
   )
 );
 
-export type FacebookPageParse = { type: "numericId"; id: string } | { type: "graphHandle"; handle: string } | { type: "empty" };
+export type FacebookPageParse =
+  | { type: "numericId"; id: string; fromAdLibrary?: true }
+  | { type: "graphHandle"; handle: string }
+  | { type: "empty" };
 
 /**
  * From a pasted Page id, @handle, or facebook.com/... URL, extract a numeric id or a Graph "username" to resolve.
+ * Recognizes Ad Library "View all" URLs with view_all_page_id=… (reliable for competitor scans; no Graph call).
  */
 export function parseFacebookPageInput(raw: string): FacebookPageParse {
   const t = raw.trim();
@@ -80,7 +84,12 @@ export function parseFacebookPageInput(raw: string): FacebookPageParse {
       return t.length < 1 || /\s/.test(t) ? { type: "empty" } : { type: "graphHandle", handle: t.replace(/^@/, "") };
     }
     const host = u.hostname.toLowerCase().replace(/^www\./, "");
-    if (host === "fb.com" || host === "facebook.com" || host === "m.facebook.com" || host === "web.facebook.com" || host === "business.facebook.com" || host === "mbasic.facebook.com") {
+    if (host === "fb.com" || host === "facebook.com" || host === "m.facebook.com" || host === "web.facebook.com" || host === "business.facebook.com" || host === "mbasic.facebook.com" || host === "l.facebook.com") {
+      /** Meta Ad Library: open any brand → "View all" → copy URL; `view_all_page_id` is the Facebook Page id for ads_archive. */
+      const fromLibrary = u.searchParams.get("view_all_page_id");
+      if (fromLibrary && /^\d{4,22}$/.test(fromLibrary.trim())) {
+        return { type: "numericId", id: fromLibrary.trim(), fromAdLibrary: true };
+      }
       const idParam = u.searchParams.get("id") || u.searchParams.get("page_id");
       if (idParam && /^\d{4,22}$/.test(idParam)) {
         return { type: "numericId", id: idParam };
@@ -228,6 +237,10 @@ async function tryExtractPageIdFromPublicFacebookPageHtml(vanityHandle: string):
     /"profile_id":(\d{4,20})/,
     /data-pageid="(\d{4,20})"/i,
     /"pageid":"(\d{4,20})"/i,
+    /"PageID":\s*"(\d{4,20})"/,
+    /"pageId":\s*"(\d{4,20})"/,
+    /"page_id":\s*"(\d{4,20})"/,
+    /"entity_id":\s*"(\d{4,20})"/,
   ];
   for (const re of patterns) {
     const m = re.exec(html);
@@ -326,6 +339,191 @@ export async function resolveCompetitorFacebookPageInput(raw: string | null | un
     return parsed.id;
   }
   return await graphResolvePageHandleToNumericId(t, parsed.handle);
+}
+
+/**
+ * Resolves a Page id and labels how it was obtained (for UI: Ad Library URL vs manual id vs Graph/HTML lookup).
+ */
+export async function resolveCompetitorFacebookPageInputEx(
+  raw: string | null | undefined
+): Promise<null | { pageId: string; source: "ad_library" | "direct" | "graph" }> {
+  if (raw == null) return null;
+  const t = String(raw).trim();
+  if (!t) return null;
+  const pre = parseFacebookPageInput(t);
+  if (pre.type === "numericId" && pre.fromAdLibrary) {
+    return { pageId: pre.id, source: "ad_library" };
+  }
+  if (pre.type === "numericId") {
+    return { pageId: pre.id, source: "direct" };
+  }
+  const pageId = await resolveCompetitorFacebookPageInput(t);
+  if (!pageId) return null;
+  return { pageId, source: "graph" };
+}
+
+/** Dedupe and compare facebook URLs from the same page (strip query, trailing slash). */
+function normalizeFacebookWebUrlForDedup(href: string): string | null {
+  const raw = href.trim();
+  if (!raw) return null;
+  let u: URL;
+  try {
+    u = new URL(raw.startsWith("http") ? raw : `https://${raw}`);
+  } catch {
+    return null;
+  }
+  const h = u.hostname.toLowerCase().replace(/^(www|m|l|mbasic|web)\./, "");
+  if (h !== "facebook.com" && h !== "fb.com") return null;
+  u.search = "";
+  u.hash = "";
+  let p = u.pathname.replace(/\/$/, "");
+  if (p === "" || p === "/") return null;
+  return `${h}${p}`;
+}
+
+function isPlausibleFacebookPagePath(absoluteOrRelative: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(absoluteOrRelative.startsWith("http") ? absoluteOrRelative : `https://facebook.com${absoluteOrRelative.startsWith("/") ? "" : "/"}${absoluteOrRelative}`);
+  } catch {
+    return false;
+  }
+  const p = u.pathname.toLowerCase();
+  if (
+    p.includes("/sharer/") ||
+    p.includes("share.php") ||
+    p.includes("/dialog/") ||
+    p.includes("/plugins/") ||
+    p.includes("tr.php") ||
+    p.includes("like.php")
+  ) {
+    return false;
+  }
+  if (p.startsWith("/groups/") || p.startsWith("/events/") || p.startsWith("/login") || p.startsWith("/watch/")) {
+    return false;
+  }
+  if (p === "/" || p === "") return false;
+  return true;
+}
+
+/**
+ * From public HTML (e.g. competitor homepage), find facebook.com/… hrefs. Brands usually put the Page
+ * in the footer; this avoids users opening the Ad Library when the site already links the Page.
+ */
+export function extractFacebookPageUrlsFromHtml(html: string, max = 10): string[] {
+  const raw: string[] = [];
+  const re =
+    /\bhref\s*=\s*["']((https?:)?\/\/(?:www\.|l\.|m\.)?(?:facebook|fb)\.com\/[^"'>\s#?]+)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null && raw.length < max * 3) {
+    let href = m[1]!.trim();
+    if (href && !href.startsWith("http")) href = "https:" + href;
+    if (!isPlausibleFacebookPathHref(href)) continue;
+    raw.push(href);
+  }
+  const ogm = /property=["']og:url["']\s+content=["'](https?:\/\/(?:www\.)?(?:facebook|fb)\.com\/[^"']+)/i.exec(
+    html
+  );
+  if (ogm?.[1] && isPlausibleFacebookPathHref(ogm[1])) {
+    raw.unshift(ogm[1]);
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const h of raw) {
+    const k = normalizeFacebookWebUrlForDedup(h);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    if (!h.startsWith("http")) {
+      out.push("https:" + h);
+    } else {
+      out.push(h);
+    }
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function isPlausibleFacebookPathHref(href: string): boolean {
+  if (!href) return false;
+  return isPlausibleFacebookPagePath(href);
+}
+
+export type FacebookPageFromWebsiteRow = {
+  pageUrl: string;
+  pageId: string;
+  source: "ad_library" | "direct" | "graph";
+};
+
+/**
+ * Fetches a public competitor website and resolves Facebook links found in HTML to Page ids
+ * (uses the same resolution as the watch field — Graph / Ad Library param / etc.).
+ */
+export async function discoverFacebookPageFromCompetitorWebsite(website: string): Promise<{
+  foundLinks: string[];
+  candidates: FacebookPageFromWebsiteRow[];
+  message?: string;
+}> {
+  const pub = assertPublicHttpUrl(website);
+  if (!pub.ok) {
+    return { foundLinks: [], candidates: [], message: pub.error };
+  }
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(pub.href, {
+      signal: ac.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": "GHL-AI-CompetitorBot/1.0 (+https://github.com) compatible; research",
+        Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+      },
+    });
+  } catch (e) {
+    clearTimeout(t);
+    const msg = e instanceof Error && e.name === "AbortError" ? "Request timed out" : "Could not fetch page";
+    return { foundLinks: [], candidates: [], message: msg };
+  } finally {
+    clearTimeout(t);
+  }
+  if (!res.ok) {
+    return { foundLinks: [], candidates: [], message: `Website returned HTTP ${res.status}` };
+  }
+  const buf = await res.arrayBuffer();
+  if (buf.byteLength > MAX_HTML_BYTES) {
+    return { foundLinks: [], candidates: [], message: "Page is too large to scan for links" };
+  }
+  const html = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+  const foundLinks = extractFacebookPageUrlsFromHtml(html, 10);
+  if (foundLinks.length === 0) {
+    return {
+      foundLinks: [],
+      candidates: [],
+      message:
+        "No Facebook Page links found on that homepage (footer, header, or meta tags). Add a public facebook.com/… link on the page, or paste a Page link manually.",
+    };
+  }
+  const candidates: FacebookPageFromWebsiteRow[] = [];
+  for (const pageUrl of foundLinks) {
+    if (candidates.length >= 3) break;
+    try {
+      const ex = await resolveCompetitorFacebookPageInputEx(pageUrl);
+      if (ex) {
+        candidates.push({ pageUrl, pageId: ex.pageId, source: ex.source });
+      }
+    } catch {
+      // try next link
+    }
+  }
+  if (candidates.length === 0) {
+    return {
+      foundLinks,
+      candidates: [],
+      message:
+        "Found Facebook link(s) on the page, but the server could not turn them into a Page id. Check META_APP_ID / token and app mode, or paste the Page id or Ad Library “View all” URL.",
+    };
+  }
+  return { foundLinks, candidates };
 }
 
 export type PublicUrlResult =
@@ -527,7 +725,25 @@ const ADS_ARCHIVE_FIELDS = [
   "ad_creative_link_titles",
 ].join(",");
 
-type AdsArchiveJson = { data?: MetaAdRow[]; error?: { message?: string; code?: number } };
+type AdsArchiveJson = {
+  data?: MetaAdRow[];
+  error?: {
+    message?: string;
+    code?: number;
+    error_subcode?: number;
+    error_user_msg?: string;
+    error_user_title?: string;
+  };
+};
+
+function formatAdsArchiveError(e: NonNullable<AdsArchiveJson["error"]>): string {
+  const parts: string[] = [];
+  if (e.message) parts.push(e.message);
+  if (typeof e.error_subcode === "number") parts.push(`(error_subcode ${e.error_subcode})`);
+  if (e.error_user_title?.trim()) parts.push(`[${e.error_user_title.trim()}]`);
+  if (e.error_user_msg?.trim()) parts.push(e.error_user_msg.trim());
+  return parts.join(" ");
+}
 
 /** Meta cURL uses `ad_reached_countries=['US']` (single-quoted). Node uses JSON `["US"]` first; this is a second encoding some stacks expect. */
 function adReachedCountriesToMetaCurlString(codes: string[], max = 20): string {
@@ -621,23 +837,38 @@ export async function fetchAndStoreMetaAdLibrary(
       return { ok: false, error: e instanceof Error ? e.message : "Ad Library request failed", debug: tried.join(" | ") };
     }
     const { res, data } = one;
-    if (!res.ok) {
-      const em = data.error?.message || `HTTP ${res.status}`;
-      const code = data.error?.code;
-      lastHttpError = `Meta Ad Library: ${em}`;
-      if (code === 190 || /invalid.*token|OAuthException|expired|session has been invalidated/i.test(em)) {
-        return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
-      }
-      if (code === 4 || /rate limit|too many|temporarily|limit/i.test(em)) {
-        return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
-      }
-      if (code === 10 || /permission|not authorized|does not have permission|2332002/i.test(em)) {
+    if (!res.ok && data.error) {
+      const err = data.error;
+      const full = formatAdsArchiveError(err);
+      lastHttpError = `Meta Ad Library: ${full}`;
+      if (err.code === 10 && err.error_subcode === 2332002) {
         return {
           ok: false,
-          error: `${lastHttpError} (Ad Library often needs a long-lived *user* token with the right product access, not only an app id|secret. Check Meta’s Ad Library API setup.)`,
+          error:
+            `Meta Ad Library: ${full} ` +
+            `Meta requires completing the official Ad Library API access flow at https://www.facebook.com/ads/library/api (use “Access the API” / get authorized). ` +
+            `This is not the same as only selecting ads_read in Graph API Explorer. Follow any identity or app steps Meta shows there; https://www.facebook.com/ID may be required for some people.`,
           debug: tried.join(" | "),
         };
       }
+      const em = err.message || `HTTP ${res.status}`;
+      if (err.code === 190 || /invalid.*token|OAuthException|expired|session has been invalidated/i.test(em)) {
+        return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
+      }
+      if (err.code === 4 || /rate limit|too many|temporarily|limit/i.test(em)) {
+        return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
+      }
+      if (err.code === 10 || /permission|not authorized|does not have permission/i.test(em)) {
+        return {
+          ok: false,
+          error: `${lastHttpError} (If you already use a user token + ads_read, still complete https://www.facebook.com/ads/library/api — not only Explorer.)`,
+          debug: tried.join(" | "),
+        };
+      }
+      continue;
+    }
+    if (!res.ok) {
+      lastHttpError = `Meta Ad Library: HTTP ${res.status}`;
       continue;
     }
     const rows = data.data || [];
