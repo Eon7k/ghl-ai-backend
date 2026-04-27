@@ -27,7 +27,7 @@ if [ -n "${META_AD_LIBRARY_TOKEN:-}" ] && [ "${META_AD_LIBRARY_TOKEN}" != "" ]; 
   echo "Using META_AD_LIBRARY_TOKEN (length ${#TOKEN})."
 else
   if [ -z "${META_APP_ID:-}" ] || [ -z "${META_APP_SECRET:-}" ]; then
-    echo "ERROR: Set META_APP_ID and META_APP_SECRET, or META_AD_LIBRARY_TOKEN, in .env"
+    echo "ERROR: Set META_APP_ID and META_APP_SECRET (preferred), or META_AD_LIBRARY_TOKEN as fallback, in .env"
     echo "  Get them from: https://developers.facebook.com/apps/ → your app → Settings → Basic"
     exit 1
   fi

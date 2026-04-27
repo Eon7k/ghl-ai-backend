@@ -13,6 +13,7 @@ import {
   resolveCompetitorFacebookPageInput,
   resolveCompetitorFacebookPageInputEx,
   discoverFacebookPageFromCompetitorWebsite,
+  resolveMetaAdLibraryIdToPageId,
 } from "./competitorIntel";
 
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
@@ -1012,6 +1013,32 @@ export function createExpansionRouter(): Router {
     }
   });
 
+  /** One Ad Library ad id → page_id (Graph Archived ad) for search_page_ids / scans. */
+  r.post(
+    "/agency/competitor/resolve-page-from-ad-library-id",
+    expansionRequireAuth,
+    expansionRequireProduct("competitors"),
+    async (req: ExpansionAuthRequest, res: Response) => {
+      try {
+        const b = (req.body || {}) as { adLibraryId?: unknown };
+        const adLibraryId = typeof b.adLibraryId === "string" ? b.adLibraryId.trim() : "";
+        if (!adLibraryId) return apiErr(res, 400, "VALIDATION", "adLibraryId is required");
+        if (adLibraryId.length > 80) return apiErr(res, 400, "VALIDATION", "adLibraryId is too long");
+        const r0 = await resolveMetaAdLibraryIdToPageId(adLibraryId);
+        return res.json(r0);
+      } catch (e) {
+        return apiErr(
+          res,
+          400,
+          "VALIDATION",
+          e instanceof Error
+            ? e.message
+            : "Could not resolve that Ad Library ad id. Check the id and server Meta token (Ad Library access)."
+        );
+      }
+    }
+  );
+
   /** Scrape the competitor’s public website for facebook.com/… links, then resolve to Page id (no Ad Library). */
   r.post(
     "/agency/competitor/discover-facebook-page-from-website",
@@ -1019,11 +1046,26 @@ export function createExpansionRouter(): Router {
     expansionRequireProduct("competitors"),
     async (req: ExpansionAuthRequest, res: Response) => {
       try {
-        const b = (req.body || {}) as { website?: unknown };
+        const b = (req.body || {}) as {
+          website?: unknown;
+          companyName?: unknown;
+          locationHint?: unknown;
+          crawlEntireSite?: unknown;
+          includeGooglePlace?: unknown;
+        };
         const website = typeof b.website === "string" ? b.website.trim() : "";
         if (!website) return apiErr(res, 400, "VALIDATION", "website is required");
         if (website.length > 500) return apiErr(res, 400, "VALIDATION", "website is too long");
-        const r0 = await discoverFacebookPageFromCompetitorWebsite(website);
+        const companyName = typeof b.companyName === "string" ? b.companyName.trim().slice(0, 200) : "";
+        const locationHint = typeof b.locationHint === "string" ? b.locationHint.trim().slice(0, 120) : "";
+        const crawlEntireSite = b.crawlEntireSite === false ? false : true;
+        const includeGooglePlace = b.includeGooglePlace === false ? false : true;
+        const r0 = await discoverFacebookPageFromCompetitorWebsite(website, {
+          crawlEntireSite,
+          companyName: companyName || undefined,
+          locationHint: locationHint || undefined,
+          includeGooglePlace,
+        });
         return res.json(r0);
       } catch (e) {
         console.error("[discover-facebook-page-from-website]", e);

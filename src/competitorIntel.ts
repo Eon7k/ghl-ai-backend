@@ -17,12 +17,17 @@ function openaiClient(): OpenAI | null {
   return new OpenAI({ apiKey: k });
 }
 
+/**
+ * Ad Library / Graph calls: prefer **app access token** (`app_id|app_secret`) when both are set — same “general” access as
+ * before, no per-user token required. Falls back to `META_AD_LIBRARY_TOKEN` only if app id+secret are not both configured
+ * (or for local testing with a user token only).
+ */
 function metaAdLibraryToken(): string | null {
-  const direct = (process.env.META_AD_LIBRARY_TOKEN || "").trim();
-  if (direct) return direct;
   const id = (process.env.META_APP_ID || "").trim();
   const secret = (process.env.META_APP_SECRET || "").trim();
   if (id && secret) return `${id}|${secret}`;
+  const direct = (process.env.META_AD_LIBRARY_TOKEN || "").trim();
+  if (direct) return direct;
   return null;
 }
 
@@ -255,7 +260,7 @@ async function tryExtractPageIdFromPublicFacebookPageHtml(vanityHandle: string):
 async function graphResolvePageHandleToNumericId(raw: string, handle: string): Promise<string> {
   const token = metaAdLibraryToken();
   if (!token) {
-    throw new Error("Set META_APP_ID and META_APP_SECRET (or META_AD_LIBRARY_TOKEN) to resolve Facebook links.");
+    throw new Error("Set META_APP_ID and META_APP_SECRET for Ad Library (or META_AD_LIBRARY_TOKEN if you have no app secret on this host).");
   }
 
   const clean = handle.replace(/^@/, "").trim();
@@ -362,6 +367,65 @@ export async function resolveCompetitorFacebookPageInputEx(
   return { pageId, source: "graph" };
 }
 
+/**
+ * Graph “Archived ad” node: the Ad Library `id` from `ads_archive` is the same object id.
+ * `GET /{id}?fields=page_id,page_name` — then use `page_id` in `search_page_ids` to list that Page’s ads.
+ * @see https://developers.facebook.com/docs/graph-api/reference/archived-ad/
+ */
+export async function resolveMetaAdLibraryIdToPageId(raw: string): Promise<{
+  pageId: string;
+  pageName: string | null;
+  adLibraryId: string;
+}> {
+  const token = metaAdLibraryToken();
+  if (!token) {
+    throw new Error(
+      "Set META_APP_ID and META_APP_SECRET (preferred) or META_AD_LIBRARY_TOKEN to look up an Ad Library ad by id."
+    );
+  }
+  const adLibraryId = raw.replace(/\D/g, "");
+  if (!adLibraryId || adLibraryId.length < 6 || adLibraryId.length > 24) {
+    throw new Error("Paste the numeric Meta Ad Library ad id (usually many digits, from the API or a library ad).");
+  }
+  const sp = new URLSearchParams();
+  sp.set("access_token", token);
+  sp.set("fields", "page_id,page_name,id");
+  const url = `https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(adLibraryId)}?${sp.toString()}`;
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 22_000);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: ac.signal });
+  } finally {
+    clearTimeout(to);
+  }
+  const data = (await res.json().catch(() => ({}))) as {
+    page_id?: string;
+    page_name?: string;
+    id?: string;
+    error?: { message?: string; error_user_msg?: string; error_user_title?: string; code?: number };
+  };
+  if (data.error) {
+    const parts: string[] = [];
+    if (data.error.error_user_msg) parts.push(data.error.error_user_msg);
+    else if (data.error.message) parts.push(data.error.message);
+    else parts.push("Graph could not read this ad id.");
+    if (res.status === 400 || res.status === 404) {
+      parts.push("Use an ad id from Meta Ad Library / your ads_archive results (field id).");
+    }
+    throw new Error(parts.join(" "));
+  }
+  const pageId =
+    typeof data.page_id === "string" && /^\d{4,22}$/.test(data.page_id.trim()) ? data.page_id.trim() : null;
+  if (!pageId) {
+    throw new Error(
+      "Meta returned no page_id for this ad. The id may not be a Library ad, or the ad is not visible to this token."
+    );
+  }
+  const pageName = typeof data.page_name === "string" && data.page_name.trim() ? data.page_name.trim() : null;
+  return { pageId, pageName, adLibraryId };
+}
+
 /** Dedupe and compare facebook URLs from the same page (strip query, trailing slash). */
 function normalizeFacebookWebUrlForDedup(href: string): string | null {
   const raw = href.trim();
@@ -454,21 +518,70 @@ export type FacebookPageFromWebsiteRow = {
   source: "ad_library" | "direct" | "graph";
 };
 
-/**
- * Fetches a public competitor website and resolves Facebook links found in HTML to Page ids
- * (uses the same resolution as the watch field — Graph / Ad Library param / etc.).
- */
-export async function discoverFacebookPageFromCompetitorWebsite(website: string): Promise<{
-  foundLinks: string[];
-  candidates: FacebookPageFromWebsiteRow[];
-  message?: string;
-}> {
-  const pub = assertPublicHttpUrl(website);
-  if (!pub.ok) {
-    return { foundLinks: [], candidates: [], message: pub.error };
+export type DiscoverFromWebsiteOptions = {
+  /**
+   * When true, follows internal links on the same hostname (BFS) up to maxCrawlPages.
+   * @default true
+   */
+  crawlEntireSite?: boolean;
+  /** @default 28 */
+  maxCrawlPages?: number;
+  /** Delay between same-host requests (ms). @default 350 */
+  crawlDelayMs?: number;
+  /**
+   * Business name for optional Google Places Text Search (needs GOOGLE_PLACES_API_KEY).
+   * Improves official website/Maps; API does not return Facebook for arbitrary listings.
+   */
+  companyName?: string;
+  locationHint?: string;
+  /** @default true when companyName and GOOGLE_PLACES_API_KEY are set */
+  includeGooglePlace?: boolean;
+};
+
+export type GooglePlaceEnrichment = {
+  textQuery: string;
+  displayName: string | null;
+  websiteUri: string | null;
+  googleMapsUri: string | null;
+  note: string;
+};
+
+const DEFAULT_CRAWL_MAX_PAGES = 28;
+const DEFAULT_CRAWL_DELAY_MS = 350;
+
+function normalizeUrlKeyForCrawl(href: string): string {
+  let u: URL;
+  try {
+    u = new URL(href);
+  } catch {
+    return href;
   }
+  u.hash = "";
+  const sp = u.searchParams;
+  for (const k of [...sp.keys()]) {
+    const kl = k.toLowerCase();
+    if (kl.startsWith("utm_") || k === "gclid" || k === "fbclid" || k === "mscklid" || k === "_ga" || k.startsWith("mc_")) {
+      sp.delete(k);
+    }
+  }
+  u.search = sp.toString() ? "?" + sp.toString() : "";
+  if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/+$/, "");
+  if (u.pathname === "") u.pathname = "/";
+  return u.href;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * HTML-only fetch for public http(s) URLs. Caller must ensure same-host policy for crawls.
+ */
+async function fetchPublicHtmlString(url: string): Promise<string | null> {
+  const pub = assertPublicHttpUrl(url);
+  if (!pub.ok) return null;
   const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
+  const to = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
   let res: Response;
   try {
     res = await fetch(pub.href, {
@@ -479,33 +592,233 @@ export async function discoverFacebookPageFromCompetitorWebsite(website: string)
         Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
       },
     });
-  } catch (e) {
-    clearTimeout(t);
-    const msg = e instanceof Error && e.name === "AbortError" ? "Request timed out" : "Could not fetch page";
-    return { foundLinks: [], candidates: [], message: msg };
+  } catch {
+    return null;
   } finally {
-    clearTimeout(t);
+    clearTimeout(to);
+  }
+  if (!res.ok) return null;
+  const len = res.headers.get("content-length");
+  if (len && +len > MAX_HTML_BYTES) return null;
+  const buf = await res.arrayBuffer();
+  if (buf.byteLength > MAX_HTML_BYTES) return null;
+  return new TextDecoder("utf-8", { fatal: false }).decode(buf);
+}
+
+/**
+ * Internal links: same host only, no asset spam.
+ */
+function extractSameHostLinksFromHtml(html: string, pageUrl: string, hostLower: string, max: number): string[] {
+  const base = new URL(pageUrl);
+  const out: string[] = [];
+  const re = /\bhref\s*=\s*["']([^"']+)["']/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null && out.length < max) {
+    const raw = m[1]!.trim();
+    if (raw.startsWith("mailto:") || raw.startsWith("tel:") || raw.startsWith("javascript:") || raw === "#" || raw.length > 2_000) {
+      continue;
+    }
+    let abs: string;
+    try {
+      abs = new URL(raw, base).href;
+    } catch {
+      continue;
+    }
+    const u = new URL(abs);
+    if (u.hostname.toLowerCase() !== hostLower) continue;
+    if (/\.(pdf|zip|7z|tar|gz|rar|mp4|webm|mp3|woff2?|ttf|eot)(\?|$)/i.test(u.pathname)) continue;
+    if (u.pathname.toLowerCase().endsWith(".xml") && u.pathname.includes("sitemap")) {
+      // prefer not to follow raw sitemap in simple crawl (would need XML parse)
+      continue;
+    }
+    u.hash = "";
+    out.push(u.toString());
+  }
+  return out;
+}
+
+async function tryGooglePlaceEnrichment(companyName: string, locationHint: string | undefined): Promise<GooglePlaceEnrichment | null> {
+  const key = (process.env.GOOGLE_PLACES_API_KEY || "").trim();
+  if (!key || !companyName.trim()) return null;
+  const textQuery = [companyName.trim(), (locationHint || "").trim()].filter(Boolean).join(" ");
+  if (textQuery.length < 2) return null;
+  const body = { textQuery: textQuery.slice(0, 400) };
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 12_000);
+  let res: Response;
+  try {
+    res = await fetch("https://places.googleapis.com/v1/places:searchText", {
+      method: "POST",
+      signal: ac.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": key,
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.websiteUri,places.googleMapsUri",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(to);
   }
   if (!res.ok) {
-    return { foundLinks: [], candidates: [], message: `Website returned HTTP ${res.status}` };
+    return {
+      textQuery,
+      displayName: null,
+      websiteUri: null,
+      googleMapsUri: null,
+      note: `Google Places search returned HTTP ${res.status} (check GOOGLE_PLACES_API_KEY and Places API (New) enabled for the key).`,
+    };
   }
-  const buf = await res.arrayBuffer();
-  if (buf.byteLength > MAX_HTML_BYTES) {
-    return { foundLinks: [], candidates: [], message: "Page is too large to scan for links" };
+  const data = (await res.json().catch(() => null)) as {
+    places?: { displayName?: { text?: string }; websiteUri?: string; googleMapsUri?: string; formattedAddress?: string }[];
+  } | null;
+  const p = data?.places?.[0];
+  if (!p) {
+    return {
+      textQuery,
+      displayName: null,
+      websiteUri: null,
+      googleMapsUri: null,
+      note: "No Google place matched this name/location. Try a clearer business name and city/region in location hint.",
+    };
   }
-  const html = new TextDecoder("utf-8", { fatal: false }).decode(buf);
-  const foundLinks = extractFacebookPageUrlsFromHtml(html, 10);
-  if (foundLinks.length === 0) {
+  return {
+    textQuery,
+    displayName: p.displayName?.text?.trim() || null,
+    websiteUri: p.websiteUri?.trim() || null,
+    googleMapsUri: p.googleMapsUri?.trim() || null,
+    note:
+      "Google’s Places API does not expose a Facebook field for arbitrary businesses. We use the listing to confirm name, official website, and a Maps link; Facebook still comes from website HTML or your paste.",
+  };
+}
+
+/**
+ * Fetches a public competitor website, optionally crawls same-site pages, optionally enriches from Google Places,
+ * and resolves Facebook links to Page ids.
+ */
+export async function discoverFacebookPageFromCompetitorWebsite(
+  website: string,
+  options?: DiscoverFromWebsiteOptions
+): Promise<{
+  foundLinks: string[];
+  candidates: FacebookPageFromWebsiteRow[];
+  message?: string;
+  crawledPageCount: number;
+  crawlEntireSite: boolean;
+  googlePlace?: GooglePlaceEnrichment;
+}> {
+  const pub = assertPublicHttpUrl(website);
+  if (!pub.ok) {
+    return { foundLinks: [], candidates: [], message: pub.error, crawledPageCount: 0, crawlEntireSite: false };
+  }
+  const startUrl = pub.href;
+  const hostLower = new URL(startUrl).hostname.toLowerCase();
+  const crawlEntireSite = options?.crawlEntireSite !== false;
+  const maxPages = Math.min(50, Math.max(1, options?.maxCrawlPages ?? DEFAULT_CRAWL_MAX_PAGES));
+  const delay = Math.max(0, options?.crawlDelayMs ?? DEFAULT_CRAWL_DELAY_MS);
+
+  let googlePlace: GooglePlaceEnrichment | undefined;
+  const name = (options?.companyName || "").trim();
+  const wantPlace =
+    (options?.includeGooglePlace !== false && name && (process.env.GOOGLE_PLACES_API_KEY || "").trim()) || options?.includeGooglePlace === true;
+  if (wantPlace && name) {
+    const gp = await tryGooglePlaceEnrichment(name, options?.locationHint);
+    if (gp) googlePlace = gp;
+  }
+
+  const allFb: string[] = [];
+  const seenFb = new Set<string>();
+  const addFbFromHtml = (html: string) => {
+    for (const f of extractFacebookPageUrlsFromHtml(html, 25)) {
+      const k = normalizeFacebookWebUrlForDedup(f) || f;
+      if (seenFb.has(k)) continue;
+      seenFb.add(k);
+      allFb.push(f);
+    }
+  };
+
+  let crawled = 0;
+  if (!crawlEntireSite) {
+    const html = await fetchPublicHtmlString(startUrl);
+    if (html) {
+      crawled = 1;
+      addFbFromHtml(html);
+    } else {
+      return {
+        foundLinks: [],
+        candidates: [],
+        message: "Could not load the website homepage to scan for links.",
+        crawledPageCount: 0,
+        crawlEntireSite: false,
+        googlePlace,
+      };
+    }
+  } else {
+    const queue: string[] = [startUrl];
+    const visitKey = new Set<string>();
+    const started = Date.now();
+    const maxWallMs = 90_000;
+    while (queue.length > 0 && crawled < maxPages && Date.now() - started < maxWallMs) {
+      const raw = queue.shift()!;
+      const k = normalizeUrlKeyForCrawl(raw);
+      if (visitKey.has(k)) continue;
+      visitKey.add(k);
+      const check = assertPublicHttpUrl(raw);
+      if (!check.ok) continue;
+      const u = new URL(check.href);
+      if (u.hostname.toLowerCase() !== hostLower) continue;
+      if (crawled > 0) await sleep(delay);
+      const html = await fetchPublicHtmlString(check.href);
+      if (!html) continue;
+      crawled++;
+      addFbFromHtml(html);
+      if (crawled < maxPages) {
+        const more = extractSameHostLinksFromHtml(html, check.href, hostLower, 120);
+        for (const x of more) {
+          if (queue.length > 200) break;
+          const nk = normalizeUrlKeyForCrawl(x);
+          if (!visitKey.has(nk)) queue.push(x);
+        }
+      }
+    }
+  }
+
+  /** One extra public page: Places “official” website if different host (single fetch, not full crawl). */
+  if (googlePlace?.websiteUri) {
+    const w = googlePlace.websiteUri;
+    const pubW = assertPublicHttpUrl(w);
+    if (pubW.ok) {
+      const wHost = new URL(pubW.href).hostname.toLowerCase();
+      if (wHost !== hostLower) {
+        await sleep(delay);
+        const h2 = await fetchPublicHtmlString(pubW.href);
+        if (h2) {
+          addFbFromHtml(h2);
+        }
+      } else {
+        const h2 = await fetchPublicHtmlString(pubW.href);
+        if (h2) addFbFromHtml(h2);
+      }
+    }
+  }
+
+  if (allFb.length === 0) {
     return {
       foundLinks: [],
       candidates: [],
       message:
-        "No Facebook Page links found on that homepage (footer, header, or meta tags). Add a public facebook.com/… link on the page, or paste a Page link manually.",
+        "No Facebook Page links found in the scanned page(s) (we follow same-site links up to a limit). " +
+        "Add a public facebook.com/… link on the site, set GOOGLE_PLACES_API_KEY and company + location to try Google’s official website, or paste a Page link.",
+      crawledPageCount: crawled,
+      crawlEntireSite,
+      googlePlace,
     };
   }
   const candidates: FacebookPageFromWebsiteRow[] = [];
-  for (const pageUrl of foundLinks) {
-    if (candidates.length >= 3) break;
+  for (const pageUrl of allFb) {
+    if (candidates.length >= 5) break;
     try {
       const ex = await resolveCompetitorFacebookPageInputEx(pageUrl);
       if (ex) {
@@ -517,13 +830,22 @@ export async function discoverFacebookPageFromCompetitorWebsite(website: string)
   }
   if (candidates.length === 0) {
     return {
-      foundLinks,
+      foundLinks: allFb,
       candidates: [],
       message:
-        "Found Facebook link(s) on the page, but the server could not turn them into a Page id. Check META_APP_ID / token and app mode, or paste the Page id or Ad Library “View all” URL.",
+        "Found Facebook link(s) in the crawl, but the server could not turn them into a Page id. Check META_APP_ID / token and app mode, or paste a Page id or Ad Library “View all” URL.",
+      crawledPageCount: crawled,
+      crawlEntireSite,
+      googlePlace,
     };
   }
-  return { foundLinks, candidates };
+  return {
+    foundLinks: allFb,
+    candidates,
+    crawledPageCount: crawled,
+    crawlEntireSite,
+    googlePlace,
+  };
 }
 
 export type PublicUrlResult =
@@ -803,7 +1125,7 @@ export async function fetchAndStoreMetaAdLibrary(
 ): Promise<{ ok: true; count: number; error?: string; debug?: string } | { ok: false; error: string; debug?: string }> {
   const token = metaAdLibraryToken();
   if (!token) {
-    return { ok: true, count: 0, error: "Meta Ad Library: no META_AD_LIBRARY_TOKEN or META_APP_ID+META_APP_SECRET" };
+    return { ok: true, count: 0, error: "Meta Ad Library: set META_APP_ID+META_APP_SECRET (preferred) or META_AD_LIBRARY_TOKEN" };
   }
   const numericId = pageId.replace(/\D/g, "");
   if (!numericId || numericId.length < 3) {
