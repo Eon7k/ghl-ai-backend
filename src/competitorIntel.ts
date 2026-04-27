@@ -368,6 +368,38 @@ export async function resolveCompetitorFacebookPageInputEx(
 }
 
 /**
+ * If `GET /{id}` as Archived Ad fails, try the same id as a Facebook Page (common mistake: pasting a Page id in the "ad id" field).
+ * User nodes return an error for `fan_count`, so a successful `id,name,fan_count` read strongly indicates a Page.
+ */
+async function tryResolveGraphNumericIdAsPage(
+  numericId: string,
+  token: string
+): Promise<{ pageId: string; pageName: string | null } | null> {
+  const sp = new URLSearchParams();
+  sp.set("access_token", token);
+  sp.set("fields", "id,name,fan_count");
+  const url = `https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(numericId)}?${sp.toString()}`;
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 18_000);
+  try {
+    const res = await fetch(url, { signal: ac.signal });
+    const d = (await res.json().catch(() => ({}))) as {
+      id?: string;
+      name?: string;
+      fan_count?: number;
+      error?: { message?: string };
+    };
+    if (d.error || !res.ok) return null;
+    if (d.id !== numericId || typeof d.fan_count !== "number") return null;
+    return { pageId: d.id, pageName: typeof d.name === "string" && d.name.trim() ? d.name.trim() : null };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+/**
  * Graph “Archived ad” node: the Ad Library `id` from `ads_archive` is the same object id.
  * `GET /{id}?fields=page_id,page_name` — then use `page_id` in `search_page_ids` to list that Page’s ads.
  * @see https://developers.facebook.com/docs/graph-api/reference/archived-ad/
@@ -376,6 +408,8 @@ export async function resolveMetaAdLibraryIdToPageId(raw: string): Promise<{
   pageId: string;
   pageName: string | null;
   adLibraryId: string;
+  /** Pasted value was a Facebook Page id, not a Library ad `id` — we still return `pageId` for the watch. */
+  resolvedVia?: "archived_ad" | "page_id";
 }> {
   const token = metaAdLibraryToken();
   if (!token) {
@@ -406,12 +440,31 @@ export async function resolveMetaAdLibraryIdToPageId(raw: string): Promise<{
     error?: { message?: string; error_user_msg?: string; error_user_title?: string; code?: number };
   };
   if (data.error) {
+    const pageGuess = await tryResolveGraphNumericIdAsPage(adLibraryId, token);
+    if (pageGuess) {
+      return {
+        pageId: pageGuess.pageId,
+        pageName: pageGuess.pageName,
+        adLibraryId,
+        resolvedVia: "page_id",
+      };
+    }
     const parts: string[] = [];
     if (data.error.error_user_msg) parts.push(data.error.error_user_msg);
     else if (data.error.message) parts.push(data.error.message);
     else parts.push("Graph could not read this ad id.");
+    const m = data.error.message || "";
+    const isPerm =
+      /missing permission|does not support|unsupported get|does not exist/i.test(m) || /#10\b|code.?10|2332002/i.test(m);
     if (res.status === 400 || res.status === 404) {
-      parts.push("Use an ad id from Meta Ad Library / your ads_archive results (field id).");
+      parts.push(
+        "Use the numeric id from an ad row in ads_archive or a competitor scan (field id), not a Facebook Page id. For a Page, use “Resolve Facebook Page” or an Ad Library “view_all_page_id=…” link."
+      );
+    }
+    if (isPerm) {
+      parts.push(
+        "If the id is correct, your token may not allow GET /{id} for Archived Ad; check Ad Library API access, or set META_AD_LIBRARY_TOKEN. If you only need the advertiser Page, use “Resolve Facebook Page” instead of an ad id."
+      );
     }
     throw new Error(parts.join(" "));
   }
@@ -423,7 +476,7 @@ export async function resolveMetaAdLibraryIdToPageId(raw: string): Promise<{
     );
   }
   const pageName = typeof data.page_name === "string" && data.page_name.trim() ? data.page_name.trim() : null;
-  return { pageId, pageName, adLibraryId };
+  return { pageId, pageName, adLibraryId, resolvedVia: "archived_ad" };
 }
 
 /** Dedupe and compare facebook URLs from the same page (strip query, trailing slash). */
