@@ -2,8 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { GhlCsvRow } from "./ghlSocialPlanner";
 
 const KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
-/** Default to a capable text model; override with ANTHROPIC_CONTENT_STRATEGY_MODEL. */
-const DEFAULT_MODEL = "claude-3-5-sonnet-20241022";
+/** Default matches main app Anthropic usage (see index.ts); override with ANTHROPIC_CONTENT_STRATEGY_MODEL. */
+const DEFAULT_MODEL = "claude-haiku-4-5";
 
 export type ContentStrategyMode = "full" | "text_plus_prompts" | "ideas_only";
 export type ContentStrategyHorizon = "single" | "week" | "month";
