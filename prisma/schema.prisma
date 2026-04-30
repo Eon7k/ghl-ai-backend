@@ -51,6 +51,8 @@ model User {
   dfyEngagementsAsClient   DfyEngagement[]     @relation("DfyClient")
   competitorWatchesAgency  CompetitorWatch[]   @relation("CompetitorWatchAgency")
   competitorWatchesClient  CompetitorWatch[]   @relation("CompetitorWatchClient")
+  /** Optional Go High Level Social Planner (CSV upload API): one credential row per portal user (effective client when agency switches). */
+  ghlSocialPlannerCredential GhlSocialPlannerCredential?
 }
 
 // ----- MODULE 1: White-label branding (agency user = owner) -----
@@ -329,6 +331,20 @@ model AgencyClient {
   clientUser     User     @relation("AgencyManaged", fields: [clientUserId], references: [id], onDelete: Cascade)
   createdAt      DateTime @default(now())
   @@unique([agencyUserId, clientUserId])
+}
+
+/** Go High Level LeadConnector Social Planner CSV API — Private Integration Token + Location id per portal account. */
+model GhlSocialPlannerCredential {
+  id                      String   @id @default(cuid())
+  userId                  String   @unique
+  user                    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /** HighLevel Sub-account Location id (Settings → Business Profile → Company ID). */
+  locationId              String   @db.VarChar(80)
+  /** Private Integration Token from Settings → Integrations → API → Private Integration (scopes for Social Planner). */
+  privateIntegrationToken String   @db.Text
+  label                   String?  @db.VarChar(200)
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
 }
 
 model ConnectedAccount {

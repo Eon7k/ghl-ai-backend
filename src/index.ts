@@ -9,6 +9,7 @@ import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import {
   generateContentStrategyPlan,
+  generateContentStrategyGhlPosts,
   type ContentStrategyHorizon,
   type ContentStrategyMode,
 } from "./contentStrategyClaude";
@@ -32,6 +33,11 @@ import {
 import { Prisma } from "@prisma/client";
 import { attachBrandingHost, createExpansionRouter, EXPANSION_UPLOADS_ROOT } from "./expansionApi";
 import { enabledProductKeysFromDb, normalizeAdminProductKeys } from "./productEntitlements";
+import {
+  buildGhlBasicCsv,
+  extractCsvImportIdFromUploadBody,
+  uploadGhlSocialPlannerCsv,
+} from "./ghlSocialPlanner";
 
 // Only load .env file when NOT in production (so Render always uses its own env vars)
 if (process.env.NODE_ENV !== "production") {
@@ -604,6 +610,99 @@ app.post("/content-strategy/generate", requireAuth, async (req: AuthRequest, res
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Content strategy failed";
     console.error("[content-strategy/generate]", msg);
+    return res.status(502).json({ error: msg });
+  }
+});
+
+/** Structured rows + CSV string for Go High Level Social Planner (Basic CSV template). */
+app.post("/content-strategy/generate-for-ghl", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const body = req.body as {
+    userPrompt?: string;
+    mode?: string;
+    horizon?: string;
+  };
+  const mode: ContentStrategyMode =
+    body.mode === "text_plus_prompts" || body.mode === "ideas_only" || body.mode === "full" ? body.mode : "full";
+  const horizon: ContentStrategyHorizon =
+    body.horizon === "week" || body.horizon === "month" || body.horizon === "single" ? body.horizon : "week";
+  const userPrompt = typeof body.userPrompt === "string" ? body.userPrompt : "";
+  const row = await prisma.user.findUnique({
+    where: { id: uid },
+    select: { businessModelProfile: true },
+  });
+  try {
+    const { posts } = await generateContentStrategyGhlPosts({
+      businessModelProfile: row?.businessModelProfile ?? null,
+      userPrompt,
+      mode,
+      horizon,
+    });
+    const csv = buildGhlBasicCsv(posts);
+    res.json({ posts, csv });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Content strategy CSV generation failed";
+    console.error("[content-strategy/generate-for-ghl]", msg);
+    return res.status(502).json({ error: msg });
+  }
+});
+
+/** Saved Go High Level Private Integration + Location id for Social Planner CSV upload (per portal account). */
+app.get("/integrations/ghl/social-planner", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const row = await prisma.ghlSocialPlannerCredential.findUnique({ where: { userId: uid } });
+  if (!row) {
+    return res.json({ configured: false });
+  }
+  const tok = row.privateIntegrationToken;
+  const tokenLast4 = tok.length >= 4 ? tok.slice(-4) : "****";
+  res.json({
+    configured: true,
+    locationId: row.locationId,
+    label: row.label ?? null,
+    tokenLast4,
+  });
+});
+
+/** Upload CSV to LeadConnector Social Planner using saved credentials for this account. */
+app.post("/integrations/ghl/social-planner/push", requireAuth, async (req: AuthRequest, res: Response) => {
+  const uid = req.effectiveUserId ?? req.user!.id;
+  const body = req.body as { csv?: unknown };
+  const csv = typeof body.csv === "string" ? body.csv : "";
+  if (!csv.trim()) {
+    return res.status(400).json({ error: "csv string is required (from Generate for Go High Level or paste)." });
+  }
+  if (csv.length > 2_500_000) {
+    return res.status(400).json({ error: "CSV is too large (max ~2.5MB)." });
+  }
+  const cred = await prisma.ghlSocialPlannerCredential.findUnique({ where: { userId: uid } });
+  if (!cred) {
+    return res.status(400).json({
+      error:
+        "No Go High Level credentials for this workspace yet. Your administrator must add Location id + Private Integration token in Admin → Go High Level.",
+    });
+  }
+  try {
+    const upload = await uploadGhlSocialPlannerCsv({
+      locationId: cred.locationId,
+      privateIntegrationToken: cred.privateIntegrationToken,
+      csvUtf8: csv,
+      filename: "ghl-ai-content-plan.csv",
+    });
+    const csvImportId = extractCsvImportIdFromUploadBody(upload.body);
+    res.json({
+      ok: true,
+      status: upload.status,
+      csvImportId,
+      response: upload.body,
+      message:
+        csvImportId != null
+          ? "CSV uploaded to HighLevel. Open Social Planner → CSV import to pick accounts and finalize scheduling if prompted."
+          : "CSV uploaded to HighLevel. Open Marketing → Social Planner → recent CSV import to assign channels and finalize.",
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Push to Go High Level failed";
+    console.error("[integrations/ghl/social-planner/push]", msg);
     return res.status(502).json({ error: msg });
   }
 });
@@ -3241,6 +3340,85 @@ app.patch("/admin/users/:id", requireAuth, requireAdmin, async (req: AuthRequest
     ...(hasAccountType ? { accountType } : {}),
     ...(hasProducts ? { enabledProductKeys: normalizedProducts } : {}),
   });
+});
+
+/** Admin-only: read masked Go High Level Social Planner credentials for any portal user (client account row). */
+app.get("/admin/users/:targetUserId/ghl-social-planner", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  const targetUserId = req.params.targetUserId?.trim();
+  if (!targetUserId) return res.status(400).json({ error: "Missing user id" });
+  const portalUser = await prisma.user.findUnique({ where: { id: targetUserId }, select: { id: true, email: true } });
+  if (!portalUser) return res.status(404).json({ error: "User not found" });
+  const row = await prisma.ghlSocialPlannerCredential.findUnique({ where: { userId: targetUserId } });
+  if (!row) {
+    return res.json({
+      configured: false,
+      userId: portalUser.id,
+      email: portalUser.email,
+    });
+  }
+  const tok = row.privateIntegrationToken;
+  const tokenLast4 = tok.length >= 4 ? tok.slice(-4) : "****";
+  res.json({
+    configured: true,
+    userId: portalUser.id,
+    email: portalUser.email,
+    locationId: row.locationId,
+    label: row.label ?? null,
+    tokenLast4,
+  });
+});
+
+/** Admin-only: set or update HighLevel Location + Private Integration for a portal user (sub-account). */
+app.put("/admin/users/:targetUserId/ghl-social-planner", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  const targetUserId = req.params.targetUserId?.trim();
+  if (!targetUserId) return res.status(400).json({ error: "Missing user id" });
+  const portalUser = await prisma.user.findUnique({ where: { id: targetUserId } });
+  if (!portalUser) return res.status(404).json({ error: "User not found" });
+  const body = req.body as {
+    locationId?: unknown;
+    privateIntegrationToken?: unknown;
+    label?: unknown;
+  };
+  const locationId = typeof body.locationId === "string" ? body.locationId.trim() : "";
+  if (!locationId || locationId.length > 80) {
+    return res.status(400).json({ error: "locationId is required (HighLevel Sub-account Location id)." });
+  }
+  const tokenIn =
+    typeof body.privateIntegrationToken === "string" ? body.privateIntegrationToken.trim() : "";
+  const label =
+    typeof body.label === "string" && body.label.trim() ? body.label.trim().slice(0, 200) : null;
+
+  const existing = await prisma.ghlSocialPlannerCredential.findUnique({ where: { userId: targetUserId } });
+  const token = tokenIn.length >= 10 ? tokenIn : existing?.privateIntegrationToken;
+  if (!token || token.length < 10) {
+    return res.status(400).json({
+      error:
+        "privateIntegrationToken is required on first save, or omit to keep the existing token when updating location only.",
+    });
+  }
+
+  await prisma.ghlSocialPlannerCredential.upsert({
+    where: { userId: targetUserId },
+    create: {
+      userId: targetUserId,
+      locationId,
+      privateIntegrationToken: token,
+      label,
+    },
+    update: {
+      locationId,
+      privateIntegrationToken: token,
+      label,
+    },
+  });
+  res.json({ ok: true });
+});
+
+app.delete("/admin/users/:targetUserId/ghl-social-planner", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
+  const targetUserId = req.params.targetUserId?.trim();
+  if (!targetUserId) return res.status(400).json({ error: "Missing user id" });
+  await prisma.ghlSocialPlannerCredential.deleteMany({ where: { userId: targetUserId } });
+  res.json({ ok: true });
 });
 
 app.get("/admin/agencies/:userId/clients", requireAuth, requireAdmin, async (req: AuthRequest, res: Response) => {
