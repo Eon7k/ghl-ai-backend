@@ -6,7 +6,7 @@
 import OpenAI from "openai";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
-import { getHarvestLearningPromptAddition } from "./harvestRankingLearning";
+import { getHarvestLearningPromptAddition, recordHarvestCollectionLearning } from "./harvestRankingLearning";
 
 const GRAPH_VERSION = (process.env.META_GRAPH_API_VERSION || "v25.0").replace(/^v?/, "v");
 const MAX_HTML_BYTES = 1_500_000;
@@ -2894,6 +2894,22 @@ export async function executeMetaHarvestRun(runId: string): Promise<{ adsStored:
         diagnostics: diagnostics as unknown as Prisma.InputJsonValue,
       },
     });
+
+    if (stored > 0 && rows.length > 0) {
+      const samples = rows.slice(0, 140).map((r) => ({
+        headline: r.headline ?? null,
+        bodyText: r.bodyText ?? null,
+        pageName: r.pageName ?? null,
+      }));
+      void recordHarvestCollectionLearning({
+        agencyId: run.agencyId,
+        clientId: run.clientId,
+        keywords: kwArr,
+        intentPrompt: run.intentPrompt,
+        adsStored: stored,
+        samples,
+      }).catch(() => {});
+    }
 
     return { adsStored: stored, diagnostics };
   } catch (e) {

@@ -27,6 +27,7 @@ import {
   parseHarvestKeywordStrings,
   recordHarvestSelectionsFromAds,
   suggestRankingKeywordsFromIntent,
+  suggestCollectionKeywordsFromIntent,
 } from "./harvestRankingLearning";
 
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
@@ -1451,15 +1452,23 @@ export function createExpansionRouter(): Router {
       if (keywords.length === 0) return apiErr(res, 400, "VALIDATION", "keywords must be a non-empty array of strings (each 3+ characters)");
       if (keywords.length > 12) return apiErr(res, 400, "VALIDATION", "Maximum 12 keywords per harvest run");
       const label = typeof b.label === "string" ? b.label.trim().slice(0, 200) : null;
+      const intentPrompt =
+        typeof b.intentPrompt === "string" && b.intentPrompt.trim().length >= 8
+          ? b.intentPrompt.trim().slice(0, 4000)
+          : null;
       const run = await prisma.metaAdHarvestRun.create({
         data: {
           agencyId: scope.agencyId,
           clientId: scope.clientId,
           keywords: keywords as unknown as Prisma.InputJsonValue,
           label: label || null,
+          intentPrompt,
           status: "pending",
         },
       });
+      if (intentPrompt && intentPrompt.length >= 12) {
+        void appendHarvestIntentSnippet(scope.agencyId, scope.clientId, intentPrompt).catch(() => {});
+      }
       await executeMetaHarvestRun(run.id);
       const row = await prisma.metaAdHarvestRun.findFirst({
         where: { id: run.id, agencyId: scope.agencyId, clientId: scope.clientId },
@@ -1469,6 +1478,34 @@ export function createExpansionRouter(): Router {
     } catch (e) {
       console.error("[meta-harvest-runs POST]", e);
       return apiErr(res, 500, "SERVER_ERROR", e instanceof Error ? e.message : "Could not run keyword harvest");
+    }
+  });
+
+  r.post("/agency/competitor/meta-harvest-suggest-collection-keywords", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const intentPrompt = typeof req.body?.intentPrompt === "string" ? req.body.intentPrompt.trim() : "";
+      if (intentPrompt.length < 16) {
+        return apiErr(res, 400, "VALIDATION", "Describe what ads you want in at least a sentence (~16+ characters).");
+      }
+      const { keywords, rationale } = await suggestCollectionKeywordsFromIntent({
+        agencyId: scope.agencyId,
+        clientId: scope.clientId,
+        intentPrompt,
+      });
+      if (!keywords.length) {
+        return apiErr(
+          res,
+          503,
+          "UNAVAILABLE",
+          "Could not generate keywords — confirm OPENAI_API_KEY is set on the API server."
+        );
+      }
+      return res.json({ keywords, rationale });
+    } catch (e) {
+      console.error("[meta-harvest-suggest-collection-keywords]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not suggest collection keywords");
     }
   });
 

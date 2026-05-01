@@ -360,7 +360,7 @@ model HarvestAnalysisPreference {
   clientId    String
   agency      User     @relation("HarvestPreferenceAgency", fields: [agencyId], references: [id], onDelete: Cascade)
   client      User     @relation("HarvestPreferenceClient", fields: [clientId], references: [id], onDelete: Cascade)
-  /** JSON: pageScores Record<pageId, count>, tokenHints Record<token, count>, intentSnippets string[] */
+  /** JSON: pageScores, tokenHints, intentSnippets, harvestLexicon (from pulls), collectionRuns (recent keyword harvest logs for AI). */
   weightsJson Json     @default("{}")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
