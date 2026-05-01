@@ -1602,6 +1602,7 @@ export function createExpansionRouter(): Router {
       const preview = await resolveMetaSnapshotPreview(snapshotUrl);
       return res.json({
         thumbnailUrl: preview.thumbnailUrl,
+        thumbnailDataUrl: preview.thumbnailDataUrl,
         previewHtml: preview.previewHtml,
       });
     } catch (e) {

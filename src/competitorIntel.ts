@@ -1291,6 +1291,56 @@ function sanitizeMetaSnapshotHtmlForSrcdoc(html: string): string | null {
   return out.slice(0, 520_000);
 }
 
+function isPlausibleCreativeImageUrl(url: string): boolean {
+  const lower = url.toLowerCase();
+  if (/rsrc\.php|\/emoji|safe_image|pixel\.gif|\b1x1\b|\/tracking\b/i.test(lower)) return false;
+  return true;
+}
+
+function isAllowedMetaImageFetchHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return h === "fbcdn.net" || h.endsWith(".fbcdn.net") || h === "facebook.com" || h.endsWith(".facebook.com");
+}
+
+/** Fetch Meta CDN creative bytes server-side; browsers often hotlink these URLs as blank/blocked frames. */
+async function fetchMetaCdnImageAsDataUrl(imageUrl: string): Promise<string | null> {
+  if (!isPlausibleCreativeImageUrl(imageUrl)) return null;
+  let u: URL;
+  try {
+    u = new URL(imageUrl);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:") return null;
+  if (!isAllowedMetaImageFetchHost(u.hostname)) return null;
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 14_000);
+  try {
+    const res = await fetch(imageUrl, {
+      redirect: "follow",
+      signal: ac.signal,
+      headers: {
+        Referer: "https://www.facebook.com/",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      },
+    });
+    if (!res.ok) return null;
+    const ctRaw = res.headers.get("content-type") || "";
+    const ct = ctRaw.split(";")[0]!.trim().toLowerCase();
+    if (!ct.startsWith("image/") || ct.includes("svg")) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length < 200 || buf.length > 480_000) return null;
+    return `data:${ct};base64,${buf.toString("base64")}`;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchMetaSnapshotHtmlDocument(snapshotUrl: string): Promise<string | null> {
   let u: URL;
   try {
@@ -1325,25 +1375,35 @@ async function fetchMetaSnapshotHtmlDocument(snapshotUrl: string): Promise<strin
 
 export type MetaSnapshotPreviewResult = {
   thumbnailUrl: string | null;
-  /** Stripped snapshot HTML for iframe srcdoc when no image URL was found (no scripts). */
+  /** Inline image data when the CDN URL was fetched successfully server-side (preferred for `<img>`). */
+  thumbnailDataUrl: string | null;
+  /** Stripped snapshot HTML for iframe srcdoc fallback when inline image is unavailable or blocked client-side. */
   previewHtml: string | null;
 };
 
 /** Single fetch: derive thumbnail URL and/or sanitized embeddable snapshot HTML. */
 export async function resolveMetaSnapshotPreview(snapshotUrl: string): Promise<MetaSnapshotPreviewResult> {
   const html = await fetchMetaSnapshotHtmlDocument(snapshotUrl);
-  if (!html) return { thumbnailUrl: null, previewHtml: null };
+  if (!html) return { thumbnailUrl: null, thumbnailDataUrl: null, previewHtml: null };
 
   const candidates = extractCreativePreviewUrlsFromHtml(html);
+  const plausible = candidates.filter(isPlausibleCreativeImageUrl);
   const thumbnailUrl =
-    candidates.find((x) => /\.fbcdn\.net\//i.test(x)) ??
-    candidates.find((x) => /\.(jpg|jpeg|png|webp)(\?|$)/i.test(x)) ??
-    candidates[0] ??
+    plausible.find((x) => /\.fbcdn\.net\//i.test(x)) ??
+    plausible.find((x) => /\.(jpg|jpeg|png|webp)(\?|$)/i.test(x)) ??
+    plausible[0] ??
     null;
 
-  const previewHtml = thumbnailUrl ? null : sanitizeMetaSnapshotHtmlForSrcdoc(html);
+  const sanitizedFallback = sanitizeMetaSnapshotHtmlForSrcdoc(html);
 
-  return { thumbnailUrl, previewHtml };
+  let thumbnailDataUrl: string | null = null;
+  if (thumbnailUrl) {
+    thumbnailDataUrl = await fetchMetaCdnImageAsDataUrl(thumbnailUrl);
+  }
+
+  const previewHtml = thumbnailDataUrl ? null : sanitizedFallback;
+
+  return { thumbnailUrl, thumbnailDataUrl, previewHtml };
 }
 
 /** @deprecated Prefer resolveMetaSnapshotPreview — kept for callers that only need og:image-style URL. */
