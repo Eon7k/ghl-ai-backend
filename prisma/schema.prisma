@@ -355,7 +355,8 @@ model MetaAdHarvestAd {
   adLibraryId    String           @db.VarChar(200)
   headline       String?          @db.Text
   bodyText       String?          @db.Text
-  mediaUrl       String?          @db.VarChar(500)
+  /** Meta `ad_snapshot_url` (often 1k+ chars); do not truncate. */
+  mediaUrl       String?          @db.Text
   rawData        Json?
   createdAt      DateTime         @default(now())
 

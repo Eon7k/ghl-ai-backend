@@ -1081,6 +1081,8 @@ type MetaAdRow = {
   ad_creation_time?: string;
   page_name?: string;
   ad_snapshot_url?: string;
+  /** ISO 639-1 language codes in the creative (when returned by Graph). */
+  languages?: string[];
   ad_creative_bodies?: { text?: string }[] | string[];
   ad_creative_link_titles?: { text?: string }[] | string[];
 };
@@ -1179,9 +1181,31 @@ const ADS_ARCHIVE_FIELDS = [
   "ad_creation_time",
   "page_name",
   "ad_snapshot_url",
+  "languages",
   "ad_creative_bodies",
   "ad_creative_link_titles",
 ].join(",");
+
+const MAX_HARVEST_SNAPSHOT_URL_LEN = 8_000;
+
+/**
+ * Optional `ads_archive` language filter (ISO 639-1), e.g. `META_AD_LIBRARY_CONTENT_LANGUAGES=en`
+ * or `en,fr`. Empty / unset = Meta returns ads in any language (common source of Spanish in US sweeps).
+ */
+function metaAdLibraryContentLanguages(): string[] | undefined {
+  const raw = (process.env.META_AD_LIBRARY_CONTENT_LANGUAGES || "").trim();
+  if (!raw) return undefined;
+  const codes = raw
+    .split(/[,;\s]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => /^[a-z]{2}$/.test(s) || s === "cmn" || s === "yue");
+  return codes.length ? [...new Set(codes)] : undefined;
+}
+
+function appendAdsArchiveLanguageFilter(sp: URLSearchParams): void {
+  const langs = metaAdLibraryContentLanguages();
+  if (langs?.length) sp.set("languages", JSON.stringify(langs));
+}
 
 type AdsArchiveJson = {
   data?: MetaAdRow[];
@@ -1242,6 +1266,7 @@ async function getAdsArchiveOnce(
   sp.set("ad_type", "ALL");
   sp.set("fields", ADS_ARCHIVE_FIELDS);
   sp.set("limit", "30");
+  appendAdsArchiveLanguageFilter(sp);
   const url = `https://graph.facebook.com/${GRAPH_VERSION}/ads_archive?${sp.toString()}`;
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 25_000);
@@ -1273,6 +1298,7 @@ async function getAdsArchiveBySearchTermOnce(
   sp.set("ad_type", "ALL");
   sp.set("fields", ADS_ARCHIVE_FIELDS);
   sp.set("limit", "50");
+  appendAdsArchiveLanguageFilter(sp);
   const url = `https://graph.facebook.com/${GRAPH_VERSION}/ads_archive?${sp.toString()}`;
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 25_000);
@@ -2284,7 +2310,7 @@ function harvestPayloadFromArchiveAd(ad: MetaAdRow): {
     adLibraryId: ad.id,
     headline,
     bodyText: body,
-    mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : null,
+    mediaUrl: mediaUrl ? mediaUrl.slice(0, MAX_HARVEST_SNAPSHOT_URL_LEN) : null,
     rawData: ad as unknown as Prisma.InputJsonValue,
   };
 }
@@ -2347,6 +2373,10 @@ export async function executeMetaHarvestRun(runId: string): Promise<{ adsStored:
       { countriesFormat: "json", countries: tiers.wide, adActiveStatus: "ALL" },
       { countriesFormat: "metaCurl", countries: tiers.wide.slice(0, 28), adActiveStatus: "ALL" },
     ];
+    const langFilter = metaAdLibraryContentLanguages();
+    if (langFilter?.length) {
+      diagnostics.push(`Ad Library language filter: ${langFilter.join(", ")} (set META_AD_LIBRARY_CONTENT_LANGUAGES to change, or clear for all languages).`);
+    }
 
     const merged = new Map<string, MetaAdRow>();
     let lastHttpError: string | null = null;

@@ -28,6 +28,16 @@ export const EXPANSION_UPLOADS_ROOT = path.resolve(
 const UPLOADS_ROOT = EXPANSION_UPLOADS_ROOT;
 const BRANDING_DIR = path.join(UPLOADS_ROOT, "branding");
 
+function languagesFromHarvestAdRaw(raw: unknown): string[] | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const langs = (raw as { languages?: unknown }).languages;
+  if (!Array.isArray(langs)) return undefined;
+  const out = langs
+    .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+    .map((x) => x.trim().toLowerCase());
+  return out.length ? [...new Set(out)] : undefined;
+}
+
 function ensureUploadDirs(): void {
   for (const d of [UPLOADS_ROOT, BRANDING_DIR]) {
     if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
@@ -1448,7 +1458,15 @@ export function createExpansionRouter(): Router {
         },
       });
       if (!run) return apiErr(res, 404, "NOT_FOUND", "Harvest run not found");
-      return res.json({ run });
+      return res.json({
+        run: {
+          ...run,
+          ads: run.ads.map(({ rawData, ...rest }) => ({
+            ...rest,
+            languages: languagesFromHarvestAdRaw(rawData),
+          })),
+        },
+      });
     } catch (e) {
       console.error("[meta-harvest-runs/:id]", e);
       return apiErr(res, 500, "SERVER_ERROR", "Could not load harvest run");
