@@ -18,16 +18,13 @@ function openaiClient(): OpenAI | null {
 }
 
 /**
- * Ad Library / Graph calls: prefer **app access token** (`app_id|app_secret`) when both are set — same “general” access as
- * before, no per-user token required. Falls back to `META_AD_LIBRARY_TOKEN` only if app id+secret are not both configured
- * (or for local testing with a user token only).
+ * Ad Library / Graph calls: **app access token only** (`META_APP_ID|META_APP_SECRET`). No separate library/user token —
+ * avoids expiring pasted tokens and matches Meta’s app-based Ad Library API flow.
  */
 function metaAdLibraryToken(): string | null {
   const id = (process.env.META_APP_ID || "").trim();
   const secret = (process.env.META_APP_SECRET || "").trim();
   if (id && secret) return `${id}|${secret}`;
-  const direct = (process.env.META_AD_LIBRARY_TOKEN || "").trim();
-  if (direct) return direct;
   return null;
 }
 
@@ -260,7 +257,7 @@ async function tryExtractPageIdFromPublicFacebookPageHtml(vanityHandle: string):
 async function graphResolvePageHandleToNumericId(raw: string, handle: string): Promise<string> {
   const token = metaAdLibraryToken();
   if (!token) {
-    throw new Error("Set META_APP_ID and META_APP_SECRET for Ad Library (or META_AD_LIBRARY_TOKEN if you have no app secret on this host).");
+    throw new Error("Set META_APP_ID and META_APP_SECRET on the API host for Ad Library (app access token APP_ID|APP_SECRET).");
   }
 
   const clean = handle.replace(/^@/, "").trim();
@@ -414,7 +411,7 @@ export async function resolveMetaAdLibraryIdToPageId(raw: string): Promise<{
   const token = metaAdLibraryToken();
   if (!token) {
     throw new Error(
-      "Set META_APP_ID and META_APP_SECRET (preferred) or META_AD_LIBRARY_TOKEN to look up an Ad Library ad by id."
+      "Set META_APP_ID and META_APP_SECRET on the API host to look up an Ad Library ad by id."
     );
   }
   const adLibraryId = raw.replace(/\D/g, "");
@@ -463,7 +460,7 @@ export async function resolveMetaAdLibraryIdToPageId(raw: string): Promise<{
     }
     if (isPerm) {
       parts.push(
-        "If the id is correct, your token may not allow GET /{id} for Archived Ad; check Ad Library API access, or set META_AD_LIBRARY_TOKEN. If you only need the advertiser Page, use “Resolve Facebook Page” instead of an ad id."
+        "If the id is correct, your app token may not allow GET /{id} for Archived Ad — complete Ad Library API access for this app in Meta. If you only need the advertiser Page, use “Resolve Facebook Page” instead of an ad id."
       );
     }
     throw new Error(parts.join(" "));
@@ -1074,6 +1071,8 @@ export async function fetchWebsiteSnapshot(
 
 type MetaAdRow = {
   id: string;
+  /** Advertiser Page id — needed when ads run under an agency/shell Page instead of the brand Page. */
+  page_id?: string;
   ad_creation_time?: string;
   page_name?: string;
   ad_snapshot_url?: string;
@@ -1093,6 +1092,7 @@ function pickCreativeText(
 
 const ADS_ARCHIVE_FIELDS = [
   "id",
+  "page_id",
   "ad_creation_time",
   "page_name",
   "ad_snapshot_url",
@@ -1172,13 +1172,155 @@ async function getAdsArchiveOnce(
   return { res, data };
 }
 
+/** Graph `ads_archive` with `search_terms` (no `search_page_ids`) — lists ads across Pages that match text. */
+async function getAdsArchiveBySearchTermOnce(
+  searchTerm: string,
+  shape: Pick<AdLibRequestShape, "countriesFormat" | "countries" | "adActiveStatus">
+): Promise<{ res: Response; data: AdsArchiveJson }> {
+  const token = metaAdLibraryToken()!;
+  const sp = new URLSearchParams();
+  sp.set("access_token", token);
+  sp.set("search_terms", searchTerm.trim());
+  if (shape.countriesFormat === "json") {
+    sp.set("ad_reached_countries", JSON.stringify(shape.countries));
+  } else {
+    sp.set("ad_reached_countries", adReachedCountriesToMetaCurlString(shape.countries, 32));
+  }
+  sp.set("ad_active_status", shape.adActiveStatus);
+  sp.set("ad_type", "ALL");
+  sp.set("fields", ADS_ARCHIVE_FIELDS);
+  sp.set("limit", "50");
+  const url = `https://graph.facebook.com/${GRAPH_VERSION}/ads_archive?${sp.toString()}`;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 25_000);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+  const data = (await res.json().catch(() => ({}))) as AdsArchiveJson;
+  return { res, data };
+}
+
+/**
+ * Keyword search against Meta Ad Library (same Graph endpoint as Page scans).
+ * Aggregates distinct advertiser Pages (`page_id`) so users can pick the Page that actually runs ads (often not the brand Page).
+ */
+export async function discoverMetaAdvertiserPagesFromAdLibrarySearch(searchTerm: string): Promise<{
+  candidates: { pageId: string; pageName: string | null; adsSeenInSample: number }[];
+  message?: string;
+}> {
+  const term = searchTerm.trim().slice(0, 200);
+  if (term.length < 2) {
+    throw new Error("searchTerm must be at least 2 characters.");
+  }
+  const token = metaAdLibraryToken();
+  if (!token) {
+    throw new Error(
+      "Set META_APP_ID and META_APP_SECRET on the API host for Ad Library."
+    );
+  }
+
+  const tiers = adReachedCountriesTiers();
+  const attempts: Pick<AdLibRequestShape, "countriesFormat" | "countries" | "adActiveStatus">[] = [
+    { countriesFormat: "json", countries: tiers.primary, adActiveStatus: "ACTIVE" },
+    { countriesFormat: "json", countries: tiers.wide, adActiveStatus: "ALL" },
+    { countriesFormat: "metaCurl", countries: tiers.wide.slice(0, 28), adActiveStatus: "ALL" },
+  ];
+
+  const seenAdIds = new Set<string>();
+  const pageMap = new Map<string, { pageName: string | null; count: number }>();
+  let lastHttpError: string | null = null;
+  let gotOkWithDataKey = false;
+
+  for (const shape of attempts) {
+    let one: { res: Response; data: AdsArchiveJson };
+    try {
+      one = await getAdsArchiveBySearchTermOnce(term, shape);
+    } catch (e) {
+      return {
+        candidates: [],
+        message: e instanceof Error ? e.message : "Ad Library keyword search failed.",
+      };
+    }
+    const { res, data } = one;
+    if (res.ok && data.data !== undefined) gotOkWithDataKey = true;
+
+    if (!res.ok && data.error) {
+      const err = data.error;
+      lastHttpError = `Meta Ad Library: ${formatAdsArchiveError(err)}`;
+      if (err.code === 10 && err.error_subcode === 2332002) {
+        return {
+          candidates: [],
+          message:
+            `${lastHttpError} Complete Meta’s Ad Library API access at https://www.facebook.com/ads/library/api — app tokens alone may not be enough until the app is authorized there.`,
+        };
+      }
+      const em = err.message || `HTTP ${res.status}`;
+      if (err.code === 190 || /invalid.*token|OAuthException|expired|session has been invalidated/i.test(em)) {
+        return { candidates: [], message: lastHttpError };
+      }
+      if (err.code === 4 || /rate limit|too many|temporarily|limit/i.test(em)) {
+        return { candidates: [], message: lastHttpError };
+      }
+      continue;
+    }
+
+    for (const ad of data.data || []) {
+      if (!ad.id || seenAdIds.has(ad.id)) continue;
+      seenAdIds.add(ad.id);
+      const rawPid = typeof ad.page_id === "string" ? ad.page_id.trim() : "";
+      const pid = /^\d{4,22}$/.test(rawPid) ? rawPid : "";
+      if (!pid) continue;
+      const pn = typeof ad.page_name === "string" && ad.page_name.trim() ? ad.page_name.trim() : null;
+      const prev = pageMap.get(pid);
+      if (prev) {
+        prev.count += 1;
+        if (!prev.pageName && pn) prev.pageName = pn;
+      } else {
+        pageMap.set(pid, { pageName: pn, count: 1 });
+      }
+    }
+
+    if (pageMap.size >= 12 || seenAdIds.size >= 150) break;
+  }
+
+  const candidates = [...pageMap.entries()]
+    .map(([pageId, v]) => ({
+      pageId,
+      pageName: v.pageName,
+      adsSeenInSample: v.count,
+    }))
+    .sort((a, b) => b.adsSeenInSample - a.adsSeenInSample)
+    .slice(0, 25);
+
+  let message: string | undefined;
+  if (candidates.length === 0) {
+    if (seenAdIds.size > 0) {
+      message =
+        "Meta returned ads for this keyword but none included page_id in the API payload. Try “Get Page id from ad id” on one Library ad instead.";
+    } else if (lastHttpError) {
+      message = lastHttpError;
+    } else if (!gotOkWithDataKey) {
+      message =
+        "Could not query Meta Ad Library by keyword (unexpected response). Check server logs and Meta token / Ad Library API access.";
+    } else {
+      message =
+        "No ads matched this keyword in your configured regions (META_AD_LIBRARY_COUNTRIES). Try a brand-specific phrase, widen regions, open Meta’s library by hand to confirm wording, or resolve Page id from one live ad.";
+    }
+  }
+
+  return { candidates, message };
+}
+
 export async function fetchAndStoreMetaAdLibrary(
   watchId: string,
   pageId: string
 ): Promise<{ ok: true; count: number; error?: string; debug?: string } | { ok: false; error: string; debug?: string }> {
   const token = metaAdLibraryToken();
   if (!token) {
-    return { ok: true, count: 0, error: "Meta Ad Library: set META_APP_ID+META_APP_SECRET (preferred) or META_AD_LIBRARY_TOKEN" };
+    return { ok: true, count: 0, error: "Meta Ad Library: set META_APP_ID and META_APP_SECRET on the API host" };
   }
   const numericId = pageId.replace(/\D/g, "");
   if (!numericId || numericId.length < 3) {
@@ -1313,7 +1455,7 @@ export async function fetchAndStoreMetaAdLibrary(
   }
 
   const hint =
-    "0 ads returned from the Graph `ads_archive` call for this Page after all request shapes. If the public Ad Library (website) still shows their ads, Meta may require a **user access token** (not only app_id|app_secret) and/or Ad Library API access in your app — see developers.facebook.com → Ad Library API. You can also set META_AD_LIBRARY_COUNTRIES to the regions you see in the ad’s “reached” filter (e.g. US,GB,DE) and re-check the **numeric** Page id matches the one in the public library URL.";
+    "0 ads returned from the Graph `ads_archive` call for this Page after all request shapes. Brands often run ads under a **different** Facebook Page (agency, reseller, or shell Page): use **Search advertisers by keyword** on the competitor watch, or open a live Library ad and **Get Page id from ad id**. Also verify META_AD_LIBRARY_COUNTRIES matches regions where ads run and the numeric Page id matches the **advertiser** row in Meta’s library. If ads appear under another Page id in the public library, confirm **Ad Library API** access for your Meta app (developers.facebook.com) and that META_APP_ID + META_APP_SECRET are set on the API host.";
   if (lastHttpError) {
     return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
   }

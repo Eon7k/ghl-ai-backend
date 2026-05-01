@@ -13,6 +13,7 @@ import {
   resolveCompetitorFacebookPageInput,
   resolveCompetitorFacebookPageInputEx,
   discoverFacebookPageFromCompetitorWebsite,
+  discoverMetaAdvertiserPagesFromAdLibrarySearch,
   resolveMetaAdLibraryIdToPageId,
 } from "./competitorIntel";
 
@@ -1074,6 +1075,34 @@ export function createExpansionRouter(): Router {
           500,
           "SERVER_ERROR",
           e instanceof Error ? e.message : "Could not scan the website for Facebook links."
+        );
+      }
+    }
+  );
+
+  /**
+   * Meta Ad Library keyword search → distinct advertiser Pages (`page_id`) ranked by how often they appear in the sample.
+   * Helps when the brand Page has no ads but a management/agency Page runs them.
+   */
+  r.post(
+    "/agency/competitor/discover-meta-pages-from-ad-library-search",
+    expansionRequireAuth,
+    expansionRequireProduct("competitors"),
+    async (req: ExpansionAuthRequest, res: Response) => {
+      try {
+        const b = (req.body || {}) as { searchTerm?: unknown };
+        const searchTerm = typeof b.searchTerm === "string" ? b.searchTerm.trim() : "";
+        if (!searchTerm) return apiErr(res, 400, "VALIDATION", "searchTerm is required");
+        if (searchTerm.length > 200) return apiErr(res, 400, "VALIDATION", "searchTerm is too long");
+        const r0 = await discoverMetaAdvertiserPagesFromAdLibrarySearch(searchTerm);
+        return res.json(r0);
+      } catch (e) {
+        console.error("[discover-meta-pages-from-ad-library-search]", e);
+        return apiErr(
+          res,
+          400,
+          "VALIDATION",
+          e instanceof Error ? e.message : "Could not search Meta Ad Library by keyword."
         );
       }
     }
