@@ -1475,23 +1475,27 @@ export function createExpansionRouter(): Router {
         take: 80,
       });
 
-      const brands = await Promise.all(
-        groups.map(async (g) => {
-          const sample = await prisma.metaAdHarvestAd.findFirst({
-            where: {
-              facebookPageId: g.facebookPageId,
-              run: { agencyId: scope.agencyId, clientId: scope.clientId },
-            },
-            orderBy: { createdAt: "desc" },
-            select: { pageName: true },
-          });
-          return {
-            facebookPageId: g.facebookPageId,
-            pageName: sample?.pageName ?? null,
-            adCount: g._count.id,
-          };
-        })
-      );
+      const pageIds = groups.map((g) => g.facebookPageId);
+      const sampleRows =
+        pageIds.length > 0
+          ? await prisma.metaAdHarvestAd.findMany({
+              where: {
+                facebookPageId: { in: pageIds },
+                run: { agencyId: scope.agencyId, clientId: scope.clientId },
+              },
+              orderBy: { createdAt: "desc" },
+              select: { facebookPageId: true, pageName: true },
+            })
+          : [];
+      const pageNameById = new Map<string, string | null>();
+      for (const row of sampleRows) {
+        if (!pageNameById.has(row.facebookPageId)) pageNameById.set(row.facebookPageId, row.pageName);
+      }
+      const brands = groups.map((g) => ({
+        facebookPageId: g.facebookPageId,
+        pageName: pageNameById.get(g.facebookPageId) ?? null,
+        adCount: g._count.id,
+      }));
 
       return res.json({ brands });
     } catch (e) {
