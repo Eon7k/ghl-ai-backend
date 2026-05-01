@@ -12,6 +12,83 @@ const GRAPH_VERSION = (process.env.META_GRAPH_API_VERSION || "v25.0").replace(/^
 const MAX_HTML_BYTES = 1_500_000;
 const FETCH_TIMEOUT_MS = 14_000;
 
+/** Postgres json/jsonb rejects some payloads Meta returns (e.g. lone surrogates, broken escapes when re-encoded). */
+const MAX_META_RAW_JSON_CHARS = 1_200_000;
+const MAX_META_STRING_FIELD_CHARS = 120_000;
+
+function cleanMetaJsonString(val: string): string {
+  let s = "";
+  for (let i = 0; i < val.length; i++) {
+    const code = val.charCodeAt(i);
+    if (code < 32 && code !== 9 && code !== 10 && code !== 13) continue;
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = i + 1 < val.length ? val.charCodeAt(i + 1) : 0;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        s += val[i] + val[i + 1];
+        i++;
+        continue;
+      }
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) continue;
+    s += val[i];
+  }
+  return s.length > MAX_META_STRING_FIELD_CHARS ? s.slice(0, MAX_META_STRING_FIELD_CHARS) : s;
+}
+
+function deepCleanMetaValueForJson(input: unknown): unknown {
+  if (input === null) return null;
+  if (input === undefined) return undefined;
+  if (typeof input === "bigint") return input.toString();
+  if (typeof input === "number") return Number.isFinite(input) ? input : null;
+  if (typeof input === "boolean") return input;
+  if (typeof input === "string") return cleanMetaJsonString(input);
+  if (typeof input === "function" || typeof input === "symbol") return undefined;
+  if (input instanceof Date) return input.toISOString();
+  if (Array.isArray(input)) {
+    const arr = input.map(deepCleanMetaValueForJson).filter((x) => x !== undefined);
+    return arr;
+  }
+  if (typeof input === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+      const key = k.slice(0, 400);
+      if (!key) continue;
+      const cv = deepCleanMetaValueForJson(v);
+      if (cv === undefined) continue;
+      out[key] = cv;
+    }
+    return out;
+  }
+  return null;
+}
+
+/** Safe for Prisma Json columns / Postgres jsonb (strict UTF-8 and escape rules). */
+export function sanitizeMetaGraphPayloadForDb(input: unknown): Prisma.InputJsonValue {
+  try {
+    const cleaned = deepCleanMetaValueForJson(input);
+    const json = JSON.stringify(cleaned);
+    if (json.length > MAX_META_RAW_JSON_CHARS) {
+      const id =
+        cleaned &&
+        typeof cleaned === "object" &&
+        cleaned !== null &&
+        "id" in cleaned &&
+        typeof (cleaned as { id?: unknown }).id === "string"
+          ? (cleaned as { id: string }).id
+          : null;
+      return {
+        _truncatedRaw: true,
+        id,
+        note: `Payload exceeded ${MAX_META_RAW_JSON_CHARS} chars after sanitization.`,
+      } as Prisma.InputJsonValue;
+    }
+    return JSON.parse(json) as Prisma.InputJsonValue;
+  } catch {
+    return { _metaJsonSanitizeFailed: true } as Prisma.InputJsonValue;
+  }
+}
+
 function openaiClient(): OpenAI | null {
   const k = (process.env.OPENAI_API_KEY || "").trim();
   if (!k || k.length < 20) return null;
@@ -1633,14 +1710,14 @@ async function upsertArchiveAdForWatch(watchId: string, ad: MetaAdRow): Promise<
         bodyText: body,
         mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : null,
         lastSeenAt: new Date(),
-        rawData: ad as unknown as Prisma.InputJsonValue,
+        rawData: sanitizeMetaGraphPayloadForDb(ad),
       },
       update: {
         headline: headline ?? undefined,
         bodyText: body ?? undefined,
         mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : undefined,
         lastSeenAt: new Date(),
-        rawData: ad as unknown as Prisma.InputJsonValue,
+        rawData: sanitizeMetaGraphPayloadForDb(ad),
       },
     });
     return true;
@@ -2022,14 +2099,14 @@ export async function fetchAndStoreMetaAdLibrary(
             bodyText: body,
             mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : null,
             lastSeenAt: new Date(),
-            rawData: ad as unknown as Prisma.InputJsonValue,
+            rawData: sanitizeMetaGraphPayloadForDb(ad),
           },
           update: {
             headline: headline ?? undefined,
             bodyText: body ?? undefined,
             mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : undefined,
             lastSeenAt: new Date(),
-            rawData: ad as unknown as Prisma.InputJsonValue,
+            rawData: sanitizeMetaGraphPayloadForDb(ad),
           },
         });
         count++;
@@ -2683,7 +2760,7 @@ function harvestPayloadFromArchiveAd(ad: MetaAdRow): {
     headline,
     bodyText: body,
     mediaUrl: mediaUrl ? mediaUrl.slice(0, MAX_HARVEST_SNAPSHOT_URL_LEN) : null,
-    rawData: ad as unknown as Prisma.InputJsonValue,
+    rawData: sanitizeMetaGraphPayloadForDb(ad),
   };
 }
 
@@ -2879,8 +2956,45 @@ export async function executeMetaHarvestRun(runId: string): Promise<{ adsStored:
     let stored = 0;
     for (let i = 0; i < rows.length; i += batchSize) {
       const chunk = rows.slice(i, i + batchSize);
-      const ins = await prisma.metaAdHarvestAd.createMany({ data: chunk, skipDuplicates: true });
-      stored += ins.count;
+      try {
+        const ins = await prisma.metaAdHarvestAd.createMany({ data: chunk, skipDuplicates: true });
+        stored += ins.count;
+      } catch (batchErr) {
+        const bem = batchErr instanceof Error ? batchErr.message : String(batchErr);
+        diagnostics.push(`Batch insert failed (${bem}); retrying ${chunk.length} row(s) individually.`);
+        for (const row of chunk) {
+          try {
+            await prisma.metaAdHarvestAd.create({
+              data: {
+                ...row,
+                rawData: sanitizeMetaGraphPayloadForDb(row.rawData),
+              },
+            });
+            stored++;
+          } catch (rowErr) {
+            const code =
+              rowErr && typeof rowErr === "object" && "code" in rowErr ? String((rowErr as { code?: string }).code) : "";
+            if (code === "P2002") continue;
+            try {
+              await prisma.metaAdHarvestAd.create({
+                data: {
+                  runId: row.runId,
+                  facebookPageId: row.facebookPageId,
+                  pageName: row.pageName,
+                  adLibraryId: row.adLibraryId,
+                  headline: row.headline,
+                  bodyText: row.bodyText,
+                  mediaUrl: row.mediaUrl,
+                  rawData: { id: row.adLibraryId, _minimalRawAfterBatchFailure: true } as Prisma.InputJsonValue,
+                },
+              });
+              stored++;
+            } catch {
+              /* duplicate or persistent DB error — skip row */
+            }
+          }
+        }
+      }
     }
 
     diagnostics.push(`Stored ${stored} rows (unique per run by Library id).`);
