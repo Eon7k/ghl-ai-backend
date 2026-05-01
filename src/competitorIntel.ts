@@ -18,10 +18,13 @@ function openaiClient(): OpenAI | null {
 }
 
 /**
- * Ad Library / Graph calls: **app access token only** (`META_APP_ID|META_APP_SECRET`). No separate library/user token —
- * avoids expiring pasted tokens and matches Meta’s app-based Ad Library API flow.
+ * Ad Library / Graph calls for competitor Intel:
+ * - If **`META_AD_LIBRARY_TOKEN`** is set → use it (long-lived user/system token you paste from Meta — handy while app-access hits permission errors).
+ * - Else **`META_APP_ID|META_APP_SECRET`** (app access token).
  */
 function metaAdLibraryToken(): string | null {
+  const direct = (process.env.META_AD_LIBRARY_TOKEN || "").trim();
+  if (direct) return direct;
   const id = (process.env.META_APP_ID || "").trim();
   const secret = (process.env.META_APP_SECRET || "").trim();
   if (id && secret) return `${id}|${secret}`;
@@ -257,7 +260,9 @@ async function tryExtractPageIdFromPublicFacebookPageHtml(vanityHandle: string):
 async function graphResolvePageHandleToNumericId(raw: string, handle: string): Promise<string> {
   const token = metaAdLibraryToken();
   if (!token) {
-    throw new Error("Set META_APP_ID and META_APP_SECRET on the API host for Ad Library (app access token APP_ID|APP_SECRET).");
+    throw new Error(
+      "Set META_AD_LIBRARY_TOKEN or both META_APP_ID and META_APP_SECRET on the API host for Ad Library."
+    );
   }
 
   const clean = handle.replace(/^@/, "").trim();
@@ -411,7 +416,7 @@ export async function resolveMetaAdLibraryIdToPageId(raw: string): Promise<{
   const token = metaAdLibraryToken();
   if (!token) {
     throw new Error(
-      "Set META_APP_ID and META_APP_SECRET on the API host to look up an Ad Library ad by id."
+      "Set META_AD_LIBRARY_TOKEN or META_APP_ID + META_APP_SECRET on the API host to look up an Ad Library ad by id."
     );
   }
   const adLibraryId = raw.replace(/\D/g, "");
@@ -460,7 +465,7 @@ export async function resolveMetaAdLibraryIdToPageId(raw: string): Promise<{
     }
     if (isPerm) {
       parts.push(
-        "If the id is correct, your app token may not allow GET /{id} for Archived Ad — complete Ad Library API access for this app in Meta. If you only need the advertiser Page, use “Resolve Facebook Page” instead of an ad id."
+        "If the id is correct, your token may not allow GET /{id} for Archived Ad — complete Ad Library API access and try META_AD_LIBRARY_TOKEN (if set, used before app credentials). If you only need the advertiser Page, use “Resolve Facebook Page” instead of an ad id."
       );
     }
     throw new Error(parts.join(" "));
@@ -1218,7 +1223,7 @@ export async function discoverMetaAdvertiserPagesFromAdLibrarySearch(searchTerm:
   const token = metaAdLibraryToken();
   if (!token) {
     throw new Error(
-      "Set META_APP_ID and META_APP_SECRET on the API host for Ad Library."
+      "Set META_AD_LIBRARY_TOKEN or both META_APP_ID and META_APP_SECRET on the API host for Ad Library."
     );
   }
 
@@ -1255,6 +1260,13 @@ export async function discoverMetaAdvertiserPagesFromAdLibrarySearch(searchTerm:
           candidates: [],
           message:
             `${lastHttpError} Complete Meta’s Ad Library API access at https://www.facebook.com/ads/library/api — app tokens alone may not be enough until the app is authorized there.`,
+        };
+      }
+      if (err.code === 10 && err.error_subcode === 2332004) {
+        return {
+          candidates: [],
+          message:
+            `${lastHttpError} [2332004] Try META_AD_LIBRARY_TOKEN on the API host (used before app credentials), or add App roles + Live mode — https://developers.facebook.com/docs/development/build-and-test/app-roles`,
         };
       }
       const em = err.message || `HTTP ${res.status}`;
@@ -1320,7 +1332,12 @@ export async function fetchAndStoreMetaAdLibrary(
 ): Promise<{ ok: true; count: number; error?: string; debug?: string } | { ok: false; error: string; debug?: string }> {
   const token = metaAdLibraryToken();
   if (!token) {
-    return { ok: true, count: 0, error: "Meta Ad Library: set META_APP_ID and META_APP_SECRET on the API host" };
+    return {
+      ok: true,
+      count: 0,
+      error:
+        "Meta Ad Library: set META_AD_LIBRARY_TOKEN or META_APP_ID + META_APP_SECRET on the API host (with META_AD_LIBRARY_TOKEN set, Ad Library uses that token first).",
+    };
   }
   const numericId = pageId.replace(/\D/g, "");
   if (!numericId || numericId.length < 3) {
@@ -1365,6 +1382,19 @@ export async function fetchAndStoreMetaAdLibrary(
             `Meta Ad Library: ${full} ` +
             `Meta requires completing the official Ad Library API access flow at https://www.facebook.com/ads/library/api (use “Access the API” / get authorized). ` +
             `This is not the same as only selecting ads_read in Graph API Explorer. Follow any identity or app steps Meta shows there; https://www.facebook.com/ID may be required for some people.`,
+          debug: tried.join(" | "),
+        };
+      }
+      if (err.code === 10 && err.error_subcode === 2332004) {
+        return {
+          ok: false,
+          error:
+            `Meta Ad Library: ${full} ` +
+            `[2332004 / App role] In Meta for Developers open the same app as META_APP_ID on your server → Roles → assign your Facebook user as Administrator or Developer (` +
+            `https://developers.facebook.com/docs/development/build-and-test/app-roles). Development-mode apps often require this even when using APP_ID|APP_SECRET. ` +
+            `Alternatively set META_AD_LIBRARY_TOKEN (long-lived token with Ad Library access) on the API host — it is used before app credentials for these calls. ` +
+            `Also complete Ad Library API access at https://www.facebook.com/ads/library/api for that app and switch to Live when Meta allows. ` +
+            `Graph API Explorer uses a user token — log in with an account that has an app role.`,
           debug: tried.join(" | "),
         };
       }
@@ -1455,7 +1485,7 @@ export async function fetchAndStoreMetaAdLibrary(
   }
 
   const hint =
-    "0 ads returned from the Graph `ads_archive` call for this Page after all request shapes. Brands often run ads under a **different** Facebook Page (agency, reseller, or shell Page): use **Search advertisers by keyword** on the competitor watch, or open a live Library ad and **Get Page id from ad id**. Also verify META_AD_LIBRARY_COUNTRIES matches regions where ads run and the numeric Page id matches the **advertiser** row in Meta’s library. If ads appear under another Page id in the public library, confirm **Ad Library API** access for your Meta app (developers.facebook.com) and that META_APP_ID + META_APP_SECRET are set on the API host.";
+    "0 ads returned from the Graph `ads_archive` call for this Page after all request shapes. Brands often run ads under a **different** Facebook Page (agency, reseller, or shell Page): use **Search advertisers by keyword** on the competitor watch, or open a live Library ad and **Get Page id from ad id**. Also verify META_AD_LIBRARY_COUNTRIES matches regions where ads run and the numeric Page id matches the **advertiser** row in Meta’s library. If ads appear under another Page id in the public library, confirm **Ad Library API** access and set **META_AD_LIBRARY_TOKEN** (used first when set) or **META_APP_ID** + **META_APP_SECRET** on the API host.";
   if (lastHttpError) {
     return { ok: false, error: lastHttpError, debug: tried.join(" | ") };
   }
@@ -1753,7 +1783,7 @@ export async function runCompetitorScanForWatch(
       }
     }
   } else {
-    scanNotes.push("Meta: add a Facebook Page link or id to pull public ads (server needs META_APP_ID + META_APP_SECRET and Graph).");
+    scanNotes.push("Meta: add a Facebook Page link or id to pull public ads (server needs META_AD_LIBRARY_TOKEN or META_APP_ID + META_APP_SECRET).");
   }
 
   const recentAds = await prisma.competitorAd.findMany({

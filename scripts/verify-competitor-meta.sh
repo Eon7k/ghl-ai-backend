@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Verify Meta Ad Library (ads_archive) using the same token logic as competitor scans (META_APP_ID + META_APP_SECRET only).
+# Verify Meta Ad Library (ads_archive) using the same token logic as competitor scans.
 # Usage (from ghl-ai-backend):
 #   chmod +x scripts/verify-competitor-meta.sh
 #   ./scripts/verify-competitor-meta.sh
 #   ./scripts/verify-competitor-meta.sh 123456789012
 #
 # Expects in .env (or the environment):
-#   META_APP_ID + META_APP_SECRET  → built as  APP_ID|APP_SECRET
+#   META_AD_LIBRARY_TOKEN  → used first when non-empty
+#   OR  META_APP_ID + META_APP_SECRET  → APP_ID|APP_SECRET
 # Optional: META_GRAPH_API_VERSION (e.g. v25.0)
 # Note: ad_reached_countries must be a JSON array, e.g. ["US"] — the API rejects a bare "US" string.
 
@@ -21,13 +22,17 @@ if [ -f .env ]; then
 fi
 
 PAGE_ID="${1:-20531316728}"
-if [ -z "${META_APP_ID:-}" ] || [ -z "${META_APP_SECRET:-}" ]; then
-  echo "ERROR: Set META_APP_ID and META_APP_SECRET in .env (Competitor watch / Ad Library uses app access token only)."
-  echo "  Get them from: https://developers.facebook.com/apps/ → your app → Settings → Basic"
+if [ -n "${META_AD_LIBRARY_TOKEN:-}" ] && [ "${META_AD_LIBRARY_TOKEN}" != "" ]; then
+  TOKEN="${META_AD_LIBRARY_TOKEN}"
+  echo "Using META_AD_LIBRARY_TOKEN (length ${#TOKEN})."
+elif [ -n "${META_APP_ID:-}" ] && [ -n "${META_APP_SECRET:-}" ]; then
+  TOKEN="${META_APP_ID}|${META_APP_SECRET}"
+  echo "Using app access token from META_APP_ID + META_APP_SECRET (not printed)."
+else
+  echo "ERROR: Set META_AD_LIBRARY_TOKEN or META_APP_ID + META_APP_SECRET in .env"
+  echo "  Get app id/secret from: https://developers.facebook.com/apps/ → your app → Settings → Basic"
   exit 1
 fi
-TOKEN="${META_APP_ID}|${META_APP_SECRET}"
-echo "Using app access token from META_APP_ID + META_APP_SECRET (not printed)."
 
 VRAW="${META_GRAPH_API_VERSION:-v21.0}"
 V="v${VRAW#v}"
