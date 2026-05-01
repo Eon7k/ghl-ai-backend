@@ -1461,7 +1461,7 @@ export function createExpansionRouter(): Router {
       if (!scope) return;
       const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
       const digits = q.replace(/\D/g, "");
-      const groups = await prisma.metaAdHarvestAd.groupBy({
+      const groups: Array<{ facebookPageId: string; _count: { id: number } }> = await prisma.metaAdHarvestAd.groupBy({
         by: ["facebookPageId"],
         where: {
           run: { agencyId: scope.agencyId, clientId: scope.clientId },
@@ -1479,7 +1479,7 @@ export function createExpansionRouter(): Router {
         take: 80,
       });
 
-      const pageIds = groups.map((g) => g.facebookPageId);
+      const pageIds = groups.map((g: { facebookPageId: string }) => g.facebookPageId);
       const sampleRows =
         pageIds.length > 0
           ? await prisma.metaAdHarvestAd.findMany({
@@ -1495,7 +1495,7 @@ export function createExpansionRouter(): Router {
       for (const row of sampleRows) {
         if (!pageNameById.has(row.facebookPageId)) pageNameById.set(row.facebookPageId, row.pageName);
       }
-      const brands = groups.map((g) => ({
+      const brands = groups.map((g: { facebookPageId: string; _count: { id: number } }) => ({
         facebookPageId: g.facebookPageId,
         pageName: pageNameById.get(g.facebookPageId) ?? null,
         adCount: g._count.id,
@@ -1948,9 +1948,9 @@ export function createExpansionRouter(): Router {
         },
       });
       return res.json({ watch: row, insight, diagnostics: scanDiagnostics });
-    } catch (e) {
-      console.error("[scan competitor]", e);
-      const em = e instanceof Error ? e.message : String(e);
+    } catch (err: unknown) {
+      console.error("[scan competitor]", err);
+      const em = err instanceof Error ? err.message : String(err);
       if (
         /competitivePack|Unknown field|column .* does not exist|does not exist in the current database|Invalid.*invocation/i.test(
           em
@@ -1963,13 +1963,16 @@ export function createExpansionRouter(): Router {
           "Scan could not be saved: the server database is missing a recent update. Your team should run: npx prisma db push (or deploy the latest migration), then try again."
         );
       }
-      if (e instanceof Prisma.PrismaClientKnownRequestError && (e.code === "P2002" || e.code === "P2011")) {
-        return apiErr(
-          res,
-          500,
-          "SERVER_ERROR",
-          "Scan failed due to a data conflict. Try again, or contact support if it keeps happening."
-        );
+      if (err instanceof Prisma.PrismaClientKnownRequestError) {
+        const code = err.code;
+        if (code === "P2002" || code === "P2011") {
+          return apiErr(
+            res,
+            500,
+            "SERVER_ERROR",
+            "Scan failed due to a data conflict. Try again, or contact support if it keeps happening."
+          );
+        }
       }
       return apiErr(
         res,

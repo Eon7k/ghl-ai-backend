@@ -2211,7 +2211,8 @@ export async function runCompetitorScanForWatch(
     orderBy: { lastSeenAt: "desc" },
     take: 30,
   });
-  const adDetails = recentAds.map((a) => {
+  type RecentAdRow = (typeof recentAds)[number];
+  const adDetails = recentAds.map((a: RecentAdRow) => {
     const raw = a.rawData as { page_name?: string } | null;
     return {
       headline: a.headline,
@@ -2220,7 +2221,7 @@ export async function runCompetitorScanForWatch(
     };
   });
   const adHeadlineFallbacks = adDetails
-    .map((a) => a.headline || a.body?.replace(/\s+/g, " ").trim().slice(0, 200) || "")
+    .map((a: (typeof adDetails)[number]) => a.headline || a.body?.replace(/\s+/g, " ").trim().slice(0, 200) || "")
     .filter(Boolean) as string[];
 
   const syn = await synthesizeWithOpenAI({
@@ -2307,7 +2308,7 @@ export async function executeMetaHarvestRun(runId: string): Promise<{ adsStored:
     });
 
     const kwArr = Array.isArray(run.keywords)
-      ? run.keywords.filter((x): x is string => typeof x === "string" && x.trim().length > 2).map((k) => k.trim().slice(0, 200))
+      ? (run.keywords as unknown[]).filter((x: unknown): x is string => typeof x === "string" && x.trim().length > 2).map((k) => k.trim().slice(0, 200))
       : [];
 
     if (kwArr.length === 0) {
@@ -2848,7 +2849,7 @@ export async function buildMetaHarvestLandscapeReport(input: {
     });
     if (!run) throw new Error("Harvest run not found.");
     const kwArr = Array.isArray(run.keywords)
-      ? run.keywords.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((k) => k.trim().slice(0, 120))
+      ? (run.keywords as unknown[]).filter((x: unknown): x is string => typeof x === "string" && x.trim().length > 0).map((k) => k.trim().slice(0, 120))
       : [];
     harvestKeywords = kwArr.slice(0, 12);
     if (!topicLabel) {
@@ -2869,27 +2870,27 @@ export async function buildMetaHarvestLandscapeReport(input: {
     ...(handPicked ? { adLibraryId: { in: libIds } } : {}),
   };
 
-  const rawRows = handPicked
-    ? await prisma.metaAdHarvestAd.findMany({
-        where,
-        select: {
-          adLibraryId: true,
-          pageName: true,
-          headline: true,
-          bodyText: true,
-        },
-      })
-    : await prisma.metaAdHarvestAd.findMany({
-        where,
-        orderBy: { createdAt: "desc" },
-        take: 220,
-      });
+  type HarvestAdPickFields = {
+    adLibraryId: string;
+    pageName: string | null;
+    headline: string | null;
+    bodyText: string | null;
+  };
 
   const seen = new Set<string>();
   const forFilter: HarvestAdForFilter[] = [];
 
   if (handPicked) {
-    const byId = new Map(rawRows.map((a) => [a.adLibraryId, a]));
+    const rawPicks: HarvestAdPickFields[] = await prisma.metaAdHarvestAd.findMany({
+      where,
+      select: {
+        adLibraryId: true,
+        pageName: true,
+        headline: true,
+        bodyText: true,
+      },
+    });
+    const byId = new Map(rawPicks.map((row: HarvestAdPickFields) => [row.adLibraryId, row] as const));
     for (const id of libIds) {
       const a = byId.get(id);
       if (!a || seen.has(a.adLibraryId)) continue;
@@ -2905,6 +2906,11 @@ export async function buildMetaHarvestLandscapeReport(input: {
       throw new Error("None of those ads were found in that collection.");
     }
   } else {
+    const rawRows = await prisma.metaAdHarvestAd.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: 220,
+    });
     for (const a of rawRows) {
       if (seen.has(a.adLibraryId)) continue;
       seen.add(a.adLibraryId);
