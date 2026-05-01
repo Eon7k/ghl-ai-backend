@@ -1126,6 +1126,27 @@ function metaAdCreativeHaystack(ad: MetaAdRow): string {
   return parts.join("\n").toLowerCase();
 }
 
+/**
+ * Keyword harvest should not store ads unrelated to the user's phrases (Meta often returns broad matches).
+ * Requires at least one full phrase substring hit OR a non-generic token (≥4 chars) from phrases to appear in copy/Page name.
+ * Disable with META_HARVEST_STRICT_KEYWORD_MATCH=false.
+ */
+function harvestAdMatchesHarvestKeywords(ad: MetaAdRow, keywords: string[]): boolean {
+  const hay = metaAdCreativeHaystack(ad);
+  const page = (typeof ad.page_name === "string" ? ad.page_name : "").toLowerCase();
+  const hayFull = `${hay}\n${page}`;
+  const phrases = keywords.map((k) => k.trim().toLowerCase()).filter((k) => k.length >= 3);
+  if (phrases.length === 0) return true;
+  if (phrases.some((p) => hayFull.includes(p))) return true;
+  const words = phrases
+    .flatMap((p) => p.split(/\s+/))
+    .map((w) => w.replace(/[^a-z0-9']/gi, "").toLowerCase())
+    .filter((w) => w.length >= 4);
+  const meaningful = [...new Set(words)].filter((w) => !META_AD_RELEVANCE_GENERIC_WORDS.has(w));
+  if (meaningful.length === 0) return false;
+  return meaningful.some((w) => hayFull.includes(w));
+}
+
 function websiteHostBrandHint(website: string | null): string | null {
   const w = website?.trim();
   if (!w) return null;
@@ -1181,12 +1202,62 @@ const ADS_ARCHIVE_FIELDS = [
   "ad_creation_time",
   "page_name",
   "ad_snapshot_url",
-  "languages",
   "ad_creative_bodies",
   "ad_creative_link_titles",
 ].join(",");
 
 const MAX_HARVEST_SNAPSHOT_URL_LEN = 8_000;
+
+function extractOgImageFromHtml(html: string): string | null {
+  const m1 = html.match(/property=["']og:image["']\s+content=["']([^"']+)["']/i);
+  if (m1?.[1]) return decodeHtmlEntities(m1[1].trim());
+  const m2 = html.match(/content=["']([^"']+)["']\s+property=["']og:image["']/i);
+  if (m2?.[1]) return decodeHtmlEntities(m2[1].trim());
+  const m3 = html.match(/property=["']og:image:url["']\s+content=["']([^"']+)["']/i);
+  if (m3?.[1]) return decodeHtmlEntities(m3[1].trim());
+  return null;
+}
+
+function decodeHtmlEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'");
+}
+
+/** Try to resolve a preview image URL for Meta’s HTML snapshot page (iframes are often blank in third-party sites). */
+export async function fetchMetaSnapshotOgImageUrl(snapshotUrl: string): Promise<string | null> {
+  let u: URL;
+  try {
+    u = new URL(snapshotUrl);
+  } catch {
+    return null;
+  }
+  const host = u.hostname.replace(/^www\./i, "").toLowerCase();
+  if (!["facebook.com", "m.facebook.com", "lm.facebook.com"].includes(host)) return null;
+  if (!u.pathname.includes("/ads/") && !u.pathname.includes("render_ad")) return null;
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 14_000);
+  try {
+    const res = await fetch(snapshotUrl, {
+      redirect: "follow",
+      signal: ac.signal,
+      headers: {
+        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+        Accept: "text/html,application/xhtml+xml",
+      },
+    });
+    const html = await res.text();
+    return extractOgImageFromHtml(html);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /**
  * Optional `ads_archive` language filter (ISO 639-1), e.g. `META_AD_LIBRARY_CONTENT_LANGUAGES=en`
@@ -2429,8 +2500,34 @@ export async function executeMetaHarvestRun(runId: string): Promise<{ adsStored:
 
     diagnostics.push(`Merged ${merged.size} unique Library ads from Meta.`);
 
+    const strictHarvestKw =
+      String(process.env.META_HARVEST_STRICT_KEYWORD_MATCH ?? "true").toLowerCase() !== "false" &&
+      String(process.env.META_HARVEST_STRICT_KEYWORD_MATCH ?? "true") !== "0";
+
+    let mergedForStore = merged;
+    if (strictHarvestKw && kwArr.length > 0) {
+      mergedForStore = new Map([...merged].filter(([, ad]) => harvestAdMatchesHarvestKeywords(ad, kwArr)));
+      const dropped = merged.size - mergedForStore.size;
+      if (dropped > 0) {
+        diagnostics.push(
+          `Dropped ${dropped} ads that did not match your keywords in visible copy or Page name (set META_HARVEST_STRICT_KEYWORD_MATCH=false to store Meta’s full broad list).`
+        );
+      }
+      if (mergedForStore.size === 0 && merged.size > 0) {
+        diagnostics.push(
+          `Keyword filtering removed all ${merged.size} ads — use more generic phrases or disable META_HARVEST_STRICT_KEYWORD_MATCH temporarily.`
+        );
+      }
+    }
+
+    if (merged.size === 0 && langFilter?.length) {
+      diagnostics.push(
+        `No rows from Meta — if this persists, clear META_AD_LIBRARY_CONTENT_LANGUAGES (currently ${langFilter.join(",")}) or widen keywords.`
+      );
+    }
+
     const rows: Prisma.MetaAdHarvestAdCreateManyInput[] = [];
-    for (const ad of merged.values()) {
+    for (const ad of mergedForStore.values()) {
       const payload = harvestPayloadFromArchiveAd(ad);
       if (!payload) continue;
       rows.push({
@@ -2450,10 +2547,12 @@ export async function executeMetaHarvestRun(runId: string): Promise<{ adsStored:
 
     if (rows.length === 0) {
       const hint =
-        merged.size === 0
-          ? lastHttpError
-            ? `No ads returned; last Graph hint: ${lastHttpError}`
-            : "No ads returned for these keywords/regions."
+        mergedForStore.size === 0
+          ? merged.size === 0
+            ? lastHttpError
+              ? `No ads returned; last Graph hint: ${lastHttpError}`
+              : "No ads returned for these keywords/regions."
+            : "Keyword filtering removed every returned ad — see diagnostics above."
           : "Meta returned ads but none included page_id in API rows.";
       diagnostics.push(hint);
       await prisma.metaAdHarvestRun.update({

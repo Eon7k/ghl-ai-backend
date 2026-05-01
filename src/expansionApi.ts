@@ -18,6 +18,7 @@ import {
   executeMetaHarvestRun,
   buildMetaHarvestBrandReport,
   buildMetaHarvestLandscapeReport,
+  fetchMetaSnapshotOgImageUrl,
 } from "./competitorIntel";
 
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
@@ -27,16 +28,6 @@ export const EXPANSION_UPLOADS_ROOT = path.resolve(
 );
 const UPLOADS_ROOT = EXPANSION_UPLOADS_ROOT;
 const BRANDING_DIR = path.join(UPLOADS_ROOT, "branding");
-
-function languagesFromHarvestAdRaw(raw: unknown): string[] | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const langs = (raw as { languages?: unknown }).languages;
-  if (!Array.isArray(langs)) return undefined;
-  const out = langs
-    .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
-    .map((x) => x.trim().toLowerCase());
-  return out.length ? [...new Set(out)] : undefined;
-}
 
 function ensureUploadDirs(): void {
   for (const d of [UPLOADS_ROOT, BRANDING_DIR]) {
@@ -1461,15 +1452,28 @@ export function createExpansionRouter(): Router {
       return res.json({
         run: {
           ...run,
-          ads: run.ads.map(({ rawData, ...rest }) => ({
-            ...rest,
-            languages: languagesFromHarvestAdRaw(rawData),
-          })),
+          ads: run.ads.map(({ rawData, ...rest }) => rest),
         },
       });
     } catch (e) {
       console.error("[meta-harvest-runs/:id]", e);
       return apiErr(res, 500, "SERVER_ERROR", "Could not load harvest run");
+    }
+  });
+
+  r.post("/agency/competitor/meta-ad-snapshot-thumb", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const snapshotUrl = typeof req.body?.snapshotUrl === "string" ? req.body.snapshotUrl.trim() : "";
+      if (!snapshotUrl.startsWith("http")) {
+        return apiErr(res, 400, "VALIDATION", "snapshotUrl must be an http(s) URL");
+      }
+      const thumbnailUrl = await fetchMetaSnapshotOgImageUrl(snapshotUrl);
+      return res.json({ thumbnailUrl });
+    } catch (e) {
+      console.error("[meta-ad-snapshot-thumb]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not resolve preview image");
     }
   });
 
