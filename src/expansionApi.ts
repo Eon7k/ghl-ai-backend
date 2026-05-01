@@ -1461,7 +1461,7 @@ export function createExpansionRouter(): Router {
       if (!scope) return;
       const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
       const digits = q.replace(/\D/g, "");
-      const groups: Array<{ facebookPageId: string; _count: { id: number } }> = await prisma.metaAdHarvestAd.groupBy({
+      const groups = await prisma.metaAdHarvestAd.groupBy({
         by: ["facebookPageId"],
         where: {
           run: { agencyId: scope.agencyId, clientId: scope.clientId },
@@ -1479,7 +1479,7 @@ export function createExpansionRouter(): Router {
         take: 80,
       });
 
-      const pageIds = groups.map((g: { facebookPageId: string }) => g.facebookPageId);
+      const pageIds = groups.map((g) => g.facebookPageId);
       const sampleRows =
         pageIds.length > 0
           ? await prisma.metaAdHarvestAd.findMany({
@@ -1495,7 +1495,7 @@ export function createExpansionRouter(): Router {
       for (const row of sampleRows) {
         if (!pageNameById.has(row.facebookPageId)) pageNameById.set(row.facebookPageId, row.pageName);
       }
-      const brands = groups.map((g: { facebookPageId: string; _count: { id: number } }) => ({
+      const brands = groups.map((g) => ({
         facebookPageId: g.facebookPageId,
         pageName: pageNameById.get(g.facebookPageId) ?? null,
         adCount: g._count.id,
