@@ -201,6 +201,276 @@ export async function attachBrandingHost(req: Request, _res: Response, next: Nex
   next();
 }
 
+function harvestReportFromInsightRow(row: {
+  status: string;
+  summary: string | null;
+  competitorDisplayName: string | null;
+  adsUsed: number | null;
+  adsConsidered: number | null;
+  adsExcluded: number | null;
+  topThemes: unknown;
+  suggestedCounterAngles: unknown;
+  strongestAds: unknown;
+  competitivePack: unknown;
+  rawPromptUsed: string | null;
+  scanNotes: unknown;
+}):
+  | {
+      competitorDisplayName: string;
+      adsUsed: number;
+      adsConsidered?: number;
+      adsExcluded?: number;
+      summary: string;
+      topThemes: unknown;
+      suggestedCounterAngles: unknown;
+      strongestAds: unknown;
+      competitivePack: unknown;
+      rawPromptUsed: string | null;
+      scanNotes: string[];
+    }
+  | null {
+  if (row.status !== "completed" || row.summary == null || row.competitorDisplayName == null || row.adsUsed == null) {
+    return null;
+  }
+  const notes = Array.isArray(row.scanNotes)
+    ? row.scanNotes.filter((x): x is string => typeof x === "string")
+    : [];
+  return {
+    competitorDisplayName: row.competitorDisplayName,
+    adsUsed: row.adsUsed,
+    adsConsidered: row.adsConsidered ?? undefined,
+    adsExcluded: row.adsExcluded ?? undefined,
+    summary: row.summary,
+    topThemes: row.topThemes ?? [],
+    suggestedCounterAngles: row.suggestedCounterAngles ?? [],
+    strongestAds: row.strongestAds ?? [],
+    competitivePack: row.competitivePack ?? null,
+    rawPromptUsed: row.rawPromptUsed,
+    scanNotes: notes,
+  };
+}
+
+function jsonHarvestInsight(row: {
+  id: string;
+  agencyId: string;
+  clientId: string;
+  kind: string;
+  title: string | null;
+  harvestRunId: string | null;
+  facebookPageIds: unknown;
+  excludePhrases: unknown;
+  strictFilter: boolean;
+  topicHint: string | null;
+  competitorDisplayName: string | null;
+  adsUsed: number | null;
+  adsConsidered: number | null;
+  adsExcluded: number | null;
+  summary: string | null;
+  topThemes: unknown;
+  suggestedCounterAngles: unknown;
+  strongestAds: unknown;
+  competitivePack: unknown;
+  rawPromptUsed: string | null;
+  scanNotes: unknown;
+  status: string;
+  errorMessage: string | null;
+  createdAt: Date;
+  completedAt: Date | null;
+}) {
+  return {
+    id: row.id,
+    agencyId: row.agencyId,
+    clientId: row.clientId,
+    kind: row.kind,
+    title: row.title,
+    harvestRunId: row.harvestRunId,
+    facebookPageIds: row.facebookPageIds ?? null,
+    excludePhrases: row.excludePhrases ?? null,
+    strictFilter: row.strictFilter,
+    topicHint: row.topicHint,
+    competitorDisplayName: row.competitorDisplayName,
+    adsUsed: row.adsUsed,
+    adsConsidered: row.adsConsidered,
+    adsExcluded: row.adsExcluded,
+    status: row.status,
+    errorMessage: row.errorMessage,
+    createdAt: row.createdAt.toISOString(),
+    completedAt: row.completedAt?.toISOString() ?? null,
+    report: harvestReportFromInsightRow(row),
+  };
+}
+
+async function persistCompletedHarvestInsight(params: {
+  agencyId: string;
+  clientId: string;
+  kind: string;
+  title: string | null;
+  harvestRunId?: string | null;
+  facebookPageIds?: string[];
+  excludePhrases: string[];
+  strictFilter: boolean;
+  topicHint?: string | null;
+  report: {
+    competitorDisplayName: string;
+    adsUsed: number;
+    adsConsidered?: number;
+    adsExcluded?: number;
+    summary: string;
+    topThemes: Prisma.InputJsonValue;
+    suggestedCounterAngles: Prisma.InputJsonValue;
+    strongestAds: Prisma.InputJsonValue;
+    competitivePack: Prisma.InputJsonValue | null;
+    rawPromptUsed: string | null;
+    scanNotes: string[];
+  };
+}) {
+  return prisma.metaHarvestInsight.create({
+    data: {
+      agencyId: params.agencyId,
+      clientId: params.clientId,
+      kind: params.kind,
+      title: params.title,
+      harvestRunId: params.harvestRunId ?? null,
+      facebookPageIds:
+        params.facebookPageIds?.length && params.kind === "brand"
+          ? (params.facebookPageIds as unknown as Prisma.InputJsonValue)
+          : undefined,
+      excludePhrases: params.excludePhrases.length ? params.excludePhrases : undefined,
+      strictFilter: params.strictFilter,
+      topicHint: params.topicHint ?? null,
+      competitorDisplayName: params.report.competitorDisplayName,
+      adsUsed: params.report.adsUsed,
+      adsConsidered: params.report.adsConsidered ?? null,
+      adsExcluded: params.report.adsExcluded ?? null,
+      summary: params.report.summary,
+      topThemes: params.report.topThemes as Prisma.InputJsonValue,
+      suggestedCounterAngles: params.report.suggestedCounterAngles as Prisma.InputJsonValue,
+      strongestAds: params.report.strongestAds as Prisma.InputJsonValue,
+      competitivePack: params.report.competitivePack ?? Prisma.JsonNull,
+      rawPromptUsed: params.report.rawPromptUsed,
+      scanNotes: params.report.scanNotes as unknown as Prisma.InputJsonValue,
+      status: "completed",
+      completedAt: new Date(),
+    },
+  });
+}
+
+function scheduleLandscapeHarvestInsightJob(
+  insightId: string,
+  agencyId: string,
+  clientId: string,
+  params: {
+    harvestRunId?: string;
+    topicHint?: string;
+    excludePhrases: string[];
+    strictRelevanceFilter: boolean;
+  }
+): void {
+  void (async () => {
+    try {
+      const report = await buildMetaHarvestLandscapeReport({
+        agencyId,
+        clientId,
+        harvestRunId: params.harvestRunId,
+        topicHint: params.topicHint,
+        excludePhrases: params.excludePhrases.length ? params.excludePhrases : undefined,
+        strictRelevanceFilter: params.strictRelevanceFilter,
+      });
+      await prisma.metaHarvestInsight.update({
+        where: { id: insightId, agencyId, clientId },
+        data: {
+          status: "completed",
+          completedAt: new Date(),
+          competitorDisplayName: report.competitorDisplayName,
+          adsUsed: report.adsUsed,
+          adsConsidered: report.adsConsidered ?? null,
+          adsExcluded: report.adsExcluded ?? null,
+          summary: report.summary,
+          topThemes: report.topThemes as Prisma.InputJsonValue,
+          suggestedCounterAngles: report.suggestedCounterAngles as Prisma.InputJsonValue,
+          strongestAds: report.strongestAds as Prisma.InputJsonValue,
+          competitivePack: report.competitivePack ?? Prisma.JsonNull,
+          rawPromptUsed: report.rawPromptUsed,
+          scanNotes: report.scanNotes as unknown as Prisma.InputJsonValue,
+          errorMessage: null,
+        },
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message.slice(0, 2000) : "Could not finish report.";
+      console.error("[meta-harvest-insight landscape job]", insightId, e);
+      await prisma.metaHarvestInsight
+        .update({
+          where: { id: insightId, agencyId, clientId },
+          data: {
+            status: "failed",
+            completedAt: new Date(),
+            errorMessage: msg,
+          },
+        })
+        .catch(() => {});
+    }
+  })();
+}
+
+function scheduleBrandHarvestInsightJob(
+  insightId: string,
+  agencyId: string,
+  clientId: string,
+  params: {
+    facebookPageIds: string[];
+    competitorDisplayName?: string;
+    keywords?: string[];
+    excludePhrases: string[];
+    strictRelevanceFilter: boolean;
+  }
+): void {
+  void (async () => {
+    try {
+      const report = await buildMetaHarvestBrandReport({
+        agencyId,
+        clientId,
+        facebookPageIds: params.facebookPageIds,
+        competitorDisplayName: params.competitorDisplayName,
+        keywords: params.keywords,
+        excludePhrases: params.excludePhrases.length ? params.excludePhrases : undefined,
+        strictRelevanceFilter: params.strictRelevanceFilter,
+      });
+      await prisma.metaHarvestInsight.update({
+        where: { id: insightId, agencyId, clientId },
+        data: {
+          status: "completed",
+          completedAt: new Date(),
+          competitorDisplayName: report.competitorDisplayName,
+          adsUsed: report.adsUsed,
+          adsConsidered: report.adsConsidered ?? null,
+          adsExcluded: report.adsExcluded ?? null,
+          summary: report.summary,
+          topThemes: report.topThemes as Prisma.InputJsonValue,
+          suggestedCounterAngles: report.suggestedCounterAngles as Prisma.InputJsonValue,
+          strongestAds: report.strongestAds as Prisma.InputJsonValue,
+          competitivePack: report.competitivePack ?? Prisma.JsonNull,
+          rawPromptUsed: report.rawPromptUsed,
+          scanNotes: report.scanNotes as unknown as Prisma.InputJsonValue,
+          errorMessage: null,
+        },
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message.slice(0, 2000) : "Could not finish report.";
+      console.error("[meta-harvest-insight brand job]", insightId, e);
+      await prisma.metaHarvestInsight
+        .update({
+          where: { id: insightId, agencyId, clientId },
+          data: {
+            status: "failed",
+            completedAt: new Date(),
+            errorMessage: msg,
+          },
+        })
+        .catch(() => {});
+    }
+  })();
+}
+
 export function createExpansionRouter(): Router {
   const r = Router();
 
@@ -1253,6 +1523,34 @@ export function createExpansionRouter(): Router {
         .map((x: string) => x.trim().slice(0, 160))
         .slice(0, 24);
       const strictRelevanceFilter = Boolean(b.strictRelevanceFilter);
+      const runInBackground = Boolean(b.runInBackground);
+
+      if (runInBackground) {
+        const pending = await prisma.metaHarvestInsight.create({
+          data: {
+            agencyId: scope.agencyId,
+            clientId: scope.clientId,
+            kind: "brand",
+            title: competitorDisplayName?.slice(0, 240) || "Brand report",
+            facebookPageIds: facebookPageIds as unknown as Prisma.InputJsonValue,
+            excludePhrases: excludePhrases.length ? excludePhrases : undefined,
+            strictFilter: strictRelevanceFilter,
+            status: "pending",
+          },
+        });
+        scheduleBrandHarvestInsightJob(pending.id, scope.agencyId, scope.clientId, {
+          facebookPageIds,
+          competitorDisplayName,
+          keywords: hk.length ? hk : undefined,
+          excludePhrases,
+          strictRelevanceFilter,
+        });
+        return res.status(202).json({
+          insight: jsonHarvestInsight(pending),
+          backgroundAccepted: true,
+        });
+      }
+
       const report = await buildMetaHarvestBrandReport({
         agencyId: scope.agencyId,
         clientId: scope.clientId,
@@ -1262,7 +1560,17 @@ export function createExpansionRouter(): Router {
         excludePhrases: excludePhrases.length ? excludePhrases : undefined,
         strictRelevanceFilter,
       });
-      return res.json({ report });
+      const insight = await persistCompletedHarvestInsight({
+        agencyId: scope.agencyId,
+        clientId: scope.clientId,
+        kind: "brand",
+        title: competitorDisplayName?.slice(0, 240) || report.competitorDisplayName.slice(0, 240),
+        facebookPageIds,
+        excludePhrases,
+        strictFilter: strictRelevanceFilter,
+        report,
+      });
+      return res.json({ report, insight: jsonHarvestInsight(insight) });
     } catch (e) {
       console.error("[meta-harvest-report]", e);
       return apiErr(
@@ -1288,6 +1596,34 @@ export function createExpansionRouter(): Router {
         .map((x: string) => x.trim().slice(0, 160))
         .slice(0, 24);
       const strictRelevanceFilter = Boolean(b.strictRelevanceFilter);
+      const runInBackground = Boolean(b.runInBackground);
+
+      if (runInBackground) {
+        const pending = await prisma.metaHarvestInsight.create({
+          data: {
+            agencyId: scope.agencyId,
+            clientId: scope.clientId,
+            kind: "landscape",
+            title: topicHint?.slice(0, 240) || "Market overview",
+            harvestRunId: harvestRunId ?? null,
+            excludePhrases: excludePhrases.length ? excludePhrases : undefined,
+            strictFilter: strictRelevanceFilter,
+            topicHint: topicHint ?? null,
+            status: "pending",
+          },
+        });
+        scheduleLandscapeHarvestInsightJob(pending.id, scope.agencyId, scope.clientId, {
+          harvestRunId,
+          topicHint,
+          excludePhrases,
+          strictRelevanceFilter,
+        });
+        return res.status(202).json({
+          insight: jsonHarvestInsight(pending),
+          backgroundAccepted: true,
+        });
+      }
+
       const report = await buildMetaHarvestLandscapeReport({
         agencyId: scope.agencyId,
         clientId: scope.clientId,
@@ -1296,7 +1632,18 @@ export function createExpansionRouter(): Router {
         excludePhrases: excludePhrases.length ? excludePhrases : undefined,
         strictRelevanceFilter,
       });
-      return res.json({ report });
+      const insight = await persistCompletedHarvestInsight({
+        agencyId: scope.agencyId,
+        clientId: scope.clientId,
+        kind: "landscape",
+        title: topicHint?.slice(0, 240) || report.competitorDisplayName.slice(0, 240),
+        harvestRunId: harvestRunId ?? null,
+        excludePhrases,
+        strictFilter: strictRelevanceFilter,
+        topicHint: topicHint ?? null,
+        report,
+      });
+      return res.json({ report, insight: jsonHarvestInsight(insight) });
     } catch (e) {
       console.error("[meta-harvest-landscape-report]", e);
       return apiErr(
@@ -1305,6 +1652,37 @@ export function createExpansionRouter(): Router {
         "VALIDATION",
         e instanceof Error ? e.message : "Could not build harvest landscape report"
       );
+    }
+  });
+
+  r.get("/agency/competitor/meta-harvest-insights", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const rows = await prisma.metaHarvestInsight.findMany({
+        where: { agencyId: scope.agencyId, clientId: scope.clientId },
+        orderBy: { createdAt: "desc" },
+        take: 50,
+      });
+      return res.json({ insights: rows.map(jsonHarvestInsight) });
+    } catch (e) {
+      console.error("[meta-harvest-insights GET]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not list saved reports");
+    }
+  });
+
+  r.get("/agency/competitor/meta-harvest-insights/:id", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const row = await prisma.metaHarvestInsight.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (!row) return apiErr(res, 404, "NOT_FOUND", "Saved report not found");
+      return res.json({ insight: jsonHarvestInsight(row) });
+    } catch (e) {
+      console.error("[meta-harvest-insights/:id]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not load saved report");
     }
   });
 

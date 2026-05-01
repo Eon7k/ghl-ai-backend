@@ -53,6 +53,8 @@ model User {
   competitorWatchesClient  CompetitorWatch[]   @relation("CompetitorWatchClient")
   metaAdHarvestRunsAgency   MetaAdHarvestRun[] @relation("MetaAdHarvestRunAgency")
   metaAdHarvestRunsClient   MetaAdHarvestRun[] @relation("MetaAdHarvestRunClient")
+  metaHarvestInsightsAgency MetaHarvestInsight[] @relation("MetaHarvestInsightAgency")
+  metaHarvestInsightsClient MetaHarvestInsight[] @relation("MetaHarvestInsightClient")
   /** Optional Go High Level Social Planner (CSV upload API): one credential row per portal user (effective client when agency switches). */
   ghlSocialPlannerCredential GhlSocialPlannerCredential?
 }
@@ -358,6 +360,40 @@ model MetaAdHarvestAd {
 
   @@unique([runId, adLibraryId])
   @@index([facebookPageId])
+}
+
+/** Saved AI brief from keyword harvest (landscape or selected brands); supports async generation. */
+model MetaHarvestInsight {
+  id             String   @id @default(cuid())
+  agencyId       String
+  clientId       String
+  agency         User     @relation("MetaHarvestInsightAgency", fields: [agencyId], references: [id], onDelete: Cascade)
+  client         User     @relation("MetaHarvestInsightClient", fields: [clientId], references: [id], onDelete: Cascade)
+  kind           String   @db.VarChar(24)
+  /** Optional label shown in history */
+  title          String?  @db.VarChar(240)
+  harvestRunId   String?
+  facebookPageIds Json?
+  excludePhrases Json?
+  strictFilter   Boolean  @default(false)
+  topicHint      String?  @db.VarChar(240)
+  competitorDisplayName String? @db.VarChar(240)
+  adsUsed        Int?
+  adsConsidered  Int?
+  adsExcluded    Int?
+  summary        String?  @db.Text
+  topThemes      Json?
+  suggestedCounterAngles Json?
+  strongestAds   Json?
+  competitivePack Json?
+  rawPromptUsed  String?  @db.Text
+  scanNotes      Json?
+  status         String   @default("completed") @db.VarChar(24)
+  errorMessage   String?  @db.Text
+  createdAt      DateTime @default(now())
+  completedAt    DateTime?
+
+  @@index([agencyId, clientId, createdAt])
 }
 
 model AgencyClient {
