@@ -364,6 +364,7 @@ function scheduleLandscapeHarvestInsightJob(
     topicHint?: string;
     excludePhrases: string[];
     strictRelevanceFilter: boolean;
+    adLibraryIds?: string[];
   }
 ): void {
   void (async () => {
@@ -375,6 +376,7 @@ function scheduleLandscapeHarvestInsightJob(
         topicHint: params.topicHint,
         excludePhrases: params.excludePhrases.length ? params.excludePhrases : undefined,
         strictRelevanceFilter: params.strictRelevanceFilter,
+        adLibraryIds: params.adLibraryIds?.length ? params.adLibraryIds : undefined,
       });
       await prisma.metaHarvestInsight.update({
         where: { id: insightId, agencyId, clientId },
@@ -418,6 +420,7 @@ function scheduleBrandHarvestInsightJob(
   clientId: string,
   params: {
     facebookPageIds: string[];
+    adLibraryIds?: string[];
     competitorDisplayName?: string;
     keywords?: string[];
     excludePhrases: string[];
@@ -429,7 +432,8 @@ function scheduleBrandHarvestInsightJob(
       const report = await buildMetaHarvestBrandReport({
         agencyId,
         clientId,
-        facebookPageIds: params.facebookPageIds,
+        facebookPageIds: params.facebookPageIds.length ? params.facebookPageIds : undefined,
+        adLibraryIds: params.adLibraryIds?.length ? params.adLibraryIds : undefined,
         competitorDisplayName: params.competitorDisplayName,
         keywords: params.keywords,
         excludePhrases: params.excludePhrases.length ? params.excludePhrases : undefined,
@@ -1514,7 +1518,14 @@ export function createExpansionRouter(): Router {
         .filter((x: unknown): x is string => typeof x === "string")
         .map((x: string) => x.replace(/\D/g, ""))
         .filter((id: string) => id.length >= 4);
-      if (facebookPageIds.length === 0) return apiErr(res, 400, "VALIDATION", "facebookPageIds must include at least one numeric Page id");
+      const libRaw = Array.isArray(b.adLibraryIds) ? (b.adLibraryIds as unknown[]) : [];
+      const adLibraryIds = libRaw
+        .filter((x: unknown): x is string => typeof x === "string" && x.trim().length > 0)
+        .map((x: string) => x.trim())
+        .slice(0, 48);
+      if (facebookPageIds.length === 0 && adLibraryIds.length === 0) {
+        return apiErr(res, 400, "VALIDATION", "Provide facebookPageIds and/or adLibraryIds from your saved harvest");
+      }
       if (facebookPageIds.length > 12) return apiErr(res, 400, "VALIDATION", "Maximum 12 Page ids per report");
       const competitorDisplayName = typeof b.competitorDisplayName === "string" ? b.competitorDisplayName.trim().slice(0, 200) : undefined;
       const hkRaw = Array.isArray(b.keywords) ? (b.keywords as unknown[]) : [];
@@ -1536,7 +1547,10 @@ export function createExpansionRouter(): Router {
             clientId: scope.clientId,
             kind: "brand",
             title: competitorDisplayName?.slice(0, 240) || "Brand report",
-            facebookPageIds: facebookPageIds as unknown as Prisma.InputJsonValue,
+            facebookPageIds:
+              facebookPageIds.length > 0
+                ? (facebookPageIds as unknown as Prisma.InputJsonValue)
+                : undefined,
             excludePhrases: excludePhrases.length ? excludePhrases : undefined,
             strictFilter: strictRelevanceFilter,
             status: "pending",
@@ -1544,6 +1558,7 @@ export function createExpansionRouter(): Router {
         });
         scheduleBrandHarvestInsightJob(pending.id, scope.agencyId, scope.clientId, {
           facebookPageIds,
+          adLibraryIds: adLibraryIds.length ? adLibraryIds : undefined,
           competitorDisplayName,
           keywords: hk.length ? hk : undefined,
           excludePhrases,
@@ -1558,7 +1573,8 @@ export function createExpansionRouter(): Router {
       const report = await buildMetaHarvestBrandReport({
         agencyId: scope.agencyId,
         clientId: scope.clientId,
-        facebookPageIds,
+        facebookPageIds: facebookPageIds.length ? facebookPageIds : undefined,
+        adLibraryIds: adLibraryIds.length ? adLibraryIds : undefined,
         competitorDisplayName,
         keywords: hk.length ? hk : undefined,
         excludePhrases: excludePhrases.length ? excludePhrases : undefined,
@@ -1569,7 +1585,7 @@ export function createExpansionRouter(): Router {
         clientId: scope.clientId,
         kind: "brand",
         title: competitorDisplayName?.slice(0, 240) || report.competitorDisplayName.slice(0, 240),
-        facebookPageIds,
+        facebookPageIds: facebookPageIds.length ? facebookPageIds : undefined,
         excludePhrases,
         strictFilter: strictRelevanceFilter,
         report,
@@ -1601,6 +1617,14 @@ export function createExpansionRouter(): Router {
         .slice(0, 24);
       const strictRelevanceFilter = Boolean(b.strictRelevanceFilter);
       const runInBackground = Boolean(b.runInBackground);
+      const libRaw = Array.isArray(b.adLibraryIds) ? (b.adLibraryIds as unknown[]) : [];
+      const adLibraryIds = libRaw
+        .filter((x: unknown): x is string => typeof x === "string" && x.trim().length > 0)
+        .map((x: string) => x.trim())
+        .slice(0, 80);
+      if (adLibraryIds.length > 0 && !harvestRunId) {
+        return apiErr(res, 400, "VALIDATION", "Choose a saved collection (harvestRunId) when listing specific ads.");
+      }
 
       if (runInBackground) {
         const pending = await prisma.metaHarvestInsight.create({
@@ -1621,6 +1645,7 @@ export function createExpansionRouter(): Router {
           topicHint,
           excludePhrases,
           strictRelevanceFilter,
+          adLibraryIds: adLibraryIds.length ? adLibraryIds : undefined,
         });
         return res.status(202).json({
           insight: jsonHarvestInsight(pending),
@@ -1635,6 +1660,7 @@ export function createExpansionRouter(): Router {
         topicHint,
         excludePhrases: excludePhrases.length ? excludePhrases : undefined,
         strictRelevanceFilter,
+        adLibraryIds: adLibraryIds.length ? adLibraryIds : undefined,
       });
       const insight = await persistCompletedHarvestInsight({
         agencyId: scope.agencyId,

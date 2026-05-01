@@ -2630,16 +2630,19 @@ async function filterHarvestAdsPipeline(
   return { kept: aiResult.kept, scanNotes: notes };
 }
 
-/** Pull harvested ads for chosen advertiser Pages and run the same OpenAI synthesis used for competitor watches (no CompetitorWatch row). */
+/** Pull harvested ads for chosen advertiser Pages and/or explicit Meta Ad Library ad ids; run OpenAI synthesis used for competitor watches. */
 export async function buildMetaHarvestBrandReport(input: {
   agencyId: string;
   clientId: string;
-  facebookPageIds: string[];
+  /** Required unless `adLibraryIds` lists harvested ads explicitly. */
+  facebookPageIds?: string[];
+  /** When set, only these harvested ads are used (workspace scope). Order preserved. Semantic relevance filtering is skipped unless exclusion phrases apply. */
+  adLibraryIds?: string[];
   competitorDisplayName?: string;
   keywords?: string[];
   /** Case-insensitive substring match on page name + copy before AI pass. */
   excludePhrases?: string[];
-  /** When true, adds an OpenAI pass to drop off-topic ads (keyword collision). Still runs AI when `excludePhrases` is non-empty. */
+  /** When true, adds an OpenAI pass to drop off-topic ads (keyword collision). Still runs AI when `excludePhrases` is non-empty. Ignored when ads are explicitly listed via `adLibraryIds`. */
   strictRelevanceFilter?: boolean;
 }): Promise<{
   competitorDisplayName: string;
@@ -2654,23 +2657,73 @@ export async function buildMetaHarvestBrandReport(input: {
   rawPromptUsed: string | null;
   scanNotes: string[];
 }> {
-  const ids = [...new Set(input.facebookPageIds.map((x) => x.replace(/\D/g, "")).filter((x) => x.length >= 4))];
-  if (ids.length === 0) {
-    throw new Error("Provide at least one numeric Facebook Page id.");
+  const pageIds = [...new Set((input.facebookPageIds ?? []).map((x) => x.replace(/\D/g, "")).filter((x) => x.length >= 4))];
+  const libIds = [...new Set((input.adLibraryIds ?? []).map((x) => String(x).trim()).filter((x) => x.length > 0))].slice(
+    0,
+    48
+  );
+
+  if (pageIds.length === 0 && libIds.length === 0) {
+    throw new Error("Provide advertiser Page id(s) and/or harvested Meta Ad Library ad id(s).");
   }
 
   const excludePhrases = (input.excludePhrases ?? []).map((x) => x.trim()).filter((x) => x.length >= 2).slice(0, 24);
   const hk = (input.keywords ?? []).map((x) => x.trim()).filter(Boolean).slice(0, 12);
-  const strict = Boolean(input.strictRelevanceFilter);
+  const handPicked = libIds.length > 0;
+  const strict = Boolean(input.strictRelevanceFilter) && !handPicked;
 
-  const ads = await prisma.metaAdHarvestAd.findMany({
-    where: {
-      facebookPageId: { in: ids },
-      run: { agencyId: input.agencyId, clientId: input.clientId },
-    },
-    orderBy: { createdAt: "desc" },
-    take: 64,
-  });
+  const scopeWhere: Prisma.MetaAdHarvestAdWhereInput = {
+    run: { agencyId: input.agencyId, clientId: input.clientId },
+  };
+
+  let ads: {
+    adLibraryId: string;
+    facebookPageId: string;
+    pageName: string | null;
+    headline: string | null;
+    bodyText: string | null;
+  }[];
+
+  if (handPicked) {
+    ads = await prisma.metaAdHarvestAd.findMany({
+      where: {
+        ...scopeWhere,
+        adLibraryId: { in: libIds },
+        ...(pageIds.length ? { facebookPageId: { in: pageIds } } : {}),
+      },
+      select: {
+        adLibraryId: true,
+        facebookPageId: true,
+        pageName: true,
+        headline: true,
+        bodyText: true,
+      },
+    });
+    const orderMap = new Map(libIds.map((id, i) => [id, i]));
+    ads.sort((a, b) => (orderMap.get(a.adLibraryId) ?? 999) - (orderMap.get(b.adLibraryId) ?? 999));
+  } else {
+    ads = await prisma.metaAdHarvestAd.findMany({
+      where: {
+        ...scopeWhere,
+        facebookPageId: { in: pageIds },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 64,
+      select: {
+        adLibraryId: true,
+        facebookPageId: true,
+        pageName: true,
+        headline: true,
+        bodyText: true,
+      },
+    });
+  }
+
+  if (handPicked && ads.length === 0) {
+    throw new Error(
+      "No harvested ads matched those Library ids—reload ads from your collection or run a keyword harvest first."
+    );
+  }
 
   const seen = new Set<string>();
   const forFilter: HarvestAdForFilter[] = [];
@@ -2685,10 +2738,12 @@ export async function buildMetaHarvestBrandReport(input: {
     });
   }
 
+  const ids = pageIds.length ? pageIds : [...new Set(ads.map((a) => a.facebookPageId.replace(/\D/g, "")).filter((x) => x.length >= 4))];
+
   let displayName = input.competitorDisplayName?.trim();
   if (!displayName) {
     const pn = ads.find((x) => x.pageName)?.pageName;
-    displayName = pn || `Advertisers (${ids.join(", ")})`;
+    displayName = pn || (handPicked ? `Selected ads (${forFilter.length})` : `Advertisers (${ids.join(", ")})`);
   }
   displayName = displayName.slice(0, 200);
 
@@ -2713,7 +2768,9 @@ export async function buildMetaHarvestBrandReport(input: {
   }
 
   const scanNotes = [
-    `Harvest-brand report for Page id(s): ${ids.join(", ")}.`,
+    handPicked
+      ? `Harvest-brand report from ${forFilter.length} hand-picked Meta Library ad row(s).`
+      : `Harvest-brand report for Page id(s): ${pageIds.join(", ")}.`,
     `Ads in pool before filters: ${adsConsidered}; used in brief: ${adDetails.length}.`,
     ...filterNotes,
   ];
@@ -2755,6 +2812,8 @@ export async function buildMetaHarvestLandscapeReport(input: {
   topicHint?: string;
   excludePhrases?: string[];
   strictRelevanceFilter?: boolean;
+  /** With harvestRunId, restrict analysis to these Meta Library rows from that collection (order preserved). */
+  adLibraryIds?: string[];
 }): Promise<{
   competitorDisplayName: string;
   adsUsed: number;
@@ -2769,10 +2828,19 @@ export async function buildMetaHarvestLandscapeReport(input: {
   scanNotes: string[];
 }> {
   const excludePhrases = (input.excludePhrases ?? []).map((x) => x.trim()).filter((x) => x.length >= 2).slice(0, 24);
-  const strict = Boolean(input.strictRelevanceFilter);
+  const libIds = [...new Set((input.adLibraryIds ?? []).map((x) => String(x).trim()).filter((x) => x.length > 0))].slice(
+    0,
+    80
+  );
+  const handPicked = libIds.length > 0;
+  const strict = Boolean(input.strictRelevanceFilter) && !handPicked;
 
   let harvestKeywords: string[] = [];
   let topicLabel = input.topicHint?.trim().slice(0, 240) || "";
+
+  if (handPicked && !input.harvestRunId?.trim()) {
+    throw new Error("Pick which saved collection those ads are from (collection required when listing specific ads).");
+  }
 
   if (input.harvestRunId?.trim()) {
     const run = await prisma.metaAdHarvestRun.findFirst({
@@ -2798,26 +2866,56 @@ export async function buildMetaHarvestLandscapeReport(input: {
       clientId: input.clientId,
       ...(input.harvestRunId?.trim() ? { id: input.harvestRunId.trim() } : {}),
     },
+    ...(handPicked ? { adLibraryId: { in: libIds } } : {}),
   };
 
-  const rawRows = await prisma.metaAdHarvestAd.findMany({
-    where,
-    orderBy: { createdAt: "desc" },
-    take: 220,
-  });
+  const rawRows = handPicked
+    ? await prisma.metaAdHarvestAd.findMany({
+        where,
+        select: {
+          adLibraryId: true,
+          pageName: true,
+          headline: true,
+          bodyText: true,
+        },
+      })
+    : await prisma.metaAdHarvestAd.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        take: 220,
+      });
 
   const seen = new Set<string>();
   const forFilter: HarvestAdForFilter[] = [];
-  for (const a of rawRows) {
-    if (seen.has(a.adLibraryId)) continue;
-    seen.add(a.adLibraryId);
-    forFilter.push({
-      adLibraryId: a.adLibraryId,
-      pageName: a.pageName,
-      headline: a.headline,
-      body: a.bodyText,
-    });
-    if (forFilter.length >= 140) break;
+
+  if (handPicked) {
+    const byId = new Map(rawRows.map((a) => [a.adLibraryId, a]));
+    for (const id of libIds) {
+      const a = byId.get(id);
+      if (!a || seen.has(a.adLibraryId)) continue;
+      seen.add(a.adLibraryId);
+      forFilter.push({
+        adLibraryId: a.adLibraryId,
+        pageName: a.pageName,
+        headline: a.headline,
+        body: a.bodyText,
+      });
+    }
+    if (forFilter.length === 0) {
+      throw new Error("None of those ads were found in that collection.");
+    }
+  } else {
+    for (const a of rawRows) {
+      if (seen.has(a.adLibraryId)) continue;
+      seen.add(a.adLibraryId);
+      forFilter.push({
+        adLibraryId: a.adLibraryId,
+        pageName: a.pageName,
+        headline: a.headline,
+        body: a.bodyText,
+      });
+      if (forFilter.length >= 140) break;
+    }
   }
 
   const displayName = topicLabel.slice(0, 200);
@@ -2843,9 +2941,11 @@ export async function buildMetaHarvestLandscapeReport(input: {
   }
 
   const scanNotes = [
-    input.harvestRunId?.trim()
-      ? `Landscape for harvest run ${input.harvestRunId.trim()}.`
-      : `Landscape across workspace harvest ads (multiple runs allowed in sample).`,
+    handPicked
+      ? `Landscape from ${forFilter.length} selected ad(s) in collection ${input.harvestRunId!.trim()}.`
+      : input.harvestRunId?.trim()
+        ? `Landscape for harvest run ${input.harvestRunId.trim()}.`
+        : `Landscape across workspace harvest ads (multiple runs allowed in sample).`,
     `Ads in sample before filters: ${adsConsidered}; used in AI: ${adDetails.length}.`,
     ...filterNotes,
   ];
