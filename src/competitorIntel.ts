@@ -1233,6 +1233,17 @@ function extractCreativePreviewUrlsFromHtml(html: string): string[] {
     }
   };
 
+  // Video / Reel ads: poster + video Open Graph images (often differ from plain og:image or are the only still).
+  for (const m of html.matchAll(/property=["'](?:og:video:image|og:video:image:url)["']\s+content=["']([^"']+)["']/gi)) {
+    push(m[1]);
+  }
+  for (const m of html.matchAll(/content=["']([^"']+)["']\s+property=["'](?:og:video:image|og:video:image:url)["']/gi)) {
+    push(m[1]);
+  }
+  for (const m of html.matchAll(/<video\b[^>]*\bposter=["']([^"']+)["']/gi)) {
+    push(m[1]);
+  }
+
   for (const m of html.matchAll(/property=["'](?:og:image|og:image:url|og:image:secure_url)["']\s+content=["']([^"']+)["']/gi)) {
     push(m[1]);
   }
@@ -1246,8 +1257,10 @@ function extractCreativePreviewUrlsFromHtml(html: string): string[] {
     push(m[1]);
   }
 
-  // Embedded JSON-style keys Meta sometimes ships in inline payloads
-  for (const m of html.matchAll(/"(?:thumbnail_uri|preferred_thumbnail_image_uri|image_uri)"\s*:\s*"([^"]+)"/gi)) {
+  // Embedded JSON-style keys Meta sometimes ships in inline payloads (video previews included).
+  for (const m of html.matchAll(
+    /"(?:thumbnail_uri|preferred_thumbnail_image_uri|image_uri|preview_image_uri|video_preview_image_uri)"\s*:\s*"([^"]+)"/gi
+  )) {
     push(m[1]?.replace(/\\u002F/gi, "/"));
   }
 
@@ -1291,6 +1304,20 @@ function sanitizeMetaSnapshotHtmlForSrcdoc(html: string): string | null {
   return out.slice(0, 520_000);
 }
 
+/** Prefer sanitized snapshot markup; if Meta ships og:image only (no `<img>` in body), embed that URL so iframe fallback can still render. */
+function buildMetaSnapshotIframeFallback(html: string, thumbnailUrl: string | null): string | null {
+  const sanitized = sanitizeMetaSnapshotHtmlForSrcdoc(html);
+  if (sanitized) return sanitized;
+  if (!thumbnailUrl || !/^https:\/\//i.test(thumbnailUrl)) return null;
+  if (!isPlausibleCreativeImageUrl(thumbnailUrl)) return null;
+  const injectHead =
+    `<base target="_blank" href="https://www.facebook.com/">` +
+    `<style>body{margin:0;background:#f4f4f5;display:flex;align-items:center;justify-content:center;min-height:120px}` +
+    `img{display:block;max-width:100%;max-height:520px;width:auto;height:auto}</style>`;
+  const esc = thumbnailUrl.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  return `<!DOCTYPE html><html><head>${injectHead}</head><body><img src="${esc}" alt="" /></body></html>`;
+}
+
 function isPlausibleCreativeImageUrl(url: string): boolean {
   const lower = url.toLowerCase();
   if (/rsrc\.php|\/emoji|safe_image|pixel\.gif|\b1x1\b|\/tracking\b/i.test(lower)) return false;
@@ -1299,7 +1326,31 @@ function isPlausibleCreativeImageUrl(url: string): boolean {
 
 function isAllowedMetaImageFetchHost(hostname: string): boolean {
   const h = hostname.toLowerCase();
-  return h === "fbcdn.net" || h.endsWith(".fbcdn.net") || h === "facebook.com" || h.endsWith(".facebook.com");
+  return (
+    h === "fbcdn.net" ||
+    h.endsWith(".fbcdn.net") ||
+    h === "facebook.com" ||
+    h.endsWith(".facebook.com") ||
+    h.endsWith(".cdninstagram.com")
+  );
+}
+
+/** When CDN sends `octet-stream` or omits Content-Type, infer image MIME from magic bytes. */
+function sniffImageMimeFromBytes(buf: Buffer): string | null {
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+  if (buf.length >= 12 && buf.slice(8, 12).toString("ascii") === "WEBP" && buf.slice(0, 4).toString("ascii") === "RIFF") {
+    return "image/webp";
+  }
+  const gifSig = buf.slice(0, 6).toString("ascii");
+  if (gifSig === "GIF87a" || gifSig === "GIF89a") return "image/gif";
+  return null;
+}
+
+function normalizeFetchedImageMime(headerCt: string, buf: Buffer): string | null {
+  const ct = headerCt.split(";")[0]!.trim().toLowerCase();
+  if (ct.startsWith("image/") && !ct.includes("svg")) return ct;
+  return sniffImageMimeFromBytes(buf);
 }
 
 /** Fetch Meta CDN creative bytes server-side; browsers often hotlink these URLs as blank/blocked frames. */
@@ -1314,27 +1365,35 @@ async function fetchMetaCdnImageAsDataUrl(imageUrl: string): Promise<string | nu
   if (u.protocol !== "https:") return null;
   if (!isAllowedMetaImageFetchHost(u.hostname)) return null;
 
+  const userAgents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+  ];
+
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 14_000);
+  const timer = setTimeout(() => ac.abort(), 18_000);
   try {
-    const res = await fetch(imageUrl, {
-      redirect: "follow",
-      signal: ac.signal,
-      headers: {
-        Referer: "https://www.facebook.com/",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-      },
-    });
-    if (!res.ok) return null;
-    const ctRaw = res.headers.get("content-type") || "";
-    const ct = ctRaw.split(";")[0]!.trim().toLowerCase();
-    if (!ct.startsWith("image/") || ct.includes("svg")) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length < 200 || buf.length > 480_000) return null;
-    return `data:${ct};base64,${buf.toString("base64")}`;
-  } catch {
+    for (const ua of userAgents) {
+      try {
+        const res = await fetch(imageUrl, {
+          redirect: "follow",
+          signal: ac.signal,
+          headers: {
+            Referer: "https://www.facebook.com/",
+            "User-Agent": ua,
+            Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+          },
+        });
+        if (!res.ok) continue;
+        const buf = Buffer.from(await res.arrayBuffer());
+        const ct = normalizeFetchedImageMime(res.headers.get("content-type") || "", buf);
+        if (!ct || buf.length < 80 || buf.length > 600_000) continue;
+        return `data:${ct};base64,${buf.toString("base64")}`;
+      } catch {
+        continue;
+      }
+    }
     return null;
   } finally {
     clearTimeout(timer);
@@ -1349,8 +1408,11 @@ async function fetchMetaSnapshotHtmlDocument(snapshotUrl: string): Promise<strin
     return null;
   }
   const host = u.hostname.replace(/^www\./i, "").toLowerCase();
-  if (!["facebook.com", "m.facebook.com", "lm.facebook.com"].includes(host)) return null;
-  if (!u.pathname.includes("/ads/") && !u.pathname.includes("render_ad")) return null;
+  // `l.facebook.com` is Meta’s outbound link shim; fetch follows redirects to the real snapshot.
+  if (!["facebook.com", "m.facebook.com", "lm.facebook.com", "l.facebook.com"].includes(host)) return null;
+  const pathOk =
+    u.pathname.includes("/ads/") || u.pathname.includes("render_ad") || host === "l.facebook.com";
+  if (!pathOk) return null;
 
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 22_000);
@@ -1394,7 +1456,7 @@ export async function resolveMetaSnapshotPreview(snapshotUrl: string): Promise<M
     plausible[0] ??
     null;
 
-  const sanitizedFallback = sanitizeMetaSnapshotHtmlForSrcdoc(html);
+  const sanitizedFallback = buildMetaSnapshotIframeFallback(html, thumbnailUrl);
 
   let thumbnailDataUrl: string | null = null;
   if (thumbnailUrl) {
@@ -2013,6 +2075,14 @@ export type CompetitivePack = {
   theirAdTactics: { headline: string; tactic: string }[];
 };
 
+export type LandscapeMarketExtras = {
+  standoutAdvertisers: { name: string; rank: number; rationale: string }[];
+  /** Patterns / tactics that appear to work across advertisers in this sample (ethical borrow ideas). */
+  whatOthersDoWell: string[];
+  /** Concrete wedges for the user vs the crowded patterns (differentiation). */
+  howYouCanStandOut: string[];
+};
+
 export type SynthesisResult = {
   summary: string;
   topThemes: string[];
@@ -2020,6 +2090,8 @@ export type SynthesisResult = {
   strongestAds: { headline: string; note?: string }[];
   competitivePack: CompetitivePack | null;
   rawPromptUsed?: string;
+  /** Populated for keyword landscape / market overview syntheses only. */
+  landscapeExtras?: LandscapeMarketExtras | null;
 };
 
 function fallbackSynthesis(
@@ -2233,7 +2305,16 @@ export async function synthesizeHarvestLandscapeWithOpenAI(input: {
     null,
     input.scanNotes
   );
-  if (!openai) return fb;
+  if (!openai) {
+    return {
+      ...fb,
+      landscapeExtras: {
+        standoutAdvertisers: [],
+        whatOthersDoWell: [...fb.topThemes],
+        howYouCanStandOut: [...(fb.competitivePack?.howToWin ?? [])],
+      },
+    };
+  }
 
   const adsBlock =
     input.adDetails.length > 0
@@ -2256,13 +2337,18 @@ Research topic label: ${input.topicLabel}
 Harvest / focus keywords: ${input.harvestKeywords.length ? input.harvestKeywords.join(", ") : "(infer from topic)"}
 Notes: ${input.scanNotes.join(" | ") || "none"}
 
-Deliver a **landscape analysis** — what the market is doing as a whole, where it is crowded, and how the user can stand out. Output one JSON object (no markdown fences).
+Deliver a **landscape analysis** — what the market is doing as a whole, where it is crowded, how others are winning attention in this slice, and how the user can stand out. Output one JSON object (no markdown fences).
+
+Ground claims in **patterns visible in the numbered sample** (Page names appear in brackets when present). You do **not** have spend, reach, or conversion data — rank advertisers only by **inferred creative/strategic strength** from copy: clarity, proof, offer, hook, tone, and distinctiveness vs peers in this slice.
 
 Return JSON with these keys:
-- "summary" (string, markdown **bold** ok): 4-6 short paragraphs on overall patterns, common offers/hooks, tone, social proof, creative formats implied, gaps/whitespace, and concrete ways to differ.
-- "theirPlaybook" (string): 2-4 sentences summarizing the **dominant playbook in this sample** (not one company — the “typical” approach).
-- "howToWin" (string array, 6-10 items): differentiation moves — campaign structure, audiences, creative angles, offers, sequencing — tied to what you see **across** the sample.
-- "yourCampaigns" (array, 3-6 objects): each has "title", "platform" (often "meta"), "angle", "adCopy" (2-5 sentences original for the USER, not copied from ads), "whyItWorks" (one sentence vs crowded patterns).
+- "summary" (string, markdown **bold** ok): 4-6 short paragraphs on overall patterns, common offers/hooks, tone, social proof, creative formats implied (e.g. still vs video-heavy hints from copy), gaps/whitespace, and concrete ways to differ.
+- "standoutAdvertisers" (array, max 5): { "name": string (use the **Page/advertiser label from the sample**), "rank": integer 1–5 where **1 = strongest signal in this slice**, "rationale": string (2–4 sentences citing what you see in their ads vs others) }. Omit brands not clearly in the sample.
+- "whatOthersDoWell" (string array, 6–10): concrete **recurring winning patterns** others use (hooks, proof, offers, urgency, formats) worth studying or ethically adapting.
+- "howYouCanStandOut" (string array, 6–10): **differentiation wedges** for the user — audiences, angles, creative tests, offers, sequencing — vs the crowded playbook (not generic “be authentic”).
+- "theirPlaybook" (string): 2-4 sentences on the **dominant market playbook** in this sample (the “typical” approach), not one hero company.
+- "howToWin" (string array, 6–10 items): broader execution moves — campaign structure, audiences, creative angles, offers, sequencing — complementing howYouCanStandOut.
+- "yourCampaigns" (array, **4–7** objects): same depth as a **single-brand** report. Each has "title", "platform" (often "meta"), "angle", "adCopy" (**3–6 sentences** of original starter copy for the USER — do not lift phrases from the ads), "whyItWorks" (one sentence tied to gaps vs crowded patterns).
 - "theirAdTactics" (array, up to 10): { "headline": string, "tactic": string } — recurring **archetypes** you observe (merge similar advertisers).
 - "topThemes" (string array, max 6): cross-market messaging themes.
 - "suggestedCounterAngles" (string array, max 6): angles less used in this sample worth testing.
@@ -2274,13 +2360,13 @@ If the sample is thin, say so honestly and still give strategic hypotheses.`;
     const completion = await openai.chat.completions.create({
       model: process.env.OPENAI_COMPETITOR_MODEL?.trim() || "gpt-4o-mini",
       temperature: 0.45,
-      max_tokens: 4_400,
+      max_tokens: 5_600,
       response_format: { type: "json_object" },
       messages: [
         {
           role: "system",
           content:
-            "You return only valid JSON. Speak to aggregate patterns across advertisers; avoid naming a single competitor unless unavoidable. adCopy must be original for the user.",
+            "You return only valid JSON. Speak to aggregate patterns across advertisers; use advertiser/Page names from the input sample where standoutAdvertisers calls for it. adCopy must be original for the user (no plagiarism).",
         },
         { role: "user", content: prompt },
       ],
@@ -2288,6 +2374,9 @@ If the sample is thin, say so honestly and still give strategic hypotheses.`;
     const raw = completion.choices[0]?.message?.content?.trim() || "";
     const parsed = JSON.parse(raw) as {
       summary?: string;
+      standoutAdvertisers?: unknown;
+      whatOthersDoWell?: unknown;
+      howYouCanStandOut?: unknown;
       theirPlaybook?: string;
       howToWin?: unknown;
       yourCampaigns?: unknown;
@@ -2311,6 +2400,39 @@ If the sample is thin, say so honestly and still give strategic hypotheses.`;
         strongestAds.push({ headline: (x as { headline: string }).headline, note });
       }
     }
+
+    const standoutRaw = Array.isArray(parsed.standoutAdvertisers) ? parsed.standoutAdvertisers : [];
+    const standoutAdvertisers: LandscapeMarketExtras["standoutAdvertisers"] = [];
+    for (const x of standoutRaw.slice(0, 8)) {
+      if (!x || typeof x !== "object") continue;
+      const o = x as Record<string, unknown>;
+      const name = typeof o.name === "string" ? o.name.trim() : "";
+      if (!name) continue;
+      let rank = typeof o.rank === "number" && Number.isFinite(o.rank) ? Math.round(o.rank) : standoutAdvertisers.length + 1;
+      rank = Math.min(10, Math.max(1, rank));
+      const rationale = typeof o.rationale === "string" ? o.rationale.trim().slice(0, 520) : "";
+      standoutAdvertisers.push({ name: name.slice(0, 140), rank, rationale });
+    }
+    standoutAdvertisers.sort((a, b) => a.rank - b.rank);
+    const byName = new Map<string, LandscapeMarketExtras["standoutAdvertisers"][0]>();
+    for (const s of standoutAdvertisers) {
+      const key = s.name.toLowerCase();
+      if (!byName.has(key)) byName.set(key, s);
+    }
+    const standoutDedup = [...byName.values()].slice(0, 5);
+
+    const whatOthersDoWell = Array.isArray(parsed.whatOthersDoWell)
+      ? parsed.whatOthersDoWell
+          .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+          .map((s) => s.trim())
+          .slice(0, 12)
+      : [];
+    const howYouCanStandOutParsed = Array.isArray(parsed.howYouCanStandOut)
+      ? parsed.howYouCanStandOut
+          .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+          .map((s) => s.trim())
+          .slice(0, 12)
+      : [];
 
     const howToWin = Array.isArray(parsed.howToWin)
       ? parsed.howToWin.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((s) => s.trim())
@@ -2350,8 +2472,18 @@ If the sample is thin, say so honestly and still give strategic hypotheses.`;
     const competitivePack: CompetitivePack = {
       theirPlaybook,
       howToWin: howToWin.length ? howToWin : fb.competitivePack!.howToWin,
-      yourCampaigns: yourCampaigns.slice(0, 6),
+      yourCampaigns: yourCampaigns.slice(0, 7),
       theirAdTactics: theirAdTactics.slice(0, 10),
+    };
+
+    const landscapeExtras: LandscapeMarketExtras = {
+      standoutAdvertisers: standoutDedup,
+      whatOthersDoWell: whatOthersDoWell.length ? whatOthersDoWell : topThemes.length ? [...topThemes] : [...fb.topThemes],
+      howYouCanStandOut: howYouCanStandOutParsed.length
+        ? howYouCanStandOutParsed
+        : howToWin.length
+          ? howToWin.slice(0, 10)
+          : [...(fb.competitivePack?.howToWin ?? [])],
     };
 
     return {
@@ -2360,11 +2492,19 @@ If the sample is thin, say so honestly and still give strategic hypotheses.`;
       suggestedCounterAngles: suggestedCounterAngles.length ? suggestedCounterAngles : fb.suggestedCounterAngles,
       strongestAds: strongestAds.length ? strongestAds : fb.strongestAds,
       competitivePack,
+      landscapeExtras,
       rawPromptUsed: "openai:harvest landscape synthesis",
     };
   } catch (e) {
     console.error("[competitorIntel] OpenAI landscape synthesis", e);
-    return fb;
+    return {
+      ...fb,
+      landscapeExtras: {
+        standoutAdvertisers: [],
+        whatOthersDoWell: [...fb.topThemes],
+        howYouCanStandOut: [...(fb.competitivePack?.howToWin ?? [])],
+      },
+    };
   }
 }
 
@@ -3270,6 +3410,12 @@ export async function buildMetaHarvestLandscapeReport(input: {
     adDetails,
   });
 
+  const competitivePackMerged =
+    syn.competitivePack &&
+    ({
+      ...syn.competitivePack,
+      ...(syn.landscapeExtras ? { landscapeAnalysis: syn.landscapeExtras } : {}),
+    } as Record<string, unknown>);
   const logBody = scanNotes.map((s) => `• ${s.replace(/\s+/g, " ").trim()}`).join("\n\n");
   const summaryWithNotes = (syn.summary + `\n\n**Harvest landscape log**\n\n${logBody}`).slice(0, 12_000);
 
@@ -3282,8 +3428,8 @@ export async function buildMetaHarvestLandscapeReport(input: {
     topThemes: syn.topThemes as unknown as Prisma.InputJsonValue,
     suggestedCounterAngles: syn.suggestedCounterAngles as unknown as Prisma.InputJsonValue,
     strongestAds: syn.strongestAds as unknown as Prisma.InputJsonValue,
-    competitivePack: syn.competitivePack
-      ? (JSON.parse(JSON.stringify(syn.competitivePack)) as Prisma.InputJsonValue)
+    competitivePack: competitivePackMerged
+      ? (JSON.parse(JSON.stringify(competitivePackMerged)) as Prisma.InputJsonValue)
       : null,
     rawPromptUsed: syn.rawPromptUsed || null,
     scanNotes,
