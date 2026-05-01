@@ -56,6 +56,8 @@ model User {
   metaAdHarvestRunsClient   MetaAdHarvestRun[] @relation("MetaAdHarvestRunClient")
   metaHarvestInsightsAgency MetaHarvestInsight[] @relation("MetaHarvestInsightAgency")
   metaHarvestInsightsClient MetaHarvestInsight[] @relation("MetaHarvestInsightClient")
+  harvestPrefsAsAgency HarvestAnalysisPreference[] @relation("HarvestPreferenceAgency")
+  harvestPrefsAsClient HarvestAnalysisPreference[] @relation("HarvestPreferenceClient")
   /** Optional Go High Level Social Planner (CSV upload API): one credential row per portal user (effective client when agency switches). */
   ghlSocialPlannerCredential GhlSocialPlannerCredential?
 }
@@ -337,6 +339,11 @@ model MetaAdHarvestRun {
   client         User              @relation("MetaAdHarvestRunClient", fields: [clientId], references: [id], onDelete: Cascade)
   label          String?           @db.VarChar(200)
   keywords       Json              @default("[]")
+  /** Optional natural-language intent used to rank/browse ads and generate ranking phrases. */
+  intentPrompt   String?           @db.Text
+  /** Extra phrases for relevance ranking (JSON string array); merged with collection keywords server-side. */
+  rankingKeywords Json             @default("[]")
+  rankingKeywordsUpdatedAt DateTime?
   status         String            @default("pending") @db.VarChar(40)
   errorMessage   String?           @db.Text
   adsStored      Int               @default(0)
@@ -344,6 +351,21 @@ model MetaAdHarvestRun {
   createdAt      DateTime          @default(now())
   completedAt    DateTime?
   ads            MetaAdHarvestAd[]
+}
+
+/** Per workspace (agency + client portal scope): lightweight counts from ads users actually ran reports on — improves ranking & prompts over time. */
+model HarvestAnalysisPreference {
+  id          String   @id @default(cuid())
+  agencyId    String
+  clientId    String
+  agency      User     @relation("HarvestPreferenceAgency", fields: [agencyId], references: [id], onDelete: Cascade)
+  client      User     @relation("HarvestPreferenceClient", fields: [clientId], references: [id], onDelete: Cascade)
+  /** JSON: pageScores Record<pageId, count>, tokenHints Record<token, count>, intentSnippets string[] */
+  weightsJson Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([agencyId, clientId])
 }
 
 model MetaAdHarvestAd {

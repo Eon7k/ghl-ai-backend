@@ -18,8 +18,16 @@ import {
   executeMetaHarvestRun,
   buildMetaHarvestBrandReport,
   buildMetaHarvestLandscapeReport,
-  fetchMetaSnapshotOgImageUrl,
+  resolveMetaSnapshotPreview,
 } from "./competitorIntel";
+import {
+  appendHarvestIntentSnippet,
+  attachHarvestAdRelevanceScores,
+  loadHarvestRankingScoreContext,
+  parseHarvestKeywordStrings,
+  recordHarvestSelectionsFromAds,
+  suggestRankingKeywordsFromIntent,
+} from "./harvestRankingLearning";
 
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
 export const EXPANSION_UPLOADS_ROOT = path.resolve(
@@ -101,6 +109,32 @@ function requireSuperAdmin(req: ExpansionAuthRequest, res: Response, next: NextF
     return;
   }
   next();
+}
+
+function skipHarvestLearning(req: ExpansionAuthRequest): boolean {
+  const email = req.user?.email?.toLowerCase().trim();
+  return !!(email && ADMIN_EMAILS.has(email));
+}
+
+async function maybeRecordHarvestAdSelections(opts: {
+  skipLearning: boolean;
+  agencyId: string;
+  clientId: string;
+  adLibraryIds: string[];
+}): Promise<void> {
+  if (opts.skipLearning || opts.adLibraryIds.length === 0) return;
+  const ads = await prisma.metaAdHarvestAd.findMany({
+    where: {
+      adLibraryId: { in: opts.adLibraryIds },
+      run: { agencyId: opts.agencyId, clientId: opts.clientId },
+    },
+    select: { facebookPageId: true, headline: true, bodyText: true },
+  });
+  await recordHarvestSelectionsFromAds({
+    agencyId: opts.agencyId,
+    clientId: opts.clientId,
+    ads,
+  });
 }
 
 /** Gate expansion modules by User.enabledProductKeys (admin emails bypass). */
@@ -366,6 +400,7 @@ function scheduleLandscapeHarvestInsightJob(
     excludePhrases: string[];
     strictRelevanceFilter: boolean;
     adLibraryIds?: string[];
+    skipLearning?: boolean;
   }
 ): void {
   void (async () => {
@@ -398,6 +433,14 @@ function scheduleLandscapeHarvestInsightJob(
           errorMessage: null,
         },
       });
+      if (!params.skipLearning && params.adLibraryIds?.length) {
+        await maybeRecordHarvestAdSelections({
+          skipLearning: false,
+          agencyId,
+          clientId,
+          adLibraryIds: params.adLibraryIds,
+        });
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message.slice(0, 2000) : "Could not finish report.";
       console.error("[meta-harvest-insight landscape job]", insightId, e);
@@ -426,6 +469,7 @@ function scheduleBrandHarvestInsightJob(
     keywords?: string[];
     excludePhrases: string[];
     strictRelevanceFilter: boolean;
+    skipLearning?: boolean;
   }
 ): void {
   void (async () => {
@@ -459,6 +503,14 @@ function scheduleBrandHarvestInsightJob(
           errorMessage: null,
         },
       });
+      if (!params.skipLearning && params.adLibraryIds?.length) {
+        await maybeRecordHarvestAdSelections({
+          skipLearning: false,
+          agencyId,
+          clientId,
+          adLibraryIds: params.adLibraryIds,
+        });
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message.slice(0, 2000) : "Could not finish report.";
       console.error("[meta-harvest-insight brand job]", insightId, e);
@@ -1449,15 +1501,93 @@ export function createExpansionRouter(): Router {
         },
       });
       if (!run) return apiErr(res, 404, "NOT_FOUND", "Harvest run not found");
+      const ctx = await loadHarvestRankingScoreContext(scope.agencyId, scope.clientId, run);
+      const stripped = run.ads.map(({ rawData, ...rest }) => rest);
+      const adsRanked = attachHarvestAdRelevanceScores(stripped, ctx);
       return res.json({
         run: {
           ...run,
-          ads: run.ads.map(({ rawData, ...rest }) => rest),
+          ads: adsRanked,
         },
       });
     } catch (e) {
       console.error("[meta-harvest-runs/:id]", e);
       return apiErr(res, 500, "SERVER_ERROR", "Could not load harvest run");
+    }
+  });
+
+  r.patch("/agency/competitor/meta-harvest-runs/:id/ranking-context", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const runId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+      if (!runId) return apiErr(res, 400, "VALIDATION", "Missing run id");
+      const existing = await prisma.metaAdHarvestRun.findFirst({
+        where: { id: runId, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (!existing) return apiErr(res, 404, "NOT_FOUND", "Harvest run not found");
+
+      const b = req.body || {};
+      const intentPrompt =
+        typeof b.intentPrompt === "string" ? b.intentPrompt.trim().slice(0, 8000) : undefined;
+      let rankingKeywords: string[] | undefined;
+      if (Array.isArray(b.rankingKeywords)) {
+        rankingKeywords = (b.rankingKeywords as unknown[])
+          .filter((x): x is string => typeof x === "string")
+          .map((x) => x.trim().slice(0, 160))
+          .filter((x) => x.length > 1)
+          .slice(0, 36);
+      }
+
+      const data: Prisma.MetaAdHarvestRunUpdateInput = {
+        rankingKeywordsUpdatedAt: new Date(),
+      };
+      if (intentPrompt !== undefined) data.intentPrompt = intentPrompt.length ? intentPrompt : null;
+      if (rankingKeywords !== undefined) data.rankingKeywords = rankingKeywords as unknown as Prisma.InputJsonValue;
+
+      await prisma.metaAdHarvestRun.update({
+        where: { id: runId },
+        data,
+      });
+
+      if (intentPrompt !== undefined && intentPrompt.length >= 12) {
+        await appendHarvestIntentSnippet(scope.agencyId, scope.clientId, intentPrompt);
+      }
+
+      const row = await prisma.metaAdHarvestRun.findFirst({
+        where: { id: runId, agencyId: scope.agencyId, clientId: scope.clientId },
+        include: { _count: { select: { ads: true } } },
+      });
+      return res.json({ run: row });
+    } catch (e) {
+      console.error("[meta-harvest-runs PATCH ranking-context]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not update ranking context");
+    }
+  });
+
+  r.post("/agency/competitor/meta-harvest-runs/:id/suggest-ranking-keywords", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const runId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+      if (!runId) return apiErr(res, 400, "VALIDATION", "Missing run id");
+      const run = await prisma.metaAdHarvestRun.findFirst({
+        where: { id: runId, agencyId: scope.agencyId, clientId: scope.clientId },
+      });
+      if (!run) return apiErr(res, 404, "NOT_FOUND", "Harvest run not found");
+      const b = req.body || {};
+      const intent =
+        typeof b.intentPrompt === "string"
+          ? b.intentPrompt.trim()
+          : run.intentPrompt?.trim() ?? "";
+      const keywords = await suggestRankingKeywordsFromIntent({
+        intentPrompt: intent,
+        harvestKeywords: parseHarvestKeywordStrings(run.keywords),
+      });
+      return res.json({ keywords });
+    } catch (e) {
+      console.error("[meta-harvest-runs suggest-ranking-keywords]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not suggest keywords");
     }
   });
 
@@ -1469,8 +1599,11 @@ export function createExpansionRouter(): Router {
       if (!snapshotUrl.startsWith("http")) {
         return apiErr(res, 400, "VALIDATION", "snapshotUrl must be an http(s) URL");
       }
-      const thumbnailUrl = await fetchMetaSnapshotOgImageUrl(snapshotUrl);
-      return res.json({ thumbnailUrl });
+      const preview = await resolveMetaSnapshotPreview(snapshotUrl);
+      return res.json({
+        thumbnailUrl: preview.thumbnailUrl,
+        previewHtml: preview.previewHtml,
+      });
     } catch (e) {
       console.error("[meta-ad-snapshot-thumb]", e);
       return apiErr(res, 500, "SERVER_ERROR", "Could not resolve preview image");
@@ -1561,6 +1694,7 @@ export function createExpansionRouter(): Router {
         .slice(0, 24);
       const strictRelevanceFilter = Boolean(b.strictRelevanceFilter);
       const runInBackground = Boolean(b.runInBackground);
+      const skipLearn = skipHarvestLearning(req);
 
       if (runInBackground) {
         const pending = await prisma.metaHarvestInsight.create({
@@ -1585,6 +1719,7 @@ export function createExpansionRouter(): Router {
           keywords: hk.length ? hk : undefined,
           excludePhrases,
           strictRelevanceFilter,
+          skipLearning: skipLearn,
         });
         return res.status(202).json({
           insight: jsonHarvestInsight(pending),
@@ -1611,6 +1746,12 @@ export function createExpansionRouter(): Router {
         excludePhrases,
         strictFilter: strictRelevanceFilter,
         report,
+      });
+      await maybeRecordHarvestAdSelections({
+        skipLearning: skipLearn,
+        agencyId: scope.agencyId,
+        clientId: scope.clientId,
+        adLibraryIds,
       });
       return res.json({ report, insight: jsonHarvestInsight(insight) });
     } catch (e) {
@@ -1648,6 +1789,8 @@ export function createExpansionRouter(): Router {
         return apiErr(res, 400, "VALIDATION", "Choose a saved collection (harvestRunId) when listing specific ads.");
       }
 
+      const skipLearn = skipHarvestLearning(req);
+
       if (runInBackground) {
         const pending = await prisma.metaHarvestInsight.create({
           data: {
@@ -1668,6 +1811,7 @@ export function createExpansionRouter(): Router {
           excludePhrases,
           strictRelevanceFilter,
           adLibraryIds: adLibraryIds.length ? adLibraryIds : undefined,
+          skipLearning: skipLearn,
         });
         return res.status(202).json({
           insight: jsonHarvestInsight(pending),
@@ -1694,6 +1838,12 @@ export function createExpansionRouter(): Router {
         strictFilter: strictRelevanceFilter,
         topicHint: topicHint ?? null,
         report,
+      });
+      await maybeRecordHarvestAdSelections({
+        skipLearning: skipLearn,
+        agencyId: scope.agencyId,
+        clientId: scope.clientId,
+        adLibraryIds,
       });
       return res.json({ report, insight: jsonHarvestInsight(insight) });
     } catch (e) {

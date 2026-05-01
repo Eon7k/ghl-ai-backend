@@ -6,6 +6,7 @@
 import OpenAI from "openai";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
+import { getHarvestLearningPromptAddition } from "./harvestRankingLearning";
 
 const GRAPH_VERSION = (process.env.META_GRAPH_API_VERSION || "v25.0").replace(/^v?/, "v");
 const MAX_HTML_BYTES = 1_500_000;
@@ -1208,27 +1209,89 @@ const ADS_ARCHIVE_FIELDS = [
 
 const MAX_HARVEST_SNAPSHOT_URL_LEN = 8_000;
 
-function extractOgImageFromHtml(html: string): string | null {
-  const m1 = html.match(/property=["']og:image["']\s+content=["']([^"']+)["']/i);
-  if (m1?.[1]) return decodeHtmlEntities(m1[1].trim());
-  const m2 = html.match(/content=["']([^"']+)["']\s+property=["']og:image["']/i);
-  if (m2?.[1]) return decodeHtmlEntities(m2[1].trim());
-  const m3 = html.match(/property=["']og:image:url["']\s+content=["']([^"']+)["']/i);
-  if (m3?.[1]) return decodeHtmlEntities(m3[1].trim());
-  return null;
-}
-
 function decodeHtmlEntities(s: string): string {
   return s
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
-    .replace(/&#039;/g, "'");
+    .replace(/&#039;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number.parseInt(n, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(Number.parseInt(h, 16)));
 }
 
-/** Try to resolve a preview image URL for Meta’s HTML snapshot page (iframes are often blank in third-party sites). */
-export async function fetchMetaSnapshotOgImageUrl(snapshotUrl: string): Promise<string | null> {
+/** Gather candidate preview image URLs from Meta snapshot HTML (og tags, embedded JSON, CDN URLs). */
+function extractCreativePreviewUrlsFromHtml(html: string): string[] {
+  const out: string[] = [];
+  const push = (raw: string | null | undefined) => {
+    const t = raw?.trim();
+    if (!t || !/^https:\/\//i.test(t)) return;
+    try {
+      out.push(decodeHtmlEntities(t.replace(/\\\//g, "/")));
+    } catch {
+      /* ignore */
+    }
+  };
+
+  for (const m of html.matchAll(/property=["'](?:og:image|og:image:url|og:image:secure_url)["']\s+content=["']([^"']+)["']/gi)) {
+    push(m[1]);
+  }
+  for (const m of html.matchAll(/content=["']([^"']+)["']\s+property=["'](?:og:image|og:image:url|og:image:secure_url)["']/gi)) {
+    push(m[1]);
+  }
+  for (const m of html.matchAll(/name=["'](?:twitter:image|twitter:image:src)["']\s+content=["']([^"']+)["']/gi)) {
+    push(m[1]);
+  }
+  for (const m of html.matchAll(/rel=["']image_src["']\s+href=["']([^"']+)["']/gi)) {
+    push(m[1]);
+  }
+
+  // Embedded JSON-style keys Meta sometimes ships in inline payloads
+  for (const m of html.matchAll(/"(?:thumbnail_uri|preferred_thumbnail_image_uri|image_uri)"\s*:\s*"([^"]+)"/gi)) {
+    push(m[1]?.replace(/\\u002F/gi, "/"));
+  }
+
+  const cdnRe =
+    /https:\/\/(?:scontent[^"'\\\s<>]*\.fbcdn\.net|[^"'\\\s<>]*\.fbcdn\.net|external[^"'\\\s<>]*\.fbcdn\.net)[^"'\\\s<>]{15,900}/gi;
+  let cm: RegExpExecArray | null;
+  while ((cm = cdnRe.exec(html)) !== null) {
+    let u = cm[0];
+    if (/rsrc\.php|\/emoji|tracking|pixel|\/safe_image/i.test(u)) continue;
+    push(u);
+  }
+
+  return [...new Set(out)];
+}
+
+function sanitizeMetaSnapshotHtmlForSrcdoc(html: string): string | null {
+  let out = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "");
+  out = out.replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, "");
+  out = out.replace(/<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>/gi, "");
+  out = out.replace(/<object\b[^<]*(?:(?!<\/object>)<[^<]*)*<\/object>/gi, "");
+  out = out.replace(/<embed\b[^>]*>/gi, "");
+  out = out.replace(/<link\b[^>]*>/gi, "");
+  out = out.replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  out = out.replace(/href\s*=\s*["']?\s*javascript:/gi, 'href="#"');
+  out = out.replace(/(\ssrc=["'])\/\//gi, "$1https://");
+  out = out.replace(/(\shref=["'])\/\//gi, "$1https://");
+
+  const injectHead =
+    `<base target="_blank" href="https://www.facebook.com/">` +
+    `<style>body{margin:0;background:#f4f4f5}img,video,picture{display:block;max-width:100%;height:auto}</style>`;
+
+  if (!/<html[\s>]/i.test(out)) {
+    out = `<!DOCTYPE html><html><head>${injectHead}</head><body>${out}</body></html>`;
+  } else if (/<head[^>]*>/i.test(out)) {
+    out = out.replace(/<head([^>]*)>/i, `<head$1>${injectHead}`);
+  } else {
+    out = out.replace(/<html([^>]*)>/i, `<html$1><head>${injectHead}</head>`);
+  }
+
+  if (out.length < 280 || !/<(img|video|picture|svg)\b/i.test(out)) return null;
+  return out.slice(0, 520_000);
+}
+
+async function fetchMetaSnapshotHtmlDocument(snapshotUrl: string): Promise<string | null> {
   let u: URL;
   try {
     u = new URL(snapshotUrl);
@@ -1240,23 +1303,53 @@ export async function fetchMetaSnapshotOgImageUrl(snapshotUrl: string): Promise<
   if (!u.pathname.includes("/ads/") && !u.pathname.includes("render_ad")) return null;
 
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 14_000);
+  const timer = setTimeout(() => ac.abort(), 22_000);
   try {
     const res = await fetch(snapshotUrl, {
       redirect: "follow",
       signal: ac.signal,
       headers: {
         "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-        Accept: "text/html,application/xhtml+xml",
+        Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
       },
     });
-    const html = await res.text();
-    return extractOgImageFromHtml(html);
+    if (!res.ok) return null;
+    return await res.text();
   } catch {
     return null;
   } finally {
     clearTimeout(timer);
   }
+}
+
+export type MetaSnapshotPreviewResult = {
+  thumbnailUrl: string | null;
+  /** Stripped snapshot HTML for iframe srcdoc when no image URL was found (no scripts). */
+  previewHtml: string | null;
+};
+
+/** Single fetch: derive thumbnail URL and/or sanitized embeddable snapshot HTML. */
+export async function resolveMetaSnapshotPreview(snapshotUrl: string): Promise<MetaSnapshotPreviewResult> {
+  const html = await fetchMetaSnapshotHtmlDocument(snapshotUrl);
+  if (!html) return { thumbnailUrl: null, previewHtml: null };
+
+  const candidates = extractCreativePreviewUrlsFromHtml(html);
+  const thumbnailUrl =
+    candidates.find((x) => /\.fbcdn\.net\//i.test(x)) ??
+    candidates.find((x) => /\.(jpg|jpeg|png|webp)(\?|$)/i.test(x)) ??
+    candidates[0] ??
+    null;
+
+  const previewHtml = thumbnailUrl ? null : sanitizeMetaSnapshotHtmlForSrcdoc(html);
+
+  return { thumbnailUrl, previewHtml };
+}
+
+/** @deprecated Prefer resolveMetaSnapshotPreview — kept for callers that only need og:image-style URL. */
+export async function fetchMetaSnapshotOgImageUrl(snapshotUrl: string): Promise<string | null> {
+  const r = await resolveMetaSnapshotPreview(snapshotUrl);
+  return r.thumbnailUrl;
 }
 
 /**
@@ -1296,6 +1389,14 @@ function formatAdsArchiveError(e: NonNullable<AdsArchiveJson["error"]>): string 
   if (e.error_user_title?.trim()) parts.push(`[${e.error_user_title.trim()}]`);
   if (e.error_user_msg?.trim()) parts.push(e.error_user_msg.trim());
   return parts.join(" ");
+}
+
+/** Expired user token, bad app secret, etc. — retrying other request shapes won’t help. */
+function isMetaAdsArchiveOAuthFatal(err: NonNullable<AdsArchiveJson["error"]>): boolean {
+  const code = typeof err.code === "number" ? err.code : NaN;
+  if ([190, 463, 467].includes(code)) return true;
+  const blob = `${err.message || ""} ${err.error_user_msg || ""} ${err.error_user_title || ""}`.toLowerCase();
+  return /\b(access token|oauth|session has expired|invalid token|expired token)\b/i.test(blob);
 }
 
 /** Meta cURL uses `ad_reached_countries=['US']` (single-quoted). Node uses JSON `["US"]` first; this is a second encoding some stacks expect. */
@@ -2474,8 +2575,15 @@ export async function executeMetaHarvestRun(runId: string): Promise<{ adsStored:
         if (!res.ok && data.error) {
           lastHttpError = formatAdsArchiveError(data.error);
           const err = data.error;
-          if (err.code === 10 && (err.error_subcode === 2332002 || err.error_subcode === 2332004)) {
+          const permissionFatal = err.code === 10 && (err.error_subcode === 2332002 || err.error_subcode === 2332004);
+          const oauthFatal = isMetaAdsArchiveOAuthFatal(err);
+          if (permissionFatal || oauthFatal) {
             diagnostics.push(`Meta Ad Library: ${lastHttpError}`);
+            if (oauthFatal) {
+              diagnostics.push(
+                "Token or app credentials look invalid/expired — refresh META_AD_LIBRARY_TOKEN (if you use it) or verify META_APP_ID + META_APP_SECRET, then redeploy/restart the API."
+              );
+            }
             await prisma.metaAdHarvestRun.update({
               where: { id: runId },
               data: {
@@ -2897,7 +3005,12 @@ export async function buildMetaHarvestBrandReport(input: {
     filterNotes.push(`Brief uses top ${adDetails.length} ads after filters (${kept.length} passed filters).`);
   }
 
+  const learningHint = await getHarvestLearningPromptAddition(input.agencyId, input.clientId);
+
   const scanNotes = [
+    ...(learningHint
+      ? [`Workspace priors from past analyses (soft bias — judge this sample on its merits): ${learningHint}`]
+      : []),
     handPicked
       ? `Harvest-brand report from ${forFilter.length} hand-picked Meta Library ad row(s).`
       : `Harvest-brand report for Page id(s): ${pageIds.join(", ")}.`,
@@ -3075,7 +3188,12 @@ export async function buildMetaHarvestLandscapeReport(input: {
     filterNotes.push(`Landscape uses ${adDetails.length} ads (${kept.length} passed filters).`);
   }
 
+  const learningHint = await getHarvestLearningPromptAddition(input.agencyId, input.clientId);
+
   const scanNotes = [
+    ...(learningHint
+      ? [`Workspace priors from past analyses (soft bias — judge this sample on its merits): ${learningHint}`]
+      : []),
     handPicked
       ? `Landscape from ${forFilter.length} selected ad(s) in collection ${input.harvestRunId!.trim()}.`
       : input.harvestRunId?.trim()
