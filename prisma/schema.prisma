@@ -51,6 +51,8 @@ model User {
   dfyEngagementsAsClient   DfyEngagement[]     @relation("DfyClient")
   competitorWatchesAgency  CompetitorWatch[]   @relation("CompetitorWatchAgency")
   competitorWatchesClient  CompetitorWatch[]   @relation("CompetitorWatchClient")
+  metaAdHarvestRunsAgency   MetaAdHarvestRun[] @relation("MetaAdHarvestRunAgency")
+  metaAdHarvestRunsClient   MetaAdHarvestRun[] @relation("MetaAdHarvestRunClient")
   /** Optional Go High Level Social Planner (CSV upload API): one credential row per portal user (effective client when agency switches). */
   ghlSocialPlannerCredential GhlSocialPlannerCredential?
 }
@@ -321,6 +323,41 @@ model CompetitorInsight {
   /** AI: playbook, how to win, your campaign ideas, etc. (shape evolves; see competitorIntel) */
   competitivePack        Json?
   rawPromptUsed          String?         @db.Text
+}
+
+/** Keyword-first sweep of Meta Ad Library — ads indexed by advertiser Page for later brand search & reports. */
+model MetaAdHarvestRun {
+  id             String            @id @default(cuid())
+  agencyId       String
+  clientId       String
+  agency         User              @relation("MetaAdHarvestRunAgency", fields: [agencyId], references: [id], onDelete: Cascade)
+  client         User              @relation("MetaAdHarvestRunClient", fields: [clientId], references: [id], onDelete: Cascade)
+  label          String?           @db.VarChar(200)
+  keywords       Json              @default("[]")
+  status         String            @default("pending") @db.VarChar(40)
+  errorMessage   String?           @db.Text
+  adsStored      Int               @default(0)
+  diagnostics    Json?
+  createdAt      DateTime          @default(now())
+  completedAt    DateTime?
+  ads            MetaAdHarvestAd[]
+}
+
+model MetaAdHarvestAd {
+  id             String           @id @default(cuid())
+  runId          String
+  run            MetaAdHarvestRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  facebookPageId String           @db.VarChar(40)
+  pageName       String?          @db.VarChar(500)
+  adLibraryId    String           @db.VarChar(200)
+  headline       String?          @db.Text
+  bodyText       String?          @db.Text
+  mediaUrl       String?          @db.VarChar(500)
+  rawData        Json?
+  createdAt      DateTime         @default(now())
+
+  @@unique([runId, adLibraryId])
+  @@index([facebookPageId])
 }
 
 model AgencyClient {

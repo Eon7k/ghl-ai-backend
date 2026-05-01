@@ -1095,6 +1095,84 @@ function pickCreativeText(
   return null;
 }
 
+/** Words too generic to use alone for keyword-only competitor relevance. */
+const META_AD_RELEVANCE_GENERIC_WORDS = new Set([
+  "spa",
+  "club",
+  "wellness",
+  "beauty",
+  "health",
+  "skin",
+  "body",
+  "best",
+  "free",
+  "new",
+  "the",
+  "and",
+  "for",
+  "llc",
+  "inc",
+]);
+
+function metaAdCreativeHaystack(ad: MetaAdRow): string {
+  const parts: string[] = [];
+  if (typeof ad.page_name === "string" && ad.page_name.trim()) parts.push(ad.page_name);
+  const body = pickCreativeText(ad.ad_creative_bodies);
+  const title = pickCreativeText(ad.ad_creative_link_titles);
+  if (body) parts.push(body);
+  if (title) parts.push(title);
+  return parts.join("\n").toLowerCase();
+}
+
+function websiteHostBrandHint(website: string | null): string | null {
+  const w = website?.trim();
+  if (!w) return null;
+  try {
+    const u = new URL(/^https?:\/\//i.test(w) ? w : `https://${w}`);
+    const first = u.hostname.replace(/^www\./i, "").split(".")[0] ?? "";
+    const clean = first.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (clean.length >= 4) return clean;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/**
+ * After a broad `ads_archive` keyword fetch, keep rows that look like this competitor (name, keywords, website host).
+ */
+function metaAdLikelyForWatch(ad: MetaAdRow, competitorName: string, keywords: string[], competitorWebsite: string | null): boolean {
+  const hay = metaAdCreativeHaystack(ad);
+  const page = (typeof ad.page_name === "string" ? ad.page_name : "").toLowerCase();
+  const name = competitorName.toLowerCase().replace(/\s+/g, " ").trim();
+  if (name.length >= 5 && hay.includes(name)) return true;
+  const nameWords = name
+    .split(/\s+/)
+    .map((w) => w.replace(/[^a-z0-9']/gi, ""))
+    .filter((w) => w.length >= 4 && !META_AD_RELEVANCE_GENERIC_WORDS.has(w));
+  if (nameWords.length >= 2) {
+    const hits = nameWords.filter((w) => hay.includes(w)).length;
+    if (hits >= 2) return true;
+    if (hits >= 1 && nameWords[0] && page.includes(nameWords[0])) return true;
+  } else if (nameWords.length === 1 && hay.includes(nameWords[0]!)) {
+    return true;
+  }
+  const hostHint = websiteHostBrandHint(competitorWebsite);
+  if (hostHint && hay.includes(hostHint)) return true;
+  const kwStrong = keywords.map((k) => k.trim().toLowerCase()).filter((k) => k.length >= 5);
+  let kwHits = 0;
+  for (const k of kwStrong) {
+    if (hay.includes(k)) kwHits++;
+  }
+  if (kwHits >= 2) return true;
+  if (kwHits >= 1 && nameWords.some((w) => hay.includes(w))) return true;
+  const kwMedium = keywords.map((k) => k.trim().toLowerCase()).filter((k) => k.length === 4);
+  for (const k of kwMedium) {
+    if (hay.includes(k) && nameWords.some((w) => hay.includes(w))) return true;
+  }
+  return false;
+}
+
 const ADS_ARCHIVE_FIELDS = [
   "id",
   "page_id",
@@ -1206,6 +1284,176 @@ async function getAdsArchiveBySearchTermOnce(
   }
   const data = (await res.json().catch(() => ({}))) as AdsArchiveJson;
   return { res, data };
+}
+
+async function upsertArchiveAdForWatch(watchId: string, ad: MetaAdRow): Promise<boolean> {
+  if (!ad.id) return false;
+  const body = pickCreativeText(ad.ad_creative_bodies);
+  const title = pickCreativeText(ad.ad_creative_link_titles);
+  let headline = title || (body ? body.replace(/\s+/g, " ").trim().slice(0, 300) : null);
+  if (!headline && !body) {
+    const pn = typeof ad.page_name === "string" && ad.page_name.trim() ? ad.page_name.trim() : null;
+    headline = pn ? `Ad from ${pn.slice(0, 120)}` : "Ad in Meta Ad Library (creative text not in this API row)";
+  }
+  const mediaUrl = typeof ad.ad_snapshot_url === "string" && ad.ad_snapshot_url.startsWith("http") ? ad.ad_snapshot_url : null;
+  try {
+    await prisma.competitorAd.upsert({
+      where: {
+        watchId_platform_adLibraryId: {
+          watchId,
+          platform: "meta",
+          adLibraryId: ad.id,
+        },
+      },
+      create: {
+        watchId,
+        platform: "meta",
+        adLibraryId: ad.id,
+        headline,
+        bodyText: body,
+        mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : null,
+        lastSeenAt: new Date(),
+        rawData: ad as unknown as Prisma.InputJsonValue,
+      },
+      update: {
+        headline: headline ?? undefined,
+        bodyText: body ?? undefined,
+        mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : undefined,
+        lastSeenAt: new Date(),
+        rawData: ad as unknown as Prisma.InputJsonValue,
+      },
+    });
+    return true;
+  } catch (e) {
+    console.error("[competitorIntel] upsert ad (keyword mode)", e);
+    return false;
+  }
+}
+
+/**
+ * No Page id: pull ads via `search_terms` (competitor name + keywords), then drop rows that don’t match name/keywords/site host.
+ * Replaces existing Meta ads on this watch so stale Page-scraped rows don’t linger.
+ */
+async function fetchAndStoreMetaAdLibraryByKeywords(
+  watchId: string,
+  competitorName: string,
+  keywords: string[],
+  competitorWebsite: string | null
+): Promise<{ ok: true; count: number; error?: string; debug?: string } | { ok: false; error: string; debug?: string }> {
+  const token = metaAdLibraryToken();
+  if (!token) {
+    return {
+      ok: true,
+      count: 0,
+      error:
+        "Meta Ad Library: set META_AD_LIBRARY_TOKEN or META_APP_ID + META_APP_SECRET on the API host (with META_AD_LIBRARY_TOKEN set, Ad Library uses that token first).",
+    };
+  }
+
+  const terms: string[] = [];
+  const nameT = competitorName.trim().slice(0, 200);
+  if (nameT.length >= 3) terms.push(nameT);
+  const seenTerm = new Set(terms.map((t) => t.toLowerCase()));
+  for (const k of keywords) {
+    const t = k.trim().slice(0, 200);
+    if (t.length < 3) continue;
+    const low = t.toLowerCase();
+    if (seenTerm.has(low)) continue;
+    if (nameT.length >= 6 && nameT.toLowerCase().includes(low)) continue;
+    terms.push(t);
+    seenTerm.add(low);
+    if (terms.length >= 3) break;
+  }
+  if (terms.length === 0) {
+    return { ok: false, error: "Meta keyword mode: use a competitor name of at least 3 characters or add keywords." };
+  }
+
+  await prisma.competitorAd.deleteMany({ where: { watchId, platform: "meta" } });
+
+  const tiers = adReachedCountriesTiers();
+  const attempts: Pick<AdLibRequestShape, "countriesFormat" | "countries" | "adActiveStatus">[] = [
+    { countriesFormat: "json", countries: tiers.primary, adActiveStatus: "ACTIVE" },
+    { countriesFormat: "json", countries: tiers.wide, adActiveStatus: "ALL" },
+    { countriesFormat: "metaCurl", countries: tiers.wide.slice(0, 28), adActiveStatus: "ALL" },
+  ];
+
+  const merged = new Map<string, MetaAdRow>();
+  let lastHttpError: string | null = null;
+
+  outer: for (const term of terms) {
+    for (const shape of attempts) {
+      let one: { res: Response; data: AdsArchiveJson };
+      try {
+        one = await getAdsArchiveBySearchTermOnce(term, shape);
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : "Meta Ad Library keyword request failed",
+        };
+      }
+      const { res, data } = one;
+      if (!res.ok && data.error) {
+        lastHttpError = `Meta Ad Library: ${formatAdsArchiveError(data.error)}`;
+        const err = data.error;
+        if (err.code === 10 && (err.error_subcode === 2332002 || err.error_subcode === 2332004)) {
+          return { ok: false, error: lastHttpError };
+        }
+        const em = err.message || "";
+        if (err.code === 190 || /invalid.*token|OAuthException|expired|session has been invalidated/i.test(em)) {
+          return { ok: false, error: lastHttpError };
+        }
+        continue;
+      }
+      if (!res.ok) {
+        lastHttpError = `Meta Ad Library: HTTP ${res.status}`;
+        continue;
+      }
+      for (const ad of data.data || []) {
+        if (!ad?.id || merged.has(ad.id)) continue;
+        merged.set(ad.id, ad);
+        if (merged.size >= 180) break outer;
+      }
+    }
+  }
+
+  const raw = merged.size;
+  let kept = 0;
+  let upsertFails = 0;
+  for (const ad of merged.values()) {
+    if (!metaAdLikelyForWatch(ad, competitorName, keywords, competitorWebsite)) continue;
+    const ok = await upsertArchiveAdForWatch(watchId, ad);
+    if (ok) kept++;
+    else upsertFails++;
+  }
+
+  const debug = `keyword-mode raw:${raw} kept:${kept} terms:${terms.length}`;
+  if (upsertFails > 0 && kept === 0) {
+    return {
+      ok: false,
+      error: "Meta Ad Library: keyword mode matched ads but saving to the database failed. Check server logs.",
+      debug,
+    };
+  }
+  if (raw === 0) {
+    if (lastHttpError) return { ok: false, error: lastHttpError, debug };
+    return {
+      ok: true,
+      count: 0,
+      error:
+        "Meta Ad Library keyword search returned no ads for your phrases/regions. Try different keywords or META_AD_LIBRARY_COUNTRIES.",
+      debug,
+    };
+  }
+  if (kept === 0) {
+    return {
+      ok: true,
+      count: 0,
+      error:
+        `Meta Ad Library: fetched ${raw} public ad(s) by keyword but none matched competitor name / keywords / website host after filtering — add more specific keywords or a Facebook Page id.`,
+      debug,
+    };
+  }
+  return { ok: true, count: kept, debug };
 }
 
 /**
@@ -1713,6 +1961,155 @@ If ads data is empty, still use the website and be honest; reduce reliance on "t
   }
 }
 
+/** Aggregate “keyword harvest” sample — many advertisers — landscape themes & differentiation (same JSON shape as watch synthesis). */
+export async function synthesizeHarvestLandscapeWithOpenAI(input: {
+  topicLabel: string;
+  harvestKeywords: string[];
+  scanNotes: string[];
+  adDetails: { headline: string | null; body: string | null; pageName?: string | null }[];
+}): Promise<SynthesisResult> {
+  const openai = openaiClient();
+  const fb = fallbackSynthesis(
+    input.topicLabel,
+    input.harvestKeywords,
+    null,
+    input.scanNotes
+  );
+  if (!openai) return fb;
+
+  const adsBlock =
+    input.adDetails.length > 0
+      ? `Sample of many advertisers’ live Meta ads from your keyword harvest (numbered — infer patterns across the market, not one brand):\n${input.adDetails
+          .slice(0, 30)
+          .map((a, i) => {
+            const h = a.headline || "—";
+            const b = (a.body || "—").replace(/\s+/g, " ").trim().slice(0, 380);
+            const pn = a.pageName ? ` [${a.pageName}]` : "";
+            return `${i + 1}.${pn} Headline: ${h}\n   Body: ${b}`;
+          })
+          .join("\n\n")}`
+      : "No ads in this filtered sample.";
+
+  const prompt = `You are a senior performance marketer. The user ran a **broad Meta Ad Library keyword harvest** — the ads below come from **many different Pages**, not a single competitor. Treat this as a **market snapshot**.
+
+${adsBlock}
+
+Research topic label: ${input.topicLabel}
+Harvest / focus keywords: ${input.harvestKeywords.length ? input.harvestKeywords.join(", ") : "(infer from topic)"}
+Notes: ${input.scanNotes.join(" | ") || "none"}
+
+Deliver a **landscape analysis** — what the market is doing as a whole, where it is crowded, and how the user can stand out. Output one JSON object (no markdown fences).
+
+Return JSON with these keys:
+- "summary" (string, markdown **bold** ok): 4-6 short paragraphs on overall patterns, common offers/hooks, tone, social proof, creative formats implied, gaps/whitespace, and concrete ways to differ.
+- "theirPlaybook" (string): 2-4 sentences summarizing the **dominant playbook in this sample** (not one company — the “typical” approach).
+- "howToWin" (string array, 6-10 items): differentiation moves — campaign structure, audiences, creative angles, offers, sequencing — tied to what you see **across** the sample.
+- "yourCampaigns" (array, 3-6 objects): each has "title", "platform" (often "meta"), "angle", "adCopy" (2-5 sentences original for the USER, not copied from ads), "whyItWorks" (one sentence vs crowded patterns).
+- "theirAdTactics" (array, up to 10): { "headline": string, "tactic": string } — recurring **archetypes** you observe (merge similar advertisers).
+- "topThemes" (string array, max 6): cross-market messaging themes.
+- "suggestedCounterAngles" (string array, max 6): angles less used in this sample worth testing.
+- "strongestAds" (array, max 6): { "headline": string, "note": string } — exemplar patterns from the sample (paraphrase, don’t plagiarize).
+
+If the sample is thin, say so honestly and still give strategic hypotheses.`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_COMPETITOR_MODEL?.trim() || "gpt-4o-mini",
+      temperature: 0.45,
+      max_tokens: 4_400,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You return only valid JSON. Speak to aggregate patterns across advertisers; avoid naming a single competitor unless unavoidable. adCopy must be original for the user.",
+        },
+        { role: "user", content: prompt },
+      ],
+    });
+    const raw = completion.choices[0]?.message?.content?.trim() || "";
+    const parsed = JSON.parse(raw) as {
+      summary?: string;
+      theirPlaybook?: string;
+      howToWin?: unknown;
+      yourCampaigns?: unknown;
+      theirAdTactics?: unknown;
+      topThemes?: unknown;
+      suggestedCounterAngles?: unknown;
+      strongestAds?: unknown;
+    };
+    const topThemes = Array.isArray(parsed.topThemes)
+      ? parsed.topThemes.filter((x): x is string => typeof x === "string").slice(0, 6)
+      : fb.topThemes;
+    const suggestedCounterAngles = Array.isArray(parsed.suggestedCounterAngles)
+      ? parsed.suggestedCounterAngles.filter((x): x is string => typeof x === "string").slice(0, 8)
+      : fb.suggestedCounterAngles;
+    const strongestRaw = Array.isArray(parsed.strongestAds) ? parsed.strongestAds : [];
+    const strongestAds: { headline: string; note?: string }[] = [];
+    for (const x of strongestRaw.slice(0, 6)) {
+      if (x && typeof x === "object" && typeof (x as { headline?: string }).headline === "string") {
+        const note =
+          typeof (x as { note?: string }).note === "string" ? (x as { note: string }).note : undefined;
+        strongestAds.push({ headline: (x as { headline: string }).headline, note });
+      }
+    }
+
+    const howToWin = Array.isArray(parsed.howToWin)
+      ? parsed.howToWin.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((s) => s.trim())
+      : fb.competitivePack!.howToWin;
+    const yourCampaigns: YourCampaignIdea[] = [];
+    if (Array.isArray(parsed.yourCampaigns)) {
+      for (const c of parsed.yourCampaigns) {
+        if (!c || typeof c !== "object") continue;
+        const o = c as Record<string, unknown>;
+        if (typeof o.title === "string" && typeof o.adCopy === "string") {
+          yourCampaigns.push({
+            title: o.title.slice(0, 120),
+            platform: typeof o.platform === "string" ? o.platform.slice(0, 40) : "meta",
+            angle: typeof o.angle === "string" ? o.angle.slice(0, 300) : "",
+            adCopy: o.adCopy.slice(0, 2_000),
+            whyItWorks: typeof o.whyItWorks === "string" ? o.whyItWorks.slice(0, 500) : "",
+          });
+        }
+      }
+    }
+    const theirAdTactics: { headline: string; tactic: string }[] = [];
+    if (Array.isArray(parsed.theirAdTactics)) {
+      for (const t of parsed.theirAdTactics) {
+        if (t && typeof t === "object" && typeof (t as { headline?: string }).headline === "string") {
+          theirAdTactics.push({
+            headline: (t as { headline: string }).headline.slice(0, 500),
+            tactic: typeof (t as { tactic?: string }).tactic === "string" ? (t as { tactic: string }).tactic.slice(0, 500) : "",
+          });
+        }
+      }
+    }
+    const theirPlaybook =
+      typeof parsed.theirPlaybook === "string" && parsed.theirPlaybook.trim()
+        ? parsed.theirPlaybook.trim()
+        : `**${input.topicLabel}** — inferred market mix from sampled ads.`;
+
+    const competitivePack: CompetitivePack = {
+      theirPlaybook,
+      howToWin: howToWin.length ? howToWin : fb.competitivePack!.howToWin,
+      yourCampaigns: yourCampaigns.slice(0, 6),
+      theirAdTactics: theirAdTactics.slice(0, 10),
+    };
+
+    return {
+      summary: typeof parsed.summary === "string" && parsed.summary.trim() ? parsed.summary.trim() : fb.summary,
+      topThemes: topThemes.length ? topThemes : fb.topThemes,
+      suggestedCounterAngles: suggestedCounterAngles.length ? suggestedCounterAngles : fb.suggestedCounterAngles,
+      strongestAds: strongestAds.length ? strongestAds : fb.strongestAds,
+      competitivePack,
+      rawPromptUsed: "openai:harvest landscape synthesis",
+    };
+  } catch (e) {
+    console.error("[competitorIntel] OpenAI landscape synthesis", e);
+    return fb;
+  }
+}
+
 export async function runCompetitorScanForWatch(
   watch: {
     id: string;
@@ -1783,7 +2180,30 @@ export async function runCompetitorScanForWatch(
       }
     }
   } else {
-    scanNotes.push("Meta: add a Facebook Page link or id to pull public ads (server needs META_AD_LIBRARY_TOKEN or META_APP_ID + META_APP_SECRET).");
+    const tok = metaAdLibraryToken();
+    if (!tok) {
+      scanNotes.push(
+        "Meta: set META_AD_LIBRARY_TOKEN or META_APP_ID + META_APP_SECRET, then add a Facebook Page id or use keyword-only mode (competitor name / keywords)."
+      );
+    } else {
+      const name = watch.competitorName.trim();
+      if (kw.length > 0 || name.length >= 3) {
+        const site = watch.competitorWebsite?.trim() ? watch.competitorWebsite.trim() : null;
+        const m = await fetchAndStoreMetaAdLibraryByKeywords(watch.id, name, kw, site);
+        if (m.ok) {
+          if (m.error) scanNotes.push(m.error);
+          if (m.debug) scanNotes.push(`Meta Ad Library: ${m.debug}`);
+          if (m.count) scanNotes.push(`Keyword-only Meta pull: stored ${m.count} ad(s) after relevance filter.`);
+        } else {
+          scanNotes.push(`Meta ads: ${m.error}`);
+          if (m.debug) scanNotes.push(`Meta Ad Library: ${m.debug}`);
+        }
+      } else {
+        scanNotes.push(
+          "Meta: add a Facebook Page id for ads tied to one Page, or enter competitor name (3+ chars) / keywords for keyword-only Ad Library search."
+        );
+      }
+    }
   }
 
   const recentAds = await prisma.competitorAd.findMany({
@@ -1827,6 +2247,628 @@ export async function runCompetitorScanForWatch(
     strongestAds: (syn.strongestAds.length
       ? syn.strongestAds
       : adHeadlineFallbacks.slice(0, 5).map((h) => ({ headline: h }))) as unknown as Prisma.InputJsonValue,
+    competitivePack: syn.competitivePack
+      ? (JSON.parse(JSON.stringify(syn.competitivePack)) as Prisma.InputJsonValue)
+      : null,
+    rawPromptUsed: syn.rawPromptUsed || null,
+    scanNotes,
+  };
+}
+
+function harvestPayloadFromArchiveAd(ad: MetaAdRow): {
+  facebookPageId: string;
+  pageName: string | null;
+  adLibraryId: string;
+  headline: string | null;
+  bodyText: string | null;
+  mediaUrl: string | null;
+  rawData: Prisma.InputJsonValue;
+} | null {
+  if (!ad.id) return null;
+  const rawPid = typeof ad.page_id === "string" ? ad.page_id.trim() : "";
+  const facebookPageId = /^\d{4,22}$/.test(rawPid) ? rawPid : null;
+  if (!facebookPageId) return null;
+  const body = pickCreativeText(ad.ad_creative_bodies);
+  const title = pickCreativeText(ad.ad_creative_link_titles);
+  let headline = title || (body ? body.replace(/\s+/g, " ").trim().slice(0, 300) : null);
+  if (!headline && !body) {
+    const pn = typeof ad.page_name === "string" && ad.page_name.trim() ? ad.page_name.trim() : null;
+    headline = pn ? `Ad from ${pn.slice(0, 120)}` : "Ad in Meta Ad Library (creative text not in this API row)";
+  }
+  const mediaUrl = typeof ad.ad_snapshot_url === "string" && ad.ad_snapshot_url.startsWith("http") ? ad.ad_snapshot_url : null;
+  const pageName = typeof ad.page_name === "string" && ad.page_name.trim() ? ad.page_name.trim().slice(0, 500) : null;
+  return {
+    facebookPageId,
+    pageName,
+    adLibraryId: ad.id,
+    headline,
+    bodyText: body,
+    mediaUrl: mediaUrl ? mediaUrl.slice(0, 500) : null,
+    rawData: ad as unknown as Prisma.InputJsonValue,
+  };
+}
+
+const META_HARVEST_MAX_MERGED_UNIQUE = 320;
+const META_HARVEST_MAX_STORE = 260;
+
+/** Keyword sweep across Ad Library — stores ads by advertiser Page for brand search & harvest reports (no per-brand watch required). */
+export async function executeMetaHarvestRun(runId: string): Promise<{ adsStored: number; diagnostics: string[] }> {
+  const diagnostics: string[] = [];
+
+  try {
+    const run = await prisma.metaAdHarvestRun.findUnique({ where: { id: runId } });
+    if (!run) {
+      return { adsStored: 0, diagnostics: ["Run not found."] };
+    }
+
+    await prisma.metaAdHarvestRun.update({
+      where: { id: runId },
+      data: { status: "running", errorMessage: null },
+    });
+
+    const kwArr = Array.isArray(run.keywords)
+      ? run.keywords.filter((x): x is string => typeof x === "string" && x.trim().length > 2).map((k) => k.trim().slice(0, 200))
+      : [];
+
+    if (kwArr.length === 0) {
+      diagnostics.push("No keywords — each must be at least 3 characters.");
+      await prisma.metaAdHarvestRun.update({
+        where: { id: runId },
+        data: {
+          status: "failed",
+          errorMessage: diagnostics[0],
+          completedAt: new Date(),
+          diagnostics: diagnostics as unknown as Prisma.InputJsonValue,
+        },
+      });
+      return { adsStored: 0, diagnostics };
+    }
+
+    const token = metaAdLibraryToken();
+    if (!token) {
+      const msg = "Meta token missing — set META_AD_LIBRARY_TOKEN or META_APP_ID + META_APP_SECRET.";
+      diagnostics.push(msg);
+      await prisma.metaAdHarvestRun.update({
+        where: { id: runId },
+        data: {
+          status: "failed",
+          errorMessage: msg,
+          completedAt: new Date(),
+          diagnostics: diagnostics as unknown as Prisma.InputJsonValue,
+        },
+      });
+      return { adsStored: 0, diagnostics };
+    }
+
+    const tiers = adReachedCountriesTiers();
+    const attempts: Pick<AdLibRequestShape, "countriesFormat" | "countries" | "adActiveStatus">[] = [
+      { countriesFormat: "json", countries: tiers.primary, adActiveStatus: "ACTIVE" },
+      { countriesFormat: "json", countries: tiers.wide, adActiveStatus: "ALL" },
+      { countriesFormat: "metaCurl", countries: tiers.wide.slice(0, 28), adActiveStatus: "ALL" },
+    ];
+
+    const merged = new Map<string, MetaAdRow>();
+    let lastHttpError: string | null = null;
+
+    outer: for (const term of kwArr.slice(0, 10)) {
+      for (const shape of attempts) {
+        let one: { res: Response; data: AdsArchiveJson };
+        try {
+          one = await getAdsArchiveBySearchTermOnce(term, shape);
+        } catch (e) {
+          diagnostics.push(e instanceof Error ? e.message : "Ad Library request failed");
+          await prisma.metaAdHarvestRun.update({
+            where: { id: runId },
+            data: {
+              status: "failed",
+              errorMessage: diagnostics.join(" "),
+              completedAt: new Date(),
+              diagnostics: diagnostics as unknown as Prisma.InputJsonValue,
+            },
+          });
+          return { adsStored: 0, diagnostics };
+        }
+        const { res, data } = one;
+        if (!res.ok && data.error) {
+          lastHttpError = formatAdsArchiveError(data.error);
+          const err = data.error;
+          if (err.code === 10 && (err.error_subcode === 2332002 || err.error_subcode === 2332004)) {
+            diagnostics.push(`Meta Ad Library: ${lastHttpError}`);
+            await prisma.metaAdHarvestRun.update({
+              where: { id: runId },
+              data: {
+                status: "failed",
+                errorMessage: diagnostics.join(" "),
+                completedAt: new Date(),
+                diagnostics: diagnostics as unknown as Prisma.InputJsonValue,
+              },
+            });
+            return { adsStored: 0, diagnostics };
+          }
+          continue;
+        }
+        if (!res.ok) continue;
+        for (const ad of data.data || []) {
+          if (!ad?.id || merged.has(ad.id)) continue;
+          merged.set(ad.id, ad);
+          if (merged.size >= META_HARVEST_MAX_MERGED_UNIQUE) break outer;
+        }
+      }
+    }
+
+    diagnostics.push(`Merged ${merged.size} unique Library ads from Meta.`);
+
+    const rows: Prisma.MetaAdHarvestAdCreateManyInput[] = [];
+    for (const ad of merged.values()) {
+      const payload = harvestPayloadFromArchiveAd(ad);
+      if (!payload) continue;
+      rows.push({
+        runId,
+        facebookPageId: payload.facebookPageId,
+        pageName: payload.pageName,
+        adLibraryId: payload.adLibraryId,
+        headline: payload.headline,
+        bodyText: payload.bodyText,
+        mediaUrl: payload.mediaUrl,
+        rawData: payload.rawData,
+      });
+      if (rows.length >= META_HARVEST_MAX_STORE) break;
+    }
+
+    diagnostics.push(`${rows.length} ads included page_id and were queued for insert.`);
+
+    if (rows.length === 0) {
+      const hint =
+        merged.size === 0
+          ? lastHttpError
+            ? `No ads returned; last Graph hint: ${lastHttpError}`
+            : "No ads returned for these keywords/regions."
+          : "Meta returned ads but none included page_id in API rows.";
+      diagnostics.push(hint);
+      await prisma.metaAdHarvestRun.update({
+        where: { id: runId },
+        data: {
+          status: "completed",
+          adsStored: 0,
+          completedAt: new Date(),
+          diagnostics: diagnostics as unknown as Prisma.InputJsonValue,
+        },
+      });
+      return { adsStored: 0, diagnostics };
+    }
+
+    const batchSize = 80;
+    let stored = 0;
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const chunk = rows.slice(i, i + batchSize);
+      const ins = await prisma.metaAdHarvestAd.createMany({ data: chunk, skipDuplicates: true });
+      stored += ins.count;
+    }
+
+    diagnostics.push(`Stored ${stored} rows (unique per run by Library id).`);
+
+    await prisma.metaAdHarvestRun.update({
+      where: { id: runId },
+      data: {
+        status: "completed",
+        adsStored: stored,
+        completedAt: new Date(),
+        diagnostics: diagnostics as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    return { adsStored: stored, diagnostics };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    diagnostics.push(`Harvest crashed: ${msg}`);
+    await prisma.metaAdHarvestRun
+      .update({
+        where: { id: runId },
+        data: {
+          status: "failed",
+          errorMessage: msg.slice(0, 2000),
+          completedAt: new Date(),
+          diagnostics: diagnostics as unknown as Prisma.InputJsonValue,
+        },
+      })
+      .catch(() => {});
+    return { adsStored: 0, diagnostics };
+  }
+}
+
+type HarvestAdForFilter = {
+  adLibraryId: string;
+  pageName: string | null;
+  headline: string | null;
+  body: string | null;
+};
+
+function harvestAdHaystack(a: HarvestAdForFilter): string {
+  return [a.pageName, a.headline, a.body].filter(Boolean).join(" ").toLowerCase();
+}
+
+async function filterHarvestAdsWithOpenAIBatches(
+  ads: HarvestAdForFilter[],
+  ctx: {
+    intentLabel: string;
+    harvestKeywords: string[];
+    excludePhrases: string[];
+    strictRelevanceFilter: boolean;
+  }
+): Promise<{ kept: HarvestAdForFilter[]; notes: string[] }> {
+  const BATCH = 26;
+  const kept: HarvestAdForFilter[] = [];
+  const notes: string[] = [];
+  const oa = openaiClient();
+  if (!oa) return { kept: ads, notes: ["No OpenAI client for semantic filter."] };
+
+  for (let start = 0; start < ads.length; start += BATCH) {
+    const batch = ads.slice(start, start + BATCH);
+    const lines = batch
+      .map((a, idx) => {
+        const pn = (a.pageName || "—").replace(/\s+/g, " ").slice(0, 80);
+        const h = (a.headline || "—").replace(/\s+/g, " ").slice(0, 120);
+        const b = (a.body || "—").replace(/\s+/g, " ").slice(0, 200);
+        return `${idx + 1}. [${pn}] ${h} | ${b}`;
+      })
+      .join("\n");
+
+    const strictLine = ctx.strictRelevanceFilter
+      ? "Also DROP ads that are clearly off-topic vs the research intent (shared keywords can still be wrong vertical, e.g. medical cryotherapy vs fertility “cryo”)."
+      : "If there are no exclusion themes, KEEP borderline ads that could plausibly match the intent.";
+
+    const user = `Research intent: ${ctx.intentLabel}
+Keywords tied to this sample: ${ctx.harvestKeywords.length ? ctx.harvestKeywords.join(", ") : "(not specified — use intent label only)"}
+
+Exclusion themes — DROP if the ad clearly matches (synonyms OK):
+${ctx.excludePhrases.length ? ctx.excludePhrases.join("; ") : "(none)"}
+
+${strictLine}
+
+Numbered ads (this block only, indices 1–${batch.length}):
+${lines}
+
+Return JSON only: { "keep": [1,2,3], "batchNote": "optional short note" }
+Use 1-based indices for this block. When in doubt under strict medical/wellness ambiguity, DROP if exclusions might apply.`;
+
+    try {
+      const completion = await oa.chat.completions.create({
+        model: process.env.OPENAI_COMPETITOR_MODEL?.trim() || "gpt-4o-mini",
+        temperature: 0.1,
+        max_tokens: 900,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You return only valid JSON. Prefer dropping clear category mismatches (e.g. fertility vs cold therapy spas) when exclusions or strict mode say so.",
+          },
+          { role: "user", content: user },
+        ],
+      });
+      const raw = completion.choices[0]?.message?.content?.trim() || "{}";
+      const parsed = JSON.parse(raw) as { keep?: unknown; batchNote?: string };
+      const arr = Array.isArray(parsed.keep)
+        ? parsed.keep.filter((x): x is number => typeof x === "number" && Number.isFinite(x))
+        : [];
+      const ok = new Set(
+        arr.map((n) => Math.floor(n)).filter((n) => n >= 1 && n <= batch.length)
+      );
+      if (ok.size === 0 && batch.length > 0) {
+        notes.push(`AI batch (offset ${start}): no keeps — retaining all ${batch.length} ads in this batch.`);
+        kept.push(...batch);
+      } else {
+        for (let i = 0; i < batch.length; i++) {
+          if (ok.has(i + 1)) kept.push(batch[i]!);
+        }
+      }
+      if (typeof parsed.batchNote === "string" && parsed.batchNote.trim()) {
+        notes.push(`AI filter: ${parsed.batchNote.trim()}`);
+      }
+    } catch (e) {
+      notes.push(`AI filter batch failed (${start}): ${e instanceof Error ? e.message : "error"} — kept all in batch.`);
+      kept.push(...batch);
+    }
+  }
+
+  return { kept, notes };
+}
+
+async function filterHarvestAdsPipeline(
+  ads: HarvestAdForFilter[],
+  opts: {
+    intentLabel: string;
+    harvestKeywords: string[];
+    excludePhrases: string[];
+    strictRelevanceFilter: boolean;
+  }
+): Promise<{ kept: HarvestAdForFilter[]; scanNotes: string[] }> {
+  const notes: string[] = [];
+  const phrases = opts.excludePhrases.map((p) => p.trim()).filter((p) => p.length >= 2);
+
+  let pool = ads;
+  if (phrases.length > 0) {
+    const next: HarvestAdForFilter[] = [];
+    let ex = 0;
+    for (const a of pool) {
+      const h = harvestAdHaystack(a);
+      const bad = phrases.some((p) => h.includes(p.toLowerCase()));
+      if (bad) ex++;
+      else next.push(a);
+    }
+    pool = next;
+    if (ex > 0) notes.push(`Phrase exclusion removed ${ex} ad(s) (page + copy substring match).`);
+  }
+
+  const wantAi = phrases.length > 0 || opts.strictRelevanceFilter;
+  if (!wantAi || pool.length === 0) {
+    return { kept: pool, scanNotes: notes };
+  }
+
+  if (!openaiClient()) {
+    notes.push("Semantic filter skipped: no OPENAI_API_KEY (substring exclusion still applied).");
+    return { kept: pool, scanNotes: notes };
+  }
+
+  const beforeAi = pool.length;
+  const aiResult = await filterHarvestAdsWithOpenAIBatches(pool, {
+    intentLabel: opts.intentLabel,
+    harvestKeywords: opts.harvestKeywords,
+    excludePhrases: phrases,
+    strictRelevanceFilter: opts.strictRelevanceFilter,
+  });
+  notes.push(...aiResult.notes);
+
+  if (aiResult.kept.length === 0 && beforeAi > 0) {
+    notes.push("AI returned no keeps — using phrase-filtered set only.");
+    return { kept: pool, scanNotes: notes };
+  }
+  if (aiResult.kept.length < 5 && beforeAi >= 20) {
+    notes.push("AI filter removed almost all ads — using phrase-filtered set to avoid an empty brief.");
+    return { kept: pool, scanNotes: notes };
+  }
+  return { kept: aiResult.kept, scanNotes: notes };
+}
+
+/** Pull harvested ads for chosen advertiser Pages and run the same OpenAI synthesis used for competitor watches (no CompetitorWatch row). */
+export async function buildMetaHarvestBrandReport(input: {
+  agencyId: string;
+  clientId: string;
+  facebookPageIds: string[];
+  competitorDisplayName?: string;
+  keywords?: string[];
+  /** Case-insensitive substring match on page name + copy before AI pass. */
+  excludePhrases?: string[];
+  /** When true, adds an OpenAI pass to drop off-topic ads (keyword collision). Still runs AI when `excludePhrases` is non-empty. */
+  strictRelevanceFilter?: boolean;
+}): Promise<{
+  competitorDisplayName: string;
+  adsUsed: number;
+  adsConsidered: number;
+  adsExcluded: number;
+  summary: string;
+  topThemes: Prisma.InputJsonValue;
+  suggestedCounterAngles: Prisma.InputJsonValue;
+  strongestAds: Prisma.InputJsonValue;
+  competitivePack: Prisma.InputJsonValue | null;
+  rawPromptUsed: string | null;
+  scanNotes: string[];
+}> {
+  const ids = [...new Set(input.facebookPageIds.map((x) => x.replace(/\D/g, "")).filter((x) => x.length >= 4))];
+  if (ids.length === 0) {
+    throw new Error("Provide at least one numeric Facebook Page id.");
+  }
+
+  const excludePhrases = (input.excludePhrases ?? []).map((x) => x.trim()).filter((x) => x.length >= 2).slice(0, 24);
+  const hk = (input.keywords ?? []).map((x) => x.trim()).filter(Boolean).slice(0, 12);
+  const strict = Boolean(input.strictRelevanceFilter);
+
+  const ads = await prisma.metaAdHarvestAd.findMany({
+    where: {
+      facebookPageId: { in: ids },
+      run: { agencyId: input.agencyId, clientId: input.clientId },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 64,
+  });
+
+  const seen = new Set<string>();
+  const forFilter: HarvestAdForFilter[] = [];
+  for (const a of ads) {
+    if (seen.has(a.adLibraryId)) continue;
+    seen.add(a.adLibraryId);
+    forFilter.push({
+      adLibraryId: a.adLibraryId,
+      pageName: a.pageName,
+      headline: a.headline,
+      body: a.bodyText,
+    });
+  }
+
+  let displayName = input.competitorDisplayName?.trim();
+  if (!displayName) {
+    const pn = ads.find((x) => x.pageName)?.pageName;
+    displayName = pn || `Advertisers (${ids.join(", ")})`;
+  }
+  displayName = displayName.slice(0, 200);
+
+  const { kept, scanNotes: filterNotes } = await filterHarvestAdsPipeline(forFilter, {
+    intentLabel: displayName,
+    harvestKeywords: hk,
+    excludePhrases,
+    strictRelevanceFilter: strict,
+  });
+
+  const adSlice = kept.slice(0, 40);
+  const adDetails = adSlice.map((a) => ({
+    headline: a.headline,
+    body: a.body,
+    pageName: a.pageName,
+  }));
+
+  const adsConsidered = forFilter.length;
+  const adsExcluded = Math.max(0, adsConsidered - kept.length);
+  if (kept.length > adDetails.length) {
+    filterNotes.push(`Brief uses top ${adDetails.length} ads after filters (${kept.length} passed filters).`);
+  }
+
+  const scanNotes = [
+    `Harvest-brand report for Page id(s): ${ids.join(", ")}.`,
+    `Ads in pool before filters: ${adsConsidered}; used in brief: ${adDetails.length}.`,
+    ...filterNotes,
+  ];
+
+  const syn = await synthesizeWithOpenAI({
+    competitorName: displayName,
+    keywords: hk,
+    site: null,
+    scanNotes,
+    adDetails,
+  });
+
+  const logBody = scanNotes.map((s) => `• ${s.replace(/\s+/g, " ").trim()}`).join("\n\n");
+  const summaryWithNotes = (syn.summary + `\n\n**Harvest report log**\n\n${logBody}`).slice(0, 12_000);
+
+  return {
+    competitorDisplayName: displayName,
+    adsUsed: adDetails.length,
+    adsConsidered,
+    adsExcluded,
+    summary: summaryWithNotes,
+    topThemes: syn.topThemes as unknown as Prisma.InputJsonValue,
+    suggestedCounterAngles: syn.suggestedCounterAngles as unknown as Prisma.InputJsonValue,
+    strongestAds: syn.strongestAds as unknown as Prisma.InputJsonValue,
+    competitivePack: syn.competitivePack
+      ? (JSON.parse(JSON.stringify(syn.competitivePack)) as Prisma.InputJsonValue)
+      : null,
+    rawPromptUsed: syn.rawPromptUsed || null,
+    scanNotes,
+  };
+}
+
+/** Entire harvest run (or workspace pool): landscape analysis after optional phrase + AI filtering. */
+export async function buildMetaHarvestLandscapeReport(input: {
+  agencyId: string;
+  clientId: string;
+  /** When set, only ads from this run; otherwise all harvest rows in the workspace (capped). */
+  harvestRunId?: string | null;
+  topicHint?: string;
+  excludePhrases?: string[];
+  strictRelevanceFilter?: boolean;
+}): Promise<{
+  competitorDisplayName: string;
+  adsUsed: number;
+  adsConsidered: number;
+  adsExcluded: number;
+  summary: string;
+  topThemes: Prisma.InputJsonValue;
+  suggestedCounterAngles: Prisma.InputJsonValue;
+  strongestAds: Prisma.InputJsonValue;
+  competitivePack: Prisma.InputJsonValue | null;
+  rawPromptUsed: string | null;
+  scanNotes: string[];
+}> {
+  const excludePhrases = (input.excludePhrases ?? []).map((x) => x.trim()).filter((x) => x.length >= 2).slice(0, 24);
+  const strict = Boolean(input.strictRelevanceFilter);
+
+  let harvestKeywords: string[] = [];
+  let topicLabel = input.topicHint?.trim().slice(0, 240) || "";
+
+  if (input.harvestRunId?.trim()) {
+    const run = await prisma.metaAdHarvestRun.findFirst({
+      where: { id: input.harvestRunId.trim(), agencyId: input.agencyId, clientId: input.clientId },
+    });
+    if (!run) throw new Error("Harvest run not found.");
+    const kwArr = Array.isArray(run.keywords)
+      ? run.keywords.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((k) => k.trim().slice(0, 120))
+      : [];
+    harvestKeywords = kwArr.slice(0, 12);
+    if (!topicLabel) {
+      topicLabel =
+        (run.label?.trim() && run.label.trim().slice(0, 200)) ||
+        (harvestKeywords.length ? harvestKeywords.slice(0, 4).join(", ") : "Keyword harvest landscape");
+    }
+  } else if (!topicLabel) {
+    topicLabel = "Workspace harvest pool (all runs)";
+  }
+
+  const where: Prisma.MetaAdHarvestAdWhereInput = {
+    run: {
+      agencyId: input.agencyId,
+      clientId: input.clientId,
+      ...(input.harvestRunId?.trim() ? { id: input.harvestRunId.trim() } : {}),
+    },
+  };
+
+  const rawRows = await prisma.metaAdHarvestAd.findMany({
+    where,
+    orderBy: { createdAt: "desc" },
+    take: 220,
+  });
+
+  const seen = new Set<string>();
+  const forFilter: HarvestAdForFilter[] = [];
+  for (const a of rawRows) {
+    if (seen.has(a.adLibraryId)) continue;
+    seen.add(a.adLibraryId);
+    forFilter.push({
+      adLibraryId: a.adLibraryId,
+      pageName: a.pageName,
+      headline: a.headline,
+      body: a.bodyText,
+    });
+    if (forFilter.length >= 140) break;
+  }
+
+  const displayName = topicLabel.slice(0, 200);
+
+  const { kept, scanNotes: filterNotes } = await filterHarvestAdsPipeline(forFilter, {
+    intentLabel: displayName,
+    harvestKeywords,
+    excludePhrases,
+    strictRelevanceFilter: strict,
+  });
+
+  const adSlice = kept.slice(0, 42);
+  const adDetails = adSlice.map((a) => ({
+    headline: a.headline,
+    body: a.body,
+    pageName: a.pageName,
+  }));
+
+  const adsConsidered = forFilter.length;
+  const adsExcluded = Math.max(0, adsConsidered - kept.length);
+  if (kept.length > adDetails.length) {
+    filterNotes.push(`Landscape uses ${adDetails.length} ads (${kept.length} passed filters).`);
+  }
+
+  const scanNotes = [
+    input.harvestRunId?.trim()
+      ? `Landscape for harvest run ${input.harvestRunId.trim()}.`
+      : `Landscape across workspace harvest ads (multiple runs allowed in sample).`,
+    `Ads in sample before filters: ${adsConsidered}; used in AI: ${adDetails.length}.`,
+    ...filterNotes,
+  ];
+
+  const syn = await synthesizeHarvestLandscapeWithOpenAI({
+    topicLabel: displayName,
+    harvestKeywords,
+    scanNotes,
+    adDetails,
+  });
+
+  const logBody = scanNotes.map((s) => `• ${s.replace(/\s+/g, " ").trim()}`).join("\n\n");
+  const summaryWithNotes = (syn.summary + `\n\n**Harvest landscape log**\n\n${logBody}`).slice(0, 12_000);
+
+  return {
+    competitorDisplayName: displayName,
+    adsUsed: adDetails.length,
+    adsConsidered,
+    adsExcluded,
+    summary: summaryWithNotes,
+    topThemes: syn.topThemes as unknown as Prisma.InputJsonValue,
+    suggestedCounterAngles: syn.suggestedCounterAngles as unknown as Prisma.InputJsonValue,
+    strongestAds: syn.strongestAds as unknown as Prisma.InputJsonValue,
     competitivePack: syn.competitivePack
       ? (JSON.parse(JSON.stringify(syn.competitivePack)) as Prisma.InputJsonValue)
       : null,

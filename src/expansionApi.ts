@@ -15,6 +15,9 @@ import {
   discoverFacebookPageFromCompetitorWebsite,
   discoverMetaAdvertiserPagesFromAdLibrarySearch,
   resolveMetaAdLibraryIdToPageId,
+  executeMetaHarvestRun,
+  buildMetaHarvestBrandReport,
+  buildMetaHarvestLandscapeReport,
 } from "./competitorIntel";
 
 const JWT_SECRET = (process.env.JWT_SECRET || "change-me-in-production").trim();
@@ -1107,6 +1110,203 @@ export function createExpansionRouter(): Router {
       }
     }
   );
+
+  // ----- Keyword harvest pool (Ads Library → brands → optional AI report) -----
+  r.post("/agency/competitor/meta-harvest-runs", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const b = req.body || {};
+      const rawKw = Array.isArray(b.keywords) ? (b.keywords as unknown[]) : [];
+      const keywords = rawKw
+        .filter((x: unknown): x is string => typeof x === "string" && x.trim().length > 2)
+        .map((k: string) => k.trim().slice(0, 200));
+      if (keywords.length === 0) return apiErr(res, 400, "VALIDATION", "keywords must be a non-empty array of strings (each 3+ characters)");
+      if (keywords.length > 12) return apiErr(res, 400, "VALIDATION", "Maximum 12 keywords per harvest run");
+      const label = typeof b.label === "string" ? b.label.trim().slice(0, 200) : null;
+      const run = await prisma.metaAdHarvestRun.create({
+        data: {
+          agencyId: scope.agencyId,
+          clientId: scope.clientId,
+          keywords: keywords as unknown as Prisma.InputJsonValue,
+          label: label || null,
+          status: "pending",
+        },
+      });
+      await executeMetaHarvestRun(run.id);
+      const row = await prisma.metaAdHarvestRun.findFirst({
+        where: { id: run.id, agencyId: scope.agencyId, clientId: scope.clientId },
+        include: { _count: { select: { ads: true } } },
+      });
+      return res.status(201).json({ run: row });
+    } catch (e) {
+      console.error("[meta-harvest-runs POST]", e);
+      return apiErr(res, 500, "SERVER_ERROR", e instanceof Error ? e.message : "Could not run keyword harvest");
+    }
+  });
+
+  r.get("/agency/competitor/meta-harvest-runs", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const runs = await prisma.metaAdHarvestRun.findMany({
+        where: { agencyId: scope.agencyId, clientId: scope.clientId },
+        orderBy: { createdAt: "desc" },
+        take: 40,
+        include: { _count: { select: { ads: true } } },
+      });
+      return res.json({ runs });
+    } catch (e) {
+      console.error("[meta-harvest-runs GET]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not list harvest runs");
+    }
+  });
+
+  r.get("/agency/competitor/meta-harvest-runs/:id", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const run = await prisma.metaAdHarvestRun.findFirst({
+        where: { id: req.params.id, agencyId: scope.agencyId, clientId: scope.clientId },
+        include: {
+          ads: { orderBy: { createdAt: "desc" }, take: 120 },
+          _count: { select: { ads: true } },
+        },
+      });
+      if (!run) return apiErr(res, 404, "NOT_FOUND", "Harvest run not found");
+      return res.json({ run });
+    } catch (e) {
+      console.error("[meta-harvest-runs/:id]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not load harvest run");
+    }
+  });
+
+  r.get("/agency/competitor/meta-harvest-brands", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+      const digits = q.replace(/\D/g, "");
+      const groups = await prisma.metaAdHarvestAd.groupBy({
+        by: ["facebookPageId"],
+        where: {
+          run: { agencyId: scope.agencyId, clientId: scope.clientId },
+          ...(q
+            ? {
+                OR: [
+                  { pageName: { contains: q, mode: "insensitive" } },
+                  ...(digits.length >= 4 ? [{ facebookPageId: { contains: digits } }] : []),
+                ],
+              }
+            : {}),
+        },
+        _count: { id: true },
+        orderBy: { _count: { id: "desc" } },
+        take: 80,
+      });
+
+      const brands = await Promise.all(
+        groups.map(async (g) => {
+          const sample = await prisma.metaAdHarvestAd.findFirst({
+            where: {
+              facebookPageId: g.facebookPageId,
+              run: { agencyId: scope.agencyId, clientId: scope.clientId },
+            },
+            orderBy: { createdAt: "desc" },
+            select: { pageName: true },
+          });
+          return {
+            facebookPageId: g.facebookPageId,
+            pageName: sample?.pageName ?? null,
+            adCount: g._count.id,
+          };
+        })
+      );
+
+      return res.json({ brands });
+    } catch (e) {
+      console.error("[meta-harvest-brands]", e);
+      return apiErr(res, 500, "SERVER_ERROR", "Could not list harvested brands");
+    }
+  });
+
+  r.post("/agency/competitor/meta-harvest-report", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const b = req.body || {};
+      const idsRaw = Array.isArray(b.facebookPageIds) ? (b.facebookPageIds as unknown[]) : [];
+      const facebookPageIds = idsRaw
+        .filter((x: unknown): x is string => typeof x === "string")
+        .map((x: string) => x.replace(/\D/g, ""))
+        .filter((id: string) => id.length >= 4);
+      if (facebookPageIds.length === 0) return apiErr(res, 400, "VALIDATION", "facebookPageIds must include at least one numeric Page id");
+      if (facebookPageIds.length > 12) return apiErr(res, 400, "VALIDATION", "Maximum 12 Page ids per report");
+      const competitorDisplayName = typeof b.competitorDisplayName === "string" ? b.competitorDisplayName.trim().slice(0, 200) : undefined;
+      const hkRaw = Array.isArray(b.keywords) ? (b.keywords as unknown[]) : [];
+      const hk = hkRaw
+        .filter((x: unknown): x is string => typeof x === "string" && x.trim().length > 0)
+        .map((x: string) => x.trim().slice(0, 120));
+      const exRaw = Array.isArray(b.excludePhrases) ? (b.excludePhrases as unknown[]) : [];
+      const excludePhrases = exRaw
+        .filter((x: unknown): x is string => typeof x === "string" && x.trim().length >= 2)
+        .map((x: string) => x.trim().slice(0, 160))
+        .slice(0, 24);
+      const strictRelevanceFilter = Boolean(b.strictRelevanceFilter);
+      const report = await buildMetaHarvestBrandReport({
+        agencyId: scope.agencyId,
+        clientId: scope.clientId,
+        facebookPageIds,
+        competitorDisplayName,
+        keywords: hk.length ? hk : undefined,
+        excludePhrases: excludePhrases.length ? excludePhrases : undefined,
+        strictRelevanceFilter,
+      });
+      return res.json({ report });
+    } catch (e) {
+      console.error("[meta-harvest-report]", e);
+      return apiErr(
+        res,
+        400,
+        "VALIDATION",
+        e instanceof Error ? e.message : "Could not build harvest report"
+      );
+    }
+  });
+
+  r.post("/agency/competitor/meta-harvest-landscape-report", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
+    try {
+      const scope = await resolveLandingScope(req, res);
+      if (!scope) return;
+      const b = req.body || {};
+      const harvestRunId =
+        typeof b.harvestRunId === "string" && b.harvestRunId.trim().length > 0 ? b.harvestRunId.trim() : undefined;
+      const topicHint = typeof b.topicHint === "string" ? b.topicHint.trim().slice(0, 240) : undefined;
+      const exRaw = Array.isArray(b.excludePhrases) ? (b.excludePhrases as unknown[]) : [];
+      const excludePhrases = exRaw
+        .filter((x: unknown): x is string => typeof x === "string" && x.trim().length >= 2)
+        .map((x: string) => x.trim().slice(0, 160))
+        .slice(0, 24);
+      const strictRelevanceFilter = Boolean(b.strictRelevanceFilter);
+      const report = await buildMetaHarvestLandscapeReport({
+        agencyId: scope.agencyId,
+        clientId: scope.clientId,
+        harvestRunId,
+        topicHint,
+        excludePhrases: excludePhrases.length ? excludePhrases : undefined,
+        strictRelevanceFilter,
+      });
+      return res.json({ report });
+    } catch (e) {
+      console.error("[meta-harvest-landscape-report]", e);
+      return apiErr(
+        res,
+        400,
+        "VALIDATION",
+        e instanceof Error ? e.message : "Could not build harvest landscape report"
+      );
+    }
+  });
 
   r.get("/agency/competitor/watches", expansionRequireAuth, expansionRequireProduct("competitors"), async (req: ExpansionAuthRequest, res: Response) => {
     try {
